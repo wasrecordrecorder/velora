@@ -9,6 +9,9 @@ import io.velora.internal.ir.*;
 import io.velora.internal.lexer.*;
 import io.velora.internal.parser.*;
 import io.velora.internal.runtime.*;
+import io.velora.internal.registry.*;
+import io.velora.internal.compiler.*;
+import io.velora.internal.script.*;
 import io.velora.internal.scheduler.*;
 import io.velora.internal.semantic.*;
 import io.velora.internal.setting.*;
@@ -36,7 +39,7 @@ class EndToEndV2Test {
         settingRegistry = new DefaultSettingRegistry();
         permissionRegistry = new DefaultPermissionRegistry();
         constantRegistry = new DefaultConstantRegistry();
-        apiRegistry = new DefaultApiRegistry();
+        apiRegistry = new DefaultApiRegistry(new DefaultTypeRegistry());
     }
 
     private CompiledModule compile(String source) {
@@ -573,8 +576,10 @@ class EndToEndV2Test {
     @Test
     @DisplayName("API function with arguments")
     void apiCallWithArgs() {
-        apiRegistry.namespace("math", ns -> ns.function("add", VeloraTypes.INT, ctx ->
-            ((Number) ctx.argument(0)).intValue() + ((Number) ctx.argument(1)).intValue()));
+        apiRegistry.namespace("math", ns -> ns.function("add", VeloraTypes.INT, p -> {
+            p.required("left", VeloraTypes.INT);
+            p.required("right", VeloraTypes.INT);
+        }, ctx -> ((Number) ctx.argument(0)).intValue() + ((Number) ctx.argument(1)).intValue()));
         CompiledModule m = compile("@Script(name=\"T\", version=\"1\")\nscript T {\n    int answer() { return math.add(20, 22) }\n}");
         CompiledFunction fn = m.functionByName("answer");
         assertEquals(42, asInt(execute(m, fn.index())));
@@ -638,7 +643,7 @@ class EndToEndV2Test {
             @Script(name="T", version="1")
             script T {
                 int child() { return 42 }
-                async int run() { int r = spawn child()
+                async int run() { Task<int> r = spawn child()
                     return await(r) }
             }
             """);

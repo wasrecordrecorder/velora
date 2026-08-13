@@ -25,7 +25,7 @@ final class SetType implements VeloraType {
 
     @Override
     public String name() {
-        return "Set<" + element.name() + ">";
+        return "Set<" + element.name() + ">" + (nullable ? "?" : "");
     }
 
     @Override

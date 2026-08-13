@@ -35,8 +35,6 @@ public final class Lexer {
             Map.entry("package", TokenType.KW_PACKAGE),
             Map.entry("private", TokenType.KW_PRIVATE),
             Map.entry("public", TokenType.KW_PUBLIC),
-            Map.entry("enum", TokenType.KW_ENUM),
-            Map.entry("data", TokenType.KW_DATA),
             Map.entry("is", TokenType.KW_IS),
             Map.entry("in", TokenType.KW_IN),
             Map.entry("spawn", TokenType.KW_SPAWN),

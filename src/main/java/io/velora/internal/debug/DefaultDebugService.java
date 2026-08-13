@@ -32,12 +32,17 @@ public final class DefaultDebugService implements DebugService {
 
     @Override
     public ProfilerSnapshot profiler(String scriptId) {
-        return profiler.snapshot(scriptId);
+        ProfilerSnapshot base = profiler.snapshot(scriptId);
+        var resources = scheduler.resources(scriptId);
+        return new ProfilerSnapshot(scriptId, base.tickTimeNanos(), scheduler.instructionsForScript(scriptId),
+                scheduler.apiCost(scriptId), resources.memoryUsed(), resources.fibers(), resources.tasks(),
+                resources.eventQueueSize(), base.droppedEvents(), base.apiCalls(), base.failures(),
+                base.cancellations(), base.coalescedEvents(), base.maxQueueDepth());
     }
 
     @Override
     public List<FiberSnapshot> fibers(String scriptId) {
-        return FiberInspector.inspectAll(scheduler.readyQueue().snapshot());
+        return FiberInspector.inspectAll(scheduler.fibersForScript(scriptId));
     }
 
     @Override

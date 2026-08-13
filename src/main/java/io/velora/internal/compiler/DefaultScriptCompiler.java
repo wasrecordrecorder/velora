@@ -1,0 +1,395 @@
+package io.velora.internal.compiler;
+
+import io.velora.api.compiler.*;
+import io.velora.api.function.ApiRegistry;
+import io.velora.api.registry.*;
+import io.velora.internal.bytecode.*;
+import io.velora.internal.ir.*;
+import io.velora.internal.lexer.Lexer;
+import io.velora.internal.lexer.LexerResult;
+import io.velora.internal.lexer.TokenType;
+import io.velora.internal.parser.ParseResult;
+import io.velora.internal.parser.Parser;
+import io.velora.internal.persistence.BytecodeCache;
+import io.velora.internal.semantic.ResolvedScript;
+import io.velora.internal.semantic.SemanticAnalyzer;
+import io.velora.internal.source.SourceHash;
+import io.velora.internal.vm.*;
+
+import java.io.*;
+import java.util.*;
+
+public final class DefaultScriptCompiler implements ScriptCompiler {
+    private final TypeRegistry typeRegistry;
+    private final SettingRegistry settingRegistry;
+    private final ApiRegistry apiRegistry;
+    private final ConstantRegistry constantRegistry;
+    private final PermissionRegistry permissionRegistry;
+    private final BytecodeCache cache = new BytecodeCache();
+    private boolean frozen;
+
+    public DefaultScriptCompiler(TypeRegistry typeRegistry, SettingRegistry settingRegistry,
+                                 ApiRegistry apiRegistry, ConstantRegistry constantRegistry,
+                                 PermissionRegistry permissionRegistry) {
+        this.typeRegistry = typeRegistry;
+        this.settingRegistry = settingRegistry;
+        this.apiRegistry = apiRegistry;
+        this.constantRegistry = constantRegistry;
+        this.permissionRegistry = permissionRegistry;
+    }
+
+    @Override
+    public CompileResult compile(CompileRequest request) {
+        Compilation compilation = compileInternal(request);
+        if (compilation.module == null) return CompileResult.failure(request.scriptId(), compilation.diagnostics);
+        try {
+            return new CompileResult(true, request.scriptId(), compilation.diagnostics, serializeBytecode(compilation.module), compilation.registryHash, compilation.sourceHash);
+        } catch (RuntimeException error) {
+            List<Diagnostic> diagnostics = new ArrayList<>(compilation.diagnostics);
+            diagnostics.add(Diagnostic.error(DiagnosticCode.BYTECODE_BAD_OPERAND, "Bytecode serialization failed: " + error.getMessage(), SourceRange.of("main.vls", 0, 0)));
+            return CompileResult.failure(request.scriptId(), diagnostics);
+        }
+    }
+
+    public CompiledModule compileToModule(CompileRequest request) {
+        return compileInternal(request).module;
+    }
+
+    private Compilation compileInternal(CompileRequest request) {
+        List<Diagnostic> diagnostics = new ArrayList<>();
+        if (request.languageVersion() > 1) {
+            diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_UNSUPPORTED_VERSION,
+                    "Unsupported language version: " + request.languageVersion(), SourceRange.of("main.vls", 0, 0)));
+            return Compilation.failure(diagnostics);
+        }
+
+        for (SourceFile source : request.sources()) {
+            if (source.relativePath().contains("..")) {
+                diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_PATH_TRAVERSAL,
+                        "Path traversal not allowed: " + source.relativePath(), SourceRange.of(source.relativePath(), 0, 0)));
+                return Compilation.failure(diagnostics);
+            }
+        }
+
+        SourceBundle bundle = sourceBundle(request.sources(), diagnostics);
+        if (bundle == null) return Compilation.failure(diagnostics);
+        String registryHash = computeRegistryHash();
+        CompiledModule cached = cache.get(request.scriptId(), bundle.sourceHash, registryHash);
+        if (cached != null && request.mode() != CompileMode.FULL) {
+            return new Compilation(cached, diagnostics, bundle.sourceHash, registryHash);
+        }
+        if (request.mode() == CompileMode.CACHE_ONLY) {
+            diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_CACHE_MISS,
+                    "No matching cached bytecode available", SourceRange.of("main.vls", 0, 0)));
+            return Compilation.failure(diagnostics);
+        }
+
+        LexerResult lexerResult = new Lexer(bundle.source, "main.vls").lex();
+        diagnostics.addAll(lexerResult.diagnostics());
+        if (hasErrors(diagnostics)) return Compilation.failure(diagnostics);
+
+        ParseResult parseResult = Parser.parse(bundle.source, "main.vls");
+        diagnostics.addAll(parseResult.diagnostics());
+        if (hasErrors(diagnostics) || parseResult.scriptNode() == null) return Compilation.failure(diagnostics);
+
+        SemanticAnalyzer analyzer = new SemanticAnalyzer(typeRegistry, settingRegistry, apiRegistry, constantRegistry, permissionRegistry);
+        ResolvedScript resolved = analyzer.analyze(parseResult.scriptNode());
+        diagnostics.addAll(analyzer.diagnostics());
+        if (hasErrors(diagnostics)) return Compilation.failure(diagnostics);
+
+        IrModule irModule = new IrOptimizer().optimize(new IrBuilder(resolved, apiRegistry).build());
+        diagnostics.addAll(new IrVerifier().verify(irModule));
+        if (hasErrors(diagnostics)) return Compilation.failure(diagnostics);
+
+        CompiledModule module = new BytecodeWriter().write(irModule, bundle.sourceHash, registryHash);
+        diagnostics.addAll(new BytecodeVerifier().verify(module));
+        if (hasErrors(diagnostics)) return Compilation.failure(diagnostics);
+        cache.put(request.scriptId(), bundle.sourceHash, registryHash, module);
+        return new Compilation(module, diagnostics, bundle.sourceHash, registryHash);
+    }
+
+    private SourceBundle sourceBundle(List<SourceFile> sources, List<Diagnostic> diagnostics) {
+        StringBuilder hashInput = new StringBuilder();
+        String mainSource = null;
+        List<String> helpers = new ArrayList<>();
+        for (SourceFile source : sources) {
+            if (!source.relativePath().endsWith(".vls")) continue;
+            hashInput.append(source.relativePath()).append('\0').append(source.contentHash()).append('\0');
+            boolean declaresScript = new Lexer(source.content(), source.relativePath()).lex().tokens().stream().anyMatch(token -> token.type() == TokenType.KW_SCRIPT);
+            if (declaresScript) {
+                if (mainSource != null) {
+                    diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_MULTIPLE_SCRIPTS,
+                            "Multiple script declarations across files", SourceRange.of(source.relativePath(), 0, 0)));
+                    return null;
+                }
+                mainSource = source.content();
+            } else {
+                helpers.add(source.content());
+            }
+        }
+        if (mainSource == null) {
+            diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_NO_SCRIPT,
+                    sources.isEmpty() ? "No .vls source files provided" : "No script declaration found", SourceRange.of("main.vls", 0, 0)));
+            return null;
+        }
+        if (!helpers.isEmpty()) {
+            int lastBrace = mainSource.lastIndexOf('}');
+            StringBuilder merged = new StringBuilder(mainSource.length() + helpers.stream().mapToInt(String::length).sum() + helpers.size() * 2);
+            if (lastBrace >= 0) {
+                merged.append(mainSource, 0, lastBrace);
+                for (String helper : helpers) merged.append('\n').append(helper).append('\n');
+                merged.append('}');
+            } else {
+                merged.append(mainSource);
+                for (String helper : helpers) merged.append('\n').append(helper);
+            }
+            mainSource = merged.toString();
+        }
+        return new SourceBundle(mainSource, SourceHash.compute(hashInput.toString()));
+    }
+
+    @Override
+    public boolean isFrozen() { return frozen; }
+
+    public void freeze() { frozen = true; }
+
+    private boolean hasErrors(List<Diagnostic> diagnostics) {
+        return diagnostics.stream().anyMatch(Diagnostic::isError);
+    }
+
+    private String computeRegistryHash() {
+        return SourceHash.compute(typeRegistry.all() + "|" + apiRegistry.all() + "|" + settingRegistry.all() + "|" + constantRegistry.all() + "|" + permissionRegistry.all());
+    }
+
+    private record SourceBundle(String source, String sourceHash) {}
+    private record Compilation(CompiledModule module, List<Diagnostic> diagnostics, String sourceHash, String registryHash) {
+        private static Compilation failure(List<Diagnostic> diagnostics) { return new Compilation(null, List.copyOf(diagnostics), null, null); }
+    }
+
+    private byte[] serializeBytecode(CompiledModule module) {
+        try (ByteArrayOutputStream bytes = new ByteArrayOutputStream(); DataOutputStream out = new DataOutputStream(bytes)) {
+            out.writeUTF("VLCB");
+            out.writeInt(2);
+            writeString(out, module.scriptId());
+            writeString(out, module.scriptName());
+            writeString(out, module.version());
+            out.writeInt(module.languageVersion());
+            writeString(out, module.sourceHash());
+            writeString(out, module.registryHash());
+
+            ConstantPool pool = module.constantPool();
+            out.writeInt(pool.size());
+            for (int i = 0; i < pool.size(); i++) {
+                ConstantPool.Tag tag = pool.tag(i);
+                out.writeInt(tag.ordinal());
+                switch (tag) {
+                    case INT -> out.writeInt(pool.intValue(i));
+                    case LONG -> out.writeLong(pool.longValue(i));
+                    case FLOAT -> out.writeFloat(pool.floatValue(i));
+                    case DOUBLE -> out.writeDouble(pool.doubleValue(i));
+                    case STRING -> writeString(out, pool.stringValue(i));
+                    case BOOLEAN -> out.writeBoolean(pool.booleanValue(i));
+                    case DURATION -> out.writeLong(pool.durationNanos(i));
+                    case NULL -> {}
+                }
+            }
+
+            out.writeInt(module.functions().size());
+            for (CompiledFunction function : module.functions()) {
+                writeString(out, function.name());
+                out.writeInt(function.index());
+                out.writeInt(function.parameterCount());
+                out.writeInt(function.localCount());
+                out.writeInt(function.maxStack());
+                out.writeBoolean(function.suspending());
+                out.writeBoolean(function.isLifecycle());
+                out.writeInt(function.code().length);
+                for (int value : function.code()) out.writeInt(value);
+                out.writeInt(function.lineNumbers().length);
+                for (int value : function.lineNumbers()) out.writeInt(value);
+            }
+
+            writeStrings(out, module.persistentFieldIds());
+            writeStrings(out, module.persistentFieldTypes());
+            out.writeInt(module.persistentFieldIndices().size());
+            for (int value : module.persistentFieldIndices()) out.writeInt(value);
+            out.writeInt(module.persistentFieldIsStatic().size());
+            for (boolean value : module.persistentFieldIsStatic()) out.writeBoolean(value);
+            writeStrings(out, module.lifecycleHooks());
+
+            out.writeInt(module.eventHandlers().size());
+            for (CompiledModule.EventHandlerInfo handler : module.eventHandlers()) {
+                writeString(out, handler.eventReference());
+                writeString(out, handler.functionName());
+                out.writeInt(handler.functionIndex());
+                out.writeBoolean(handler.suspending());
+            }
+
+            out.writeInt(module.fieldInitializers().size());
+            for (CompiledModule.FieldInitializer initializer : module.fieldInitializers()) {
+                out.writeInt(initializer.fieldIndex());
+                out.writeBoolean(initializer.isStatic());
+                writeValue(out, initializer.initialValue());
+            }
+            writeString(out, module.author() == null ? "" : module.author());
+            writeString(out, module.description() == null ? "" : module.description());
+            out.flush();
+            return bytes.toByteArray();
+        } catch (IOException e) {
+            throw new IllegalStateException("Cannot serialize bytecode", e);
+        }
+    }
+
+    public static CompiledModule deserializeBytecode(byte[] data,
+                                                      List<io.velora.api.setting.SettingDescriptor> settings,
+                                                      io.velora.api.permission.PermissionSet requiredPermissions,
+                                                      io.velora.api.permission.PermissionSet maximumPermissions) {
+        if (data == null || data.length == 0) return null;
+        try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(data))) {
+            if (!"VLCB".equals(in.readUTF())) return null;
+            int format = in.readInt();
+            if (format < 1 || format > 2) return null;
+            String scriptId = readString(in, format);
+            String scriptName = readString(in, format);
+            String version = readString(in, format);
+            int languageVersion = in.readInt();
+            String sourceHash = readString(in, format);
+            String registryHash = readString(in, format);
+
+            int poolSize = readCount(in, 1_000_000);
+            ConstantPool pool = new ConstantPool();
+            ConstantPool.Tag[] tags = ConstantPool.Tag.values();
+            for (int i = 0; i < poolSize; i++) {
+                int ordinal = in.readInt();
+                if (ordinal < 0 || ordinal >= tags.length) return null;
+                switch (tags[ordinal]) {
+                    case INT -> pool.addInt(in.readInt());
+                    case LONG -> pool.addLong(in.readLong());
+                    case FLOAT -> pool.addFloat(in.readFloat());
+                    case DOUBLE -> pool.addDouble(in.readDouble());
+                    case STRING -> pool.addString(readString(in, format));
+                    case BOOLEAN -> pool.addBoolean(in.readBoolean());
+                    case DURATION -> pool.addDuration(in.readLong());
+                    case NULL -> pool.addNull();
+                }
+            }
+
+            int functionCount = readCount(in, 100_000);
+            List<CompiledFunction> functions = new ArrayList<>(functionCount);
+            for (int i = 0; i < functionCount; i++) {
+                String name = readString(in, format);
+                int index = in.readInt();
+                int parameterCount = readCount(in, 1_000_000);
+                int localCount = readCount(in, 1_000_000);
+                int maxStack = readCount(in, 1_000_000);
+                boolean suspending = in.readBoolean();
+                boolean lifecycle = in.readBoolean();
+                int codeLength = readCount(in, 16_000_000);
+                int[] code = new int[codeLength];
+                for (int j = 0; j < codeLength; j++) code[j] = in.readInt();
+                int lineLength = readCount(in, 16_000_000);
+                int[] lines = new int[lineLength];
+                for (int j = 0; j < lineLength; j++) lines[j] = in.readInt();
+                functions.add(new CompiledFunction(name, index, parameterCount, localCount, maxStack, suspending, lifecycle, code, lines));
+            }
+
+            List<String> persistentFieldIds = readStrings(in, format, 1_000_000);
+            List<String> persistentFieldTypes = readStrings(in, format, 1_000_000);
+            int indexCount = readCount(in, 1_000_000);
+            List<Integer> persistentFieldIndices = new ArrayList<>(indexCount);
+            for (int i = 0; i < indexCount; i++) persistentFieldIndices.add(in.readInt());
+            int staticCount = readCount(in, 1_000_000);
+            List<Boolean> persistentFieldIsStatic = new ArrayList<>(staticCount);
+            for (int i = 0; i < staticCount; i++) persistentFieldIsStatic.add(in.readBoolean());
+            List<String> lifecycleHooks = readStrings(in, format, 100_000);
+
+            int handlerCount = readCount(in, 1_000_000);
+            List<CompiledModule.EventHandlerInfo> eventHandlers = new ArrayList<>(handlerCount);
+            for (int i = 0; i < handlerCount; i++) {
+                eventHandlers.add(new CompiledModule.EventHandlerInfo(readString(in, format), readString(in, format), in.readInt(), in.readBoolean()));
+            }
+
+            List<CompiledModule.FieldInitializer> initializers = new ArrayList<>();
+            String author = null;
+            String description = null;
+            if (format >= 2) {
+                int initializerCount = readCount(in, 1_000_000);
+                for (int i = 0; i < initializerCount; i++) {
+                    initializers.add(new CompiledModule.FieldInitializer(in.readInt(), in.readBoolean(), readValue(in)));
+                }
+                author = emptyToNull(readString(in, format));
+                description = emptyToNull(readString(in, format));
+            }
+
+            CompiledModule module = new CompiledModule(scriptId, scriptName, version, languageVersion,
+                    sourceHash, registryHash, pool, functions, settings,
+                    persistentFieldIds, persistentFieldTypes, persistentFieldIndices, persistentFieldIsStatic,
+                    requiredPermissions, maximumPermissions, lifecycleHooks, eventHandlers, initializers, author, description);
+            return new BytecodeVerifier().verify(module).stream().anyMatch(Diagnostic::isError) ? null : module;
+        } catch (IOException | RuntimeException e) {
+            return null;
+        }
+    }
+
+    private static void writeStrings(DataOutputStream out, List<String> values) throws IOException {
+        out.writeInt(values.size());
+        for (String value : values) writeString(out, value);
+    }
+
+    private static List<String> readStrings(DataInputStream in, int format, int maxCount) throws IOException {
+        int count = readCount(in, maxCount);
+        List<String> values = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) values.add(readString(in, format));
+        return values;
+    }
+
+    private static void writeString(DataOutputStream out, String value) throws IOException {
+        byte[] bytes = Objects.requireNonNull(value).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        out.writeInt(bytes.length);
+        out.write(bytes);
+    }
+
+    private static String readString(DataInputStream in, int format) throws IOException {
+        if (format == 1) return in.readUTF();
+        int length = readCount(in, 16_000_000);
+        byte[] bytes = in.readNBytes(length);
+        if (bytes.length != length) throw new EOFException();
+        return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    private static int readCount(DataInputStream in, int max) throws IOException {
+        int count = in.readInt();
+        if (count < 0 || count > max) throw new IOException("Invalid count: " + count);
+        return count;
+    }
+
+    private static void writeValue(DataOutputStream out, ScriptValue value) throws IOException {
+        if (value == null || value.isNull()) { out.writeByte(0); return; }
+        if (value instanceof PrimitiveValue.IntV v) { out.writeByte(1); out.writeInt(v.value()); return; }
+        if (value instanceof PrimitiveValue.LongV v) { out.writeByte(2); out.writeLong(v.value()); return; }
+        if (value instanceof PrimitiveValue.FloatV v) { out.writeByte(3); out.writeFloat(v.value()); return; }
+        if (value instanceof PrimitiveValue.DoubleV v) { out.writeByte(4); out.writeDouble(v.value()); return; }
+        if (value instanceof PrimitiveValue.BooleanV v) { out.writeByte(5); out.writeBoolean(v.value()); return; }
+        if (value instanceof PrimitiveValue.ByteV v) { out.writeByte(6); out.writeByte(v.value()); return; }
+        if (value instanceof PrimitiveValue.CharV v) { out.writeByte(7); out.writeChar(v.value()); return; }
+        if (value instanceof StringValue v) { out.writeByte(8); writeString(out, v.value()); return; }
+        throw new IllegalArgumentException("Unsupported field initializer value: " + value.getClass().getSimpleName());
+    }
+
+    private static ScriptValue readValue(DataInputStream in) throws IOException {
+        return switch (in.readUnsignedByte()) {
+            case 0 -> PrimitiveValue.nullValue();
+            case 1 -> PrimitiveValue.of(in.readInt());
+            case 2 -> PrimitiveValue.of(in.readLong());
+            case 3 -> PrimitiveValue.of(in.readFloat());
+            case 4 -> PrimitiveValue.of(in.readDouble());
+            case 5 -> PrimitiveValue.of(in.readBoolean());
+            case 6 -> PrimitiveValue.of(in.readByte());
+            case 7 -> PrimitiveValue.of(in.readChar());
+            case 8 -> new StringValue(readString(in, 2));
+            default -> throw new IOException("Invalid initializer value tag");
+        };
+    }
+
+    private static String emptyToNull(String value) { return value.isEmpty() ? null : value; }
+}

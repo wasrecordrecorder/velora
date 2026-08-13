@@ -37,5 +37,7 @@ public final class ResourceLimits {
         return depth > limits.maxCallDepth();
     }
 
-    public VeloraLimits limits() { return limits; }
+    public VeloraLimits limits() {
+        return limits;
+    }
 }

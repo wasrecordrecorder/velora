@@ -8,6 +8,9 @@ import io.velora.api.type.*;
 import io.velora.binding.annotation.*;
 import io.velora.host.*;
 import io.velora.internal.runtime.*;
+import io.velora.internal.registry.*;
+import io.velora.internal.compiler.*;
+import io.velora.internal.script.*;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.DisplayName;
 
@@ -75,17 +78,25 @@ class EngineV2Test {
     // === Registries ===
 
     @Test
-    @DisplayName("Engine has type registry with built-in types")
+    @DisplayName("Engine has generic core types without client bindings")
     void typeRegistry() {
         VeloraEngine engine = Velora.builder().host(simpleHost()).build();
-        assertTrue(engine.types().all().size() >= 22, "Should have at least 22 built-in types");
+        assertNotNull(engine.types().find("Int"));
+        assertNotNull(engine.types().find("String"));
+        assertNotNull(engine.types().find("Vec3"));
+        assertNull(engine.types().find("BlockPos"));
+        assertNull(engine.types().find("PlayerRef"));
+        assertNull(engine.types().find("BlockRef"));
     }
 
     @Test
-    @DisplayName("Engine has built-in API")
+    @DisplayName("Engine has generic built-in API only")
     void builtInApi() {
         VeloraEngine engine = Velora.builder().host(simpleHost()).build();
-        assertTrue(engine.api().all().size() > 0, "Should have built-in API functions");
+        assertNotNull(engine.api().find("console", "print"));
+        assertFalse(engine.api().namespaces().contains("player"));
+        assertFalse(engine.api().namespaces().contains("world"));
+        assertFalse(engine.api().namespaces().contains("bot"));
     }
 
     @Test

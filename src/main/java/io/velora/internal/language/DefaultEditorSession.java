@@ -16,6 +16,7 @@ public final class DefaultEditorSession implements EditorSession {
     private String content = "";
     private long revisionToken = 0;
     private boolean closed = false;
+    private EditorSnapshot cachedSnapshot;
 
     public DefaultEditorSession(String scriptId, String filePath) {
         this.scriptId = scriptId;
@@ -27,12 +28,18 @@ public final class DefaultEditorSession implements EditorSession {
 
     @Override
     public void updateText(String text) {
-        this.content = text != null ? text : "";
-        this.revisionToken++;
+        ensureOpen();
+        String next = text != null ? text : "";
+        if (content.equals(next)) return;
+        content = next;
+        revisionToken++;
+        cachedSnapshot = null;
     }
 
     @Override
     public EditorSnapshot snapshot() {
+        ensureOpen();
+        if (cachedSnapshot != null) return cachedSnapshot;
         LexerResult lr = new Lexer(content, filePath).lex();
         List<SyntaxToken> tokens = SyntaxHighlighter.highlight(lr);
         List<Diagnostic> diagnostics = new ArrayList<>(lr.diagnostics());
@@ -40,41 +47,49 @@ public final class DefaultEditorSession implements EditorSession {
             ParseResult pr = Parser.parse(content, filePath);
             diagnostics.addAll(pr.diagnostics());
         }
-        return new EditorSnapshot(scriptId, filePath, content,
+        cachedSnapshot = new EditorSnapshot(scriptId, filePath, content,
                 io.velora.internal.source.SourceHash.compute(content), diagnostics, tokens, revisionToken);
+        return cachedSnapshot;
     }
 
     @Override
     public List<CompletionItem> completions(int line, int column) {
+        ensureOpen();
         return CompletionEngine.getCompletions(content, line, column);
     }
 
     @Override
     public Optional<HoverInfo> hover(int line, int column) {
+        ensureOpen();
         return HoverEngine.getHover(content, line, column, filePath);
     }
 
     @Override
     public Optional<SignatureHelp> signatureHelp(int line, int column) {
+        ensureOpen();
         return SignatureHelpEngine.getSignatureHelp(content, line, column);
     }
 
     @Override
     public Optional<DefinitionLocation> definition(int line, int column) {
+        ensureOpen();
         return DefinitionEngine.getDefinition(content, line, column, filePath);
     }
 
     @Override
     public List<TextEdit> format() {
+        ensureOpen();
         return Formatter.format(content, filePath);
     }
 
     @Override
     public List<TextEdit> rename(String oldName, String newName) {
+        ensureOpen();
         return RenameEngine.rename(content, oldName, newName, filePath);
     }
 
     @Override
-    public void close() { closed = true; }
+    public void close() { closed = true; cachedSnapshot = null; }
     public boolean isClosed() { return closed; }
+    private void ensureOpen() { if (closed) throw new IllegalStateException("Editor session is closed"); }
 }

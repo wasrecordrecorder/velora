@@ -13,7 +13,7 @@ public final class SyntaxHighlighter {
         List<SyntaxToken> tokens = new ArrayList<>();
         for (Token t : result.tokens()) {
             SyntaxToken.TokenType type = mapType(t.type());
-            tokens.add(new SyntaxToken(type, t.text(), t.line(), t.column(), t.text().length()));
+            tokens.add(new SyntaxToken(type, t.text(), t.line(), t.column() + 1, t.text().length()));
         }
         return tokens;
     }
@@ -37,7 +37,9 @@ public final class SyntaxHighlighter {
                 || tt == TokenType.GT || tt == TokenType.GE || tt == TokenType.AND_AND || tt == TokenType.OR_OR
                 || tt == TokenType.QUESTION || tt == TokenType.INCREMENT || tt == TokenType.DECREMENT) return SyntaxToken.TokenType.OPERATOR;
         if (tt.isKeyword()) return SyntaxToken.TokenType.KEYWORD;
-        if (tt.isTrivia()) return SyntaxToken.TokenType.WHITESPACE;
+        if (tt == TokenType.COMMENT) return SyntaxToken.TokenType.COMMENT;
+        if (tt == TokenType.NEWLINE) return SyntaxToken.TokenType.NEWLINE;
+        if (tt == TokenType.WHITESPACE) return SyntaxToken.TokenType.WHITESPACE;
         return SyntaxToken.TokenType.ERROR;
     }
 }

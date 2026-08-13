@@ -3,16 +3,22 @@ package io.velora.internal.setting;
 import io.velora.api.setting.SettingDescriptor;
 import io.velora.api.setting.SettingValue;
 
-import java.util.*;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 public final class SettingStore {
     private final Map<String, SettingCell> cells = new LinkedHashMap<>();
+    private final Map<String, SettingDescriptor> descriptorsById = new LinkedHashMap<>();
     private final List<SettingDescriptor> descriptors;
 
     public SettingStore(List<SettingDescriptor> descriptors) {
         this.descriptors = List.copyOf(descriptors);
-        for (SettingDescriptor desc : descriptors) {
-            cells.put(desc.id(), new SettingCell(SettingValue.of(desc.type(), desc.defaultValue())));
+        for (SettingDescriptor descriptor : descriptors) {
+            descriptorsById.put(descriptor.id(), descriptor);
+            SettingValue initial = SettingValidator.normalize(descriptor, SettingValue.of(descriptor.type(), descriptor.defaultValue()));
+            cells.put(descriptor.id(), new SettingCell(initial));
         }
     }
 
@@ -23,13 +29,14 @@ public final class SettingStore {
 
     public SettingValue getByIndex(int index) {
         if (index < 0 || index >= descriptors.size()) return null;
-        SettingCell cell = cells.get(descriptors.get(index).id());
-        return cell != null ? cell.value() : null;
+        return get(descriptors.get(index).id());
     }
 
     public void set(String id, SettingValue value) {
         SettingCell cell = cells.get(id);
-        if (cell != null) cell.value(value);
+        SettingDescriptor descriptor = descriptorsById.get(id);
+        if (cell == null || descriptor == null) throw new IllegalArgumentException("Unknown setting: " + id);
+        cell.value(SettingValidator.normalize(descriptor, value));
     }
 
     public List<SettingDescriptor> descriptors() { return descriptors; }
@@ -37,16 +44,19 @@ public final class SettingStore {
 
     public Map<String, SettingValue> snapshot() {
         Map<String, SettingValue> result = new LinkedHashMap<>();
-        for (var e : cells.entrySet()) {
-            result.put(e.getKey(), e.getValue().value());
-        }
+        for (var entry : cells.entrySet()) result.put(entry.getKey(), entry.getValue().value());
         return result;
     }
 
-    public void applySnapshot(Map<String, SettingValue> snapshot) {
-        for (var e : snapshot.entrySet()) {
-            SettingCell cell = cells.get(e.getKey());
-            if (cell != null) cell.value(e.getValue());
+    public int applySnapshot(Map<String, SettingValue> snapshot) {
+        int applied = 0;
+        for (var entry : snapshot.entrySet()) {
+            if (!cells.containsKey(entry.getKey())) continue;
+            try {
+                set(entry.getKey(), entry.getValue());
+                applied++;
+            } catch (IllegalArgumentException ignored) {}
         }
+        return applied;
     }
 }

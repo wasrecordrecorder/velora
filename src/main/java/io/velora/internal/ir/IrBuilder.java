@@ -312,7 +312,8 @@ public final class IrBuilder {
                 }
             }
         } else if (expr instanceof UnaryExpressionNode un) {
-            buildExpression(un.operand(), instrs);
+            int[] operand = buildExpression(un.operand(), instrs);
+            maxStack = Math.max(maxStack, operand[1]);
             instrs.add(new IrInstruction.UnaryOp(un.operator(), VeloraTypes.UNIT));
         } else if (expr instanceof CallExpressionNode call) {
             if (call.callee() instanceof IdentifierExpressionNode id) {
@@ -338,11 +339,12 @@ public final class IrBuilder {
             }
         } else if (expr instanceof MemberAccessExpressionNode mem) {
             if (mem.target() instanceof IdentifierExpressionNode id && isApiNamespace(id.name())) {
-                int apiIdx = resolveApiIndex(id.name(), mem.member());
-                if (isApiSuspending(id.name(), mem.member())) {
-                    instrs.add(new IrInstruction.CallSuspend(apiIdx, 0, VeloraTypes.UNIT));
+                FunctionDescriptor descriptor = resolveApiDescriptor(id.name(), mem.member());
+                int apiIdx = descriptor.index() >= 0 ? descriptor.index() : resolveApiIndex(id.name(), mem.member());
+                if (descriptor.suspending()) {
+                    instrs.add(new IrInstruction.CallSuspend(apiIdx, 0, descriptor.returnType()));
                 } else {
-                    instrs.add(new IrInstruction.CallApi(apiIdx, 0, VeloraTypes.UNIT));
+                    instrs.add(new IrInstruction.CallApi(apiIdx, 0, descriptor.returnType()));
                 }
             } else {
                 buildExpression(mem.target(), instrs);
@@ -395,7 +397,7 @@ public final class IrBuilder {
             }
             maxStack = Math.max(maxStack, 3);
         } else if (expr instanceof DurationExpressionNode dur) {
-            buildExpression(dur.amount(), instrs);
+            instrs.add(new IrInstruction.Const(new IrValue.DurationVal(durationToNanos(dur))));
         } else if (expr instanceof IndexExpressionNode idx) {
             buildExpression(idx.receiver(), instrs);
             int[] r = buildExpression(idx.index(), instrs);
@@ -529,79 +531,55 @@ public final class IrBuilder {
     }
 
     private int buildCall(ExpressionNode callee, List<ExpressionNode> args, List<IrInstruction> instrs) {
-        String funcName = null;
-        if (callee instanceof IdentifierExpressionNode id) funcName = id.name();
-        ResolvedScript.ResolvedFunction rf = funcName != null ? resolved.functions().get(funcName) : null;
-
-        boolean hasNamedArgs = args.stream().anyMatch(a -> a instanceof NamedArgumentExpressionNode);
-
-        if (rf != null && (hasNamedArgs || (args.size() < rf.parameters().size()))) {
-            int paramCount = rf.parameters().size();
-            int callMaxStack = 0;
-            for (int i = 0; i < paramCount; i++) {
-                ResolvedScript.ResolvedParam param = rf.parameters().get(i);
-                ExpressionNode matched = null;
-                for (ExpressionNode a : args) {
-                    if (a instanceof NamedArgumentExpressionNode named && named.argumentName().equals(param.name())) {
-                        matched = named.value();
-                        break;
-                    }
-                }
-                if (matched == null && i < args.size() && !(args.get(i) instanceof NamedArgumentExpressionNode)) {
-                    matched = args.get(i);
-                }
-                if (matched != null) {
-                    int[] r = buildExpression(matched, instrs);
-                    callMaxStack = Math.max(callMaxStack, r[1] + i);
-                } else if (param.hasDefault()) {
-                    instrs.add(new IrInstruction.Const(objectToValue(param.defaultValue())));
-                    callMaxStack = Math.max(callMaxStack, 1 + i);
-                } else {
-                    instrs.add(new IrInstruction.Const(new IrValue.NullVal()));
-                    callMaxStack = Math.max(callMaxStack, 1 + i);
-                }
-            }
-            if (callee instanceof IdentifierExpressionNode id) {
-                int funcIdx = resolveFunctionIndex(id);
-                instrs.add(new IrInstruction.Call(funcIdx, paramCount, VeloraTypes.UNIT));
-            } else {
-                instrs.add(new IrInstruction.Call(0, paramCount, VeloraTypes.UNIT));
-            }
-            return Math.max(callMaxStack, paramCount);
-        } else {
-            int callMaxStack = 0;
-            int argIdx = 0;
-            for (ExpressionNode a : args) {
-                if (a instanceof NamedArgumentExpressionNode named) {
-                    int[] r = buildExpression(named.value(), instrs);
-                    callMaxStack = Math.max(callMaxStack, r[1] + argIdx);
-                } else {
-                    int[] r = buildExpression(a, instrs);
-                    callMaxStack = Math.max(callMaxStack, r[1] + argIdx);
-                }
-                argIdx++;
-            }
-            if (callee instanceof MemberAccessExpressionNode mem) {
-                if (mem.target() instanceof IdentifierExpressionNode ns && isApiNamespace(ns.name())) {
-                    int apiIdx = resolveApiIndex(ns.name(), mem.member());
-                    // Check if the API function is suspending
-                    boolean isSuspending = isApiSuspending(ns.name(), mem.member());
-                    if (isSuspending) {
-                        instrs.add(new IrInstruction.CallSuspend(apiIdx, args.size(), VeloraTypes.UNIT));
-                    } else {
-                        instrs.add(new IrInstruction.CallApi(apiIdx, args.size(), VeloraTypes.UNIT));
-                    }
-                } else {
-                    instrs.add(new IrInstruction.CallApi(0, args.size(), VeloraTypes.UNIT));
-                }
-            } else if (callee instanceof IdentifierExpressionNode id) {
-                int funcIdx = resolveFunctionIndex(id);
-                instrs.add(new IrInstruction.Call(funcIdx, args.size(), VeloraTypes.UNIT));
-            } else {
-                instrs.add(new IrInstruction.Call(0, args.size(), VeloraTypes.UNIT));
-            }
-            return Math.max(callMaxStack, args.size());
+        if (callee instanceof IdentifierExpressionNode id) {
+            ResolvedScript.ResolvedFunction function = resolved.functions().get(id.name());
+            if (function == null) throw new IllegalStateException("Unresolved function: " + id.name());
+            List<ExpressionNode> bound = bindArguments(args, function.parameters().stream().map(ResolvedScript.ResolvedParam::name).toList());
+            int stack = emitBoundArguments(bound, function.parameters().stream().map(ResolvedScript.ResolvedParam::defaultValue).toList(), instrs);
+            instrs.add(new IrInstruction.Call(function.functionIndex(), function.parameters().size(), function.returnType()));
+            return Math.max(stack, function.parameters().size());
         }
+        if (callee instanceof MemberAccessExpressionNode mem && mem.target() instanceof IdentifierExpressionNode ns && isApiNamespace(ns.name())) {
+            FunctionDescriptor descriptor = resolveApiDescriptor(ns.name(), mem.member());
+            List<ExpressionNode> bound = bindArguments(args, descriptor.parameters().stream().map(io.velora.api.function.ParameterDescriptor::name).toList());
+            List<Object> defaults = descriptor.parameters().stream().map(p -> p.hasDefault() ? p.defaultValue() : null).toList();
+            int stack = emitBoundArguments(bound, defaults, instrs);
+            int apiIdx = descriptor.index() >= 0 ? descriptor.index() : resolveApiIndex(ns.name(), mem.member());
+            if (descriptor.suspending()) instrs.add(new IrInstruction.CallSuspend(apiIdx, descriptor.parameters().size(), descriptor.returnType()));
+            else instrs.add(new IrInstruction.CallApi(apiIdx, descriptor.parameters().size(), descriptor.returnType()));
+            return Math.max(stack, descriptor.parameters().size());
+        }
+        throw new IllegalStateException("Unsupported callable expression: " + callee.nodeName());
+    }
+
+    private List<ExpressionNode> bindArguments(List<ExpressionNode> args, List<String> parameterNames) {
+        List<ExpressionNode> bound = new ArrayList<>(Collections.nCopies(parameterNames.size(), null));
+        int positional = 0;
+        for (ExpressionNode argument : args) {
+            if (argument instanceof NamedArgumentExpressionNode named) {
+                int index = parameterNames.indexOf(named.argumentName());
+                if (index >= 0) bound.set(index, named.value());
+            } else {
+                while (positional < bound.size() && bound.get(positional) != null) positional++;
+                if (positional < bound.size()) bound.set(positional++, argument);
+            }
+        }
+        return bound;
+    }
+
+    private int emitBoundArguments(List<ExpressionNode> bound, List<Object> defaults, List<IrInstruction> instrs) {
+        int max = 0;
+        for (int i = 0; i < bound.size(); i++) {
+            ExpressionNode expression = bound.get(i);
+            if (expression != null) {
+                int[] result = buildExpression(expression, instrs);
+                max = Math.max(max, result[1] + i);
+            } else {
+                instrs.add(new IrInstruction.Const(objectToValue(defaults.get(i))));
+                max = Math.max(max, i + 1);
+            }
+        }
+        return max;
     }
 
     private int resolveFunctionIndex(ExpressionNode callee) {
@@ -615,12 +593,12 @@ public final class IrBuilder {
             ResolvedScript.ResolvedFunction rf = resolved.functions().get(name);
             if (rf != null) return rf.functionIndex();
         }
-        return 0;
+        throw new IllegalStateException("Unresolved function: " + (name == null ? callee.nodeName() : name));
     }
 
     private int resolveApiIndex(String namespace, String name) {
         ApiRegistry reg = apiRegistry != null ? apiRegistry : resolved.apiRegistry();
-        if (reg == null) return 0;
+        if (reg == null) throw new IllegalStateException("API registry is unavailable");
         List<FunctionDescriptor> all = reg.all();
         for (int i = 0; i < all.size(); i++) {
             FunctionDescriptor fd = all.get(i);
@@ -628,19 +606,15 @@ public final class IrBuilder {
                 return i;
             }
         }
-        return 0;
+        throw new IllegalStateException("Unresolved API function: " + namespace + "." + name);
     }
 
-    private boolean isApiSuspending(String namespace, String name) {
+    private FunctionDescriptor resolveApiDescriptor(String namespace, String name) {
         ApiRegistry reg = apiRegistry != null ? apiRegistry : resolved.apiRegistry();
-        if (reg == null) return false;
-        List<FunctionDescriptor> all = reg.all();
-        for (FunctionDescriptor fd : all) {
-            if (fd.namespace().equals(namespace) && fd.name().equals(name)) {
-                return fd.suspending();
-            }
-        }
-        return false;
+        if (reg == null) throw new IllegalStateException("API registry is unavailable");
+        FunctionDescriptor descriptor = reg.find(namespace, name);
+        if (descriptor == null) throw new IllegalStateException("Unresolved API function: " + namespace + "." + name);
+        return descriptor;
     }
 
     private boolean isApiNamespace(String name) {
@@ -666,10 +640,9 @@ public final class IrBuilder {
     }
 
     private VeloraType resolveType(TypeNode typeNode) {
-        if (typeNode == null) return VeloraTypes.UNIT;
+        if (typeNode == null || typeNode.typeName() == null) return VeloraTypes.UNIT;
         String name = typeNode.typeName();
-        if (name == null) return VeloraTypes.UNIT;
-        return switch (name) {
+        VeloraType type = switch (name) {
             case "Int", "int" -> VeloraTypes.INT;
             case "Long", "long" -> VeloraTypes.LONG;
             case "Float", "float" -> VeloraTypes.FLOAT;
@@ -680,17 +653,32 @@ public final class IrBuilder {
             case "Char", "char" -> VeloraTypes.CHAR;
             case "Unit", "void" -> VeloraTypes.UNIT;
             case "Duration" -> VeloraTypes.DURATION;
-            default -> {
-                if (!typeNode.typeArguments().isEmpty()) {
-                    if (name.equals("List") || name.equals("list")) {
-                        yield VeloraTypes.list(resolveType(typeNode.typeArguments().get(0)));
-                    } else if (name.equals("Map") || name.equals("map")) {
-                        yield VeloraTypes.map(resolveType(typeNode.typeArguments().get(0)), resolveType(typeNode.typeArguments().get(1)));
-                    }
-                }
-                yield VeloraTypes.UNIT;
-            }
+            case "List", "list" -> typeNode.typeArguments().size() == 1 ? VeloraTypes.list(resolveType(typeNode.typeArguments().get(0))) : VeloraTypes.UNIT;
+            case "Set", "set" -> typeNode.typeArguments().size() == 1 ? VeloraTypes.set(resolveType(typeNode.typeArguments().get(0))) : VeloraTypes.UNIT;
+            case "Task", "task" -> typeNode.typeArguments().size() == 1 ? VeloraTypes.task(resolveType(typeNode.typeArguments().get(0))) : VeloraTypes.UNIT;
+            case "Map", "map" -> typeNode.typeArguments().size() == 2 ? VeloraTypes.map(resolveType(typeNode.typeArguments().get(0)), resolveType(typeNode.typeArguments().get(1))) : VeloraTypes.UNIT;
+            default -> VeloraTypes.UNIT;
         };
+        return typeNode.nullable() ? type.nullable() : type;
+    }
+
+    private long durationToNanos(DurationExpressionNode duration) {
+        if (!(duration.amount() instanceof LiteralExpressionNode literal) || !(literal.value() instanceof Number number)) {
+            throw new IllegalStateException("Duration amount must be numeric");
+        }
+        long factor = switch (duration.unit()) {
+            case "millis", "milliseconds", "ms" -> 1_000_000L;
+            case "seconds", "second", "sec", "s" -> 1_000_000_000L;
+            case "minutes", "minute", "min" -> 60_000_000_000L;
+            case "hours", "hour", "h" -> 3_600_000_000_000L;
+            case "days", "day" -> 86_400_000_000_000L;
+            default -> throw new IllegalStateException("Unknown duration unit: " + duration.unit());
+        };
+        try {
+            return new java.math.BigDecimal(number.toString()).multiply(java.math.BigDecimal.valueOf(factor)).longValueExact();
+        } catch (ArithmeticException e) {
+            throw new IllegalArgumentException("Duration is out of range or below nanosecond precision", e);
+        }
     }
 
     private IrValue objectToValue(Object value) {

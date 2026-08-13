@@ -1,7 +1,7 @@
 package io.velora.internal.ast;
 
 /**
- * Type check: {@code block is BlockRef}. Yields a Boolean.
+ * Type check: {@code block is EntityRef}. Yields a Boolean.
  */
 public final class IsExpressionNode extends ExpressionNode {
     private final ExpressionNode operand;

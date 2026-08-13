@@ -12,6 +12,7 @@ public final class ScriptFiber {
     private final String scriptId;
     private final int functionIndex;
     private final ScriptValue[] args;
+    private final long createdAtNanos = System.nanoTime();
     private FiberState state = FiberState.READY;
     private int instructionsThisTick;
     private long sleepUntilNanos;
@@ -24,6 +25,10 @@ public final class ScriptFiber {
     private Deque<CallFrame> savedCallStack;
     private int savedInstructions;
     private int consecutiveInstructionLimits;
+    private long instructionsExecuted;
+    private long reservedMemory;
+    private boolean eventFiber;
+    private String functionName;
 
     public ScriptFiber(long id, String scriptId, int functionIndex, ScriptValue[] args) {
         this.id = id;
@@ -31,6 +36,7 @@ public final class ScriptFiber {
         this.functionIndex = functionIndex;
         this.args = args;
         this.parentId = -1;
+        this.functionName = "fn" + functionIndex;
     }
 
     public long id() { return id; }
@@ -52,6 +58,16 @@ public final class ScriptFiber {
     public long awaitTaskId() { return awaitTaskId; }
     public void awaitTaskId(long t) { this.awaitTaskId = t; }
     public boolean isDone() { return state == FiberState.COMPLETED || state == FiberState.FAILED || state == FiberState.CANCELLED; }
+    public long createdAtNanos() { return createdAtNanos; }
+    public long instructionsExecuted() { return instructionsExecuted; }
+    public void addInstructionsExecuted(long count) { instructionsExecuted += count; }
+    public long reservedMemory() { return reservedMemory; }
+    public void reservedMemory(long bytes) { reservedMemory = bytes; }
+    public boolean eventFiber() { return eventFiber; }
+    public void eventFiber(boolean value) { eventFiber = value; }
+    public String functionName() { return functionName; }
+    public void functionName(String value) { functionName = value; }
+    public int instructionPointer() { return savedCallStack != null && !savedCallStack.isEmpty() ? savedCallStack.peek().ip() : 0; }
 
     public ValueStack savedStack() { return savedStack; }
     public void savedStack(ValueStack s) { this.savedStack = s; }

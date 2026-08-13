@@ -1,6 +1,13 @@
 package io.velora.internal.vm;
 
-public sealed interface ScriptValue permits PrimitiveValue, StringValue, ListValue, MapValue, StructValue, EnumValue, HandleValue, TaskValue {
+import java.lang.reflect.Array;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+public sealed interface ScriptValue permits PrimitiveValue, StringValue, ListValue, MapValue, SetValue, StructValue, EnumValue, HandleValue, TaskValue {
     boolean isNull();
     Object boxed();
 
@@ -16,6 +23,27 @@ public sealed interface ScriptValue permits PrimitiveValue, StringValue, ListVal
         if (obj instanceof Byte b) return PrimitiveValue.of(b);
         if (obj instanceof Short s) return PrimitiveValue.of((int) s);
         if (obj instanceof Character c) return PrimitiveValue.of(c);
-        return new HandleValue("Object", obj);
+        if (obj instanceof List<?> list) {
+            List<ScriptValue> values = new ArrayList<>(list.size());
+            for (Object value : list) values.add(fromJava(value));
+            return new ListValue(values);
+        }
+        if (obj instanceof Map<?, ?> map) {
+            Map<ScriptValue, ScriptValue> values = new LinkedHashMap<>();
+            for (Map.Entry<?, ?> entry : map.entrySet()) values.put(fromJava(entry.getKey()), fromJava(entry.getValue()));
+            return new MapValue(values);
+        }
+        if (obj instanceof Set<?> set) {
+            Set<ScriptValue> values = new java.util.LinkedHashSet<>();
+            for (Object value : set) values.add(fromJava(value));
+            return new SetValue(values);
+        }
+        if (obj.getClass().isArray()) {
+            int length = Array.getLength(obj);
+            List<ScriptValue> values = new ArrayList<>(length);
+            for (int i = 0; i < length; i++) values.add(fromJava(Array.get(obj, i)));
+            return new ListValue(values);
+        }
+        return new HandleValue(obj.getClass().getName(), obj);
     }
 }

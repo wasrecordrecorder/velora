@@ -29,6 +29,8 @@ public interface CancellationToken {
 
     /** Exception used to unwind a cancelled fiber. It is not a runtime failure. */
     final class CancellationException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
         public CancellationException() {
             super("Fiber cancelled", null, false, false);
         }

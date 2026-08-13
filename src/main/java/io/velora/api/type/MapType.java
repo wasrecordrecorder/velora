@@ -31,7 +31,7 @@ final class MapType implements VeloraType {
 
     @Override
     public String name() {
-        return "Map<" + key.name() + ", " + value.name() + ">";
+        return "Map<" + key.name() + ", " + value.name() + ">" + (nullable ? "?" : "");
     }
 
     @Override

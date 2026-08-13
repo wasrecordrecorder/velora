@@ -87,6 +87,15 @@ public final class VeloraLimits {
         public Builder engineWallTimeNanosPerTick(long v) { this.engineWallTimeNanosPerTick = v; return this; }
 
         public VeloraLimits build() {
+            if (instructionsPerFiberTick <= 0 || instructionsPerScriptTick <= 0 || instructionsPerEngineTick <= 0
+                    || apiCostPerScriptTick <= 0 || memoryPerScript <= 0 || maxFibersPerScript <= 0
+                    || maxTasksPerScript <= 0 || maxEventQueuePerScript <= 0 || maxCallDepth <= 0
+                    || maxStringLength <= 0 || maxCollectionElements <= 0 || maxCollectionDepth <= 0
+                    || engineWallTimeNanosPerTick <= 0) {
+                throw new IllegalArgumentException("Velora limits must be positive");
+            }
+            if (instructionsPerScriptTick < instructionsPerFiberTick) throw new IllegalArgumentException("Script instruction budget must be >= fiber budget");
+            if (instructionsPerEngineTick < instructionsPerScriptTick) throw new IllegalArgumentException("Engine instruction budget must be >= script budget");
             return new VeloraLimits(this);
         }
     }

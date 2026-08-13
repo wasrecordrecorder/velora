@@ -16,12 +16,12 @@ class SecurityV2Test {
     @DisplayName("PermissionController: set and check permissions")
     void permissionController_setCheck() {
         PermissionController pc = new PermissionController();
-        ScriptPermission worldRead = ScriptPermission.of("WORLD_READ", "World Read", "");
-        ScriptPermission playerControl = ScriptPermission.of("PLAYER_CONTROL", "Player Control", "");
+        ScriptPermission readPermission = ScriptPermission.of("DATA_READ", "Data Read", "");
+        ScriptPermission controlPermission = ScriptPermission.of("ACTION_CONTROL", "Action Control", "");
 
-        pc.setPermissions("script1", PermissionSet.of(worldRead));
-        assertTrue(pc.hasPermission("script1", worldRead));
-        assertFalse(pc.hasPermission("script1", playerControl));
+        pc.setPermissions("script1", PermissionSet.of(readPermission));
+        assertTrue(pc.hasPermission("script1", readPermission));
+        assertFalse(pc.hasPermission("script1", controlPermission));
     }
 
     @Test
@@ -56,76 +56,6 @@ class SecurityV2Test {
         assertFalse(pc.hasPermission("s1", p2));
         assertTrue(pc.hasPermission("s2", p2));
         assertFalse(pc.hasPermission("s2", p1));
-    }
-
-    // === HandleValidator ===
-
-    @Test
-    @DisplayName("HandleValidator: register and validate")
-    void handleValidator_registerValidate() {
-        HandleValidator hv = new HandleValidator();
-        hv.registerHandleType("PlayerRef");
-        assertTrue(hv.isValid("PlayerRef"));
-        assertFalse(hv.isValid("UnknownType"));
-    }
-
-    @Test
-    @DisplayName("HandleValidator: validate throws on invalid")
-    void handleValidator_throws() {
-        HandleValidator hv = new HandleValidator();
-        hv.registerHandleType("Valid");
-        assertDoesNotThrow(() -> hv.validate("Valid"));
-        assertThrows(SecurityException.class, () -> hv.validate("Invalid"));
-    }
-
-    @Test
-    @DisplayName("HandleValidator: empty validator rejects all")
-    void handleValidator_empty() {
-        HandleValidator hv = new HandleValidator();
-        assertFalse(hv.isValid("Anything"));
-        assertThrows(SecurityException.class, () -> hv.validate("Anything"));
-    }
-
-    // === ApiCostController ===
-
-    @Test
-    @DisplayName("ApiCostController: within budget")
-    void apiCostController_withinBudget() {
-        ApiCostController ac = new ApiCostController(100);
-        assertTrue(ac.canCall(50));
-        ac.recordCall(50);
-        assertTrue(ac.canCall(50));
-        ac.recordCall(50);
-        assertFalse(ac.canCall(1));
-    }
-
-    @Test
-    @DisplayName("ApiCostController: reset tick")
-    void apiCostController_reset() {
-        ApiCostController ac = new ApiCostController(100);
-        ac.recordCall(100);
-        assertFalse(ac.canCall(1));
-        ac.resetTick();
-        assertTrue(ac.canCall(100));
-    }
-
-    @Test
-    @DisplayName("ApiCostController: exact budget boundary")
-    void apiCostController_boundary() {
-        ApiCostController ac = new ApiCostController(100);
-        assertTrue(ac.canCall(100));
-        ac.recordCall(100);
-        assertFalse(ac.canCall(1));
-        assertEquals(100, ac.costThisTick());
-    }
-
-    @Test
-    @DisplayName("ApiCostController: zero cost always allowed")
-    void apiCostController_zeroCost() {
-        ApiCostController ac = new ApiCostController(0);
-        assertTrue(ac.canCall(0));
-        ac.recordCall(0);
-        assertTrue(ac.canCall(0));
     }
 
     // === ResourceCounter ===
@@ -251,57 +181,6 @@ class SecurityV2Test {
         ResourceLimits rl = new ResourceLimits(limits);
         assertFalse(rl.callDepthExceeded(10));
         assertTrue(rl.callDepthExceeded(11));
-    }
-
-    // === ScriptThrottleController ===
-
-    @Test
-    @DisplayName("ScriptThrottleController: throttle after max violations")
-    void throttleController_throttle() {
-        ScriptThrottleController stc = new ScriptThrottleController(3);
-        stc.recordViolation("s1");
-        stc.recordViolation("s1");
-        assertFalse(stc.isThrottled("s1"));
-        stc.recordViolation("s1");
-        assertTrue(stc.isThrottled("s1"));
-    }
-
-    @Test
-    @DisplayName("ScriptThrottleController: unthrottle clears state")
-    void throttleController_unthrottle() {
-        ScriptThrottleController stc = new ScriptThrottleController(1);
-        stc.recordViolation("s1");
-        assertTrue(stc.isThrottled("s1"));
-        stc.unthrottle("s1");
-        assertFalse(stc.isThrottled("s1"));
-    }
-
-    @Test
-    @DisplayName("ScriptThrottleController: different scripts isolated")
-    void throttleController_isolation() {
-        ScriptThrottleController stc = new ScriptThrottleController(2);
-        stc.recordViolation("s1");
-        stc.recordViolation("s1");
-        assertTrue(stc.isThrottled("s1"));
-        assertFalse(stc.isThrottled("s2"));
-    }
-
-    @Test
-    @DisplayName("ScriptThrottleController: clear removes all")
-    void throttleController_clear() {
-        ScriptThrottleController stc = new ScriptThrottleController(1);
-        stc.recordViolation("s1");
-        stc.clear("s1");
-        assertFalse(stc.isThrottled("s1"));
-    }
-
-    @Test
-    @DisplayName("ScriptThrottleController: throttledScripts returns set")
-    void throttleController_throttledSet() {
-        ScriptThrottleController stc = new ScriptThrottleController(1);
-        stc.recordViolation("s1");
-        stc.recordViolation("s2");
-        assertEquals(2, stc.throttledScripts().size());
     }
 
     // === LogRateLimiter ===

@@ -38,10 +38,11 @@ public interface NamespaceBuilder {
      */
     NamespaceBuilder function(String name, VeloraType returnType, FunctionInvoker invoker);
 
-    /**
-     * Register a synchronous function with permission.
-     */
+    NamespaceBuilder function(String name, VeloraType returnType, Consumer<ParameterListBuilder> parameters, FunctionInvoker invoker);
+
     NamespaceBuilder function(String name, VeloraType returnType, ScriptPermission permission, FunctionInvoker invoker);
+
+    NamespaceBuilder function(String name, VeloraType returnType, Consumer<ParameterListBuilder> parameters, ScriptPermission permission, FunctionInvoker invoker);
 
     /**
      * Set description for the last registered function or property.

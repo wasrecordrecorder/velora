@@ -33,8 +33,6 @@ public enum TokenType {
     KW_PACKAGE,
     KW_PRIVATE,
     KW_PUBLIC,
-    KW_ENUM,
-    KW_DATA,
     KW_IS,
     KW_IN,
     KW_SPAWN,

@@ -65,6 +65,7 @@ public final class SemanticAnalyzer {
         Map<LifecycleNode.Hook, ResolvedScript.ResolvedFunction> lifecycle = new LinkedHashMap<>();
         List<ResolvedScript.ResolvedEventHandler> eventHandlers = new ArrayList<>();
         Set<ScriptPermission> requiredPerms = new LinkedHashSet<>();
+        Set<String> persistentIds = new HashSet<>();
 
         // Build script-level scope: settings + properties + functions
         Scope scriptScope = new Scope();
@@ -92,23 +93,30 @@ public final class SemanticAnalyzer {
                     propType = inferTypeFromInitializer(prop.initializer());
                 }
                 if (propType == null) propType = VeloraTypes.UNIT;
+                if (prop.persistent()) {
+                    String persistentId = prop.persistentId() != null ? prop.persistentId() : prop.name();
+                    if (!isPersistableType(propType)) error(DiagnosticCode.SEMANTIC_INVALID_PERSISTENT_TYPE, "Persistent field '" + prop.name() + "' uses unsupported type " + propType.name(), prop.line(), prop.column());
+                    if (persistentId.isBlank()) error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "Persistent id cannot be blank", prop.line(), prop.column());
+                    else if (!persistentIds.add(persistentId)) error(DiagnosticCode.SEMANTIC_DUPLICATE_SYMBOL, "Duplicate persistent id: " + persistentId, prop.line(), prop.column());
+                }
 
                 // Extract const value for field initializers (all fields, not just const/static)
                 Object constValue = null;
                 if (prop.initializer() == null) {
-                    if (prop.isConst()) {
-                        error(DiagnosticCode.SEMANTIC_MISSING_INITIALIZER, "Constant '" + prop.name() + "' requires an initializer", prop.line(), prop.column());
-                    }
+                    if (prop.isConst()) error(DiagnosticCode.SEMANTIC_MISSING_INITIALIZER, "Constant '" + prop.name() + "' requires an initializer", prop.line(), prop.column());
                 } else {
-                    // Check static+const conflict
-                    if (prop.isStatic() && prop.isConst()) {
-                        error(DiagnosticCode.SEMANTIC_STATIC_CONST_CONFLICT, "Field '" + prop.name() + "' cannot be both static and const", prop.line(), prop.column());
+                    if (prop.isStatic() && prop.isConst()) error(DiagnosticCode.SEMANTIC_STATIC_CONST_CONFLICT, "Field '" + prop.name() + "' cannot be both static and const", prop.line(), prop.column());
+                    ConstantEvaluation evaluation = evaluateConstant(prop.initializer(), properties);
+                    if (!evaluation.constant()) {
+                        error(prop.isConst() ? DiagnosticCode.SEMANTIC_CONST_RUNTIME_INIT : DiagnosticCode.SEMANTIC_NON_CONSTANT_FIELD_INIT,
+                                "Field '" + prop.name() + "' initializer must be compile-time evaluable", prop.line(), prop.column());
+                    } else {
+                        constValue = evaluation.value();
+                        VeloraType valueType = constantType(constValue);
+                        if (propType != VeloraTypes.UNIT && valueType != null && !isAssignable(valueType, propType)) {
+                            error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Field '" + prop.name() + "' expects " + propType.name() + ", got " + valueType.name(), prop.line(), prop.column());
+                        }
                     }
-                    // Check const initializer is compile-time constant
-                    if (prop.isConst() && !(prop.initializer() instanceof LiteralExpressionNode)) {
-                        error(DiagnosticCode.SEMANTIC_CONST_RUNTIME_INIT, "Constant '" + prop.name() + "' initializer must be a compile-time constant", prop.line(), prop.column());
-                    }
-                    constValue = extractConstValue(prop.initializer());
                 }
 
                 int idx = prop.isStatic() ? staticIndex++ : fieldIndex++;
@@ -244,6 +252,9 @@ public final class SemanticAnalyzer {
             if (vd.initializer() != null) {
                 VeloraType initType = checkExpression(vd.initializer(), scope, currentFn, requiredPerms);
                 if (type == null) type = initType;
+                else if (initType != null && initType != VeloraTypes.UNIT && !isAssignable(initType, type)) {
+                    error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Variable '" + vd.name() + "' expects " + type.name() + ", got " + initType.name(), vd.line(), vd.column());
+                }
             }
             if (type == null) type = VeloraTypes.UNIT;
             if (vd.initializer() instanceof LiteralExpressionNode lit && lit.kind() == LiteralExpressionNode.LiteralKind.NULL
@@ -270,8 +281,8 @@ public final class SemanticAnalyzer {
                 error(DiagnosticCode.SEMANTIC_NON_ITERABLE, "For loop iterable must be a List, got " + iterType.name(), fs.line(), fs.column());
             }
             Scope forScope = new Scope(scope);
-            VeloraType elemType = VeloraTypes.UNIT;
-            if (iterType != null) elemType = iterType;
+            VeloraType elemType = VeloraTypes.listElement(iterType);
+            if (elemType == null) elemType = VeloraTypes.UNIT;
             forScope.define(new Symbol(fs.variable(), elemType, Symbol.Kind.LOCAL));
             if (fs.body() != null) checkBlock(fs.body(), forScope, currentFn, requiredPerms);
         } else if (stmt instanceof WhenStatementNode ws) {
@@ -303,15 +314,12 @@ public final class SemanticAnalyzer {
     }
 
     private boolean isAssignable(VeloraType from, VeloraType to) {
-        if (from == to) return true;
-        if (to == VeloraTypes.UNIT) return true;
-        // Numeric widening
-        if (from == VeloraTypes.INT && (to == VeloraTypes.LONG || to == VeloraTypes.DOUBLE || to == VeloraTypes.FLOAT)) return true;
-        if (from == VeloraTypes.LONG && to == VeloraTypes.DOUBLE) return true;
-        if (from == VeloraTypes.FLOAT && to == VeloraTypes.DOUBLE) return true;
-        // Nullable to non-null same base
-        if (to != null && from.name().equals(to.name())) return true;
-        return false;
+        if (from == null || to == null) return false;
+        if (from == to || to == VeloraTypes.UNIT) return true;
+        if (isNullType(from)) return !to.isPrimitive() || to.isNullable();
+        if (VeloraTypes.isWidening(from, to)) return true;
+        if (from.name().equals(to.name())) return true;
+        return to.isNullable() && from.nonNull().name().equals(to.nonNull().name());
     }
 
     private VeloraType checkExpression(ExpressionNode expr, Scope scope, ResolvedScript.ResolvedFunction currentFn, Set<ScriptPermission> requiredPerms) {
@@ -322,7 +330,7 @@ public final class SemanticAnalyzer {
         if (expr instanceof IdentifierExpressionNode id) {
             Symbol s = scope.resolve(id.name());
             if (s == null) {
-                // Could be an API namespace (e.g. world, bot, player)
+                // Could be an API namespace
                 if (isApiNamespace(id.name())) {
                     return VeloraTypes.UNIT; // namespace itself
                 }
@@ -334,31 +342,36 @@ public final class SemanticAnalyzer {
         if (expr instanceof BinaryExpressionNode bin) {
             VeloraType lt = checkExpression(bin.left(), scope, currentFn, requiredPerms);
             VeloraType rt = checkExpression(bin.right(), scope, currentFn, requiredPerms);
-            return binaryType(bin.operator(), lt, rt);
+            return checkBinary(bin, lt, rt);
         }
         if (expr instanceof UnaryExpressionNode un) {
-            checkExpression(un.operand(), scope, currentFn, requiredPerms);
-            if (un.operator().equals("!")) return VeloraTypes.BOOLEAN;
-            return VeloraTypes.UNIT;
+            VeloraType operandType = checkExpression(un.operand(), scope, currentFn, requiredPerms);
+            if (un.operator().equals("!")) {
+                if (operandType != VeloraTypes.BOOLEAN && operandType != VeloraTypes.UNIT) {
+                    error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Operator ! requires Boolean, got " + operandType.name(), un.line(), un.column());
+                }
+                return VeloraTypes.BOOLEAN;
+            }
+            if ((un.operator().equals("+") || un.operator().equals("-")) && !isNumeric(operandType) && operandType != VeloraTypes.UNIT) {
+                error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Unary " + un.operator() + " requires a number, got " + operandType.name(), un.line(), un.column());
+            }
+            return operandType;
         }
         if (expr instanceof CallExpressionNode call) {
             return checkCall(call, scope, currentFn, requiredPerms);
         }
         if (expr instanceof MemberAccessExpressionNode mem) {
             VeloraType recvType = checkExpression(mem.target(), scope, currentFn, requiredPerms);
-            // Resolve member type from struct type or API property
-            if (recvType instanceof io.velora.api.type.StructType st && st.hasProperty(mem.member())) {
-                return st.property(mem.member()).type();
-            }
-            // API property access: namespace.property (without call)
+            if (recvType instanceof io.velora.api.type.StructType st && st.hasProperty(mem.member())) return st.property(mem.member()).type();
+            if (recvType == VeloraTypes.STRING && mem.member().equals("length")) return VeloraTypes.INT;
+            if ((VeloraTypes.listElement(recvType) != null || VeloraTypes.mapKey(recvType) != null || VeloraTypes.setElement(recvType) != null) && mem.member().equals("size")) return VeloraTypes.INT;
             if (mem.target() instanceof IdentifierExpressionNode ns && isApiNamespace(ns.name())) {
                 FunctionDescriptor fd = apiRegistry.find(ns.name(), mem.member());
-                if (fd != null && fd.permission() != null) {
-                    requiredPerms.add(fd.permission());
+                if (fd != null && fd.parameters().isEmpty()) {
+                    if (fd.permission() != null) requiredPerms.add(fd.permission());
                     return fd.returnType();
                 }
             }
-            // Could be a constant namespace access (Blocks.X) — handled in qualified
             return VeloraTypes.UNIT;
         }
         if (expr instanceof QualifiedExpressionNode q) {
@@ -382,11 +395,34 @@ public final class SemanticAnalyzer {
             return VeloraTypes.BOOLEAN;
         }
         if (expr instanceof ListLiteralExpressionNode list) {
-            VeloraType elem = VeloraTypes.UNIT;
+            VeloraType elem = null;
             for (ExpressionNode e : list.elements()) {
-                elem = checkExpression(e, scope, currentFn, requiredPerms);
+                VeloraType current = checkExpression(e, scope, currentFn, requiredPerms);
+                if (elem == null || elem == VeloraTypes.UNIT) elem = current;
+                else if (current != VeloraTypes.UNIT) {
+                    VeloraType common = commonType(elem, current);
+                    if (common == null) {
+                        error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "List elements must have compatible types, got " + elem.name() + " and " + current.name(), e.line(), e.column());
+                    } else elem = common;
+                }
             }
-            return VeloraTypes.list(elem);
+            return VeloraTypes.list(elem == null ? VeloraTypes.UNIT : elem);
+        }
+        if (expr instanceof MapLiteralExpressionNode map) {
+            VeloraType key = null;
+            VeloraType value = null;
+            for (var entry : map.entries()) {
+                VeloraType currentKey = checkExpression(entry.getKey(), scope, currentFn, requiredPerms);
+                VeloraType currentValue = checkExpression(entry.getValue(), scope, currentFn, requiredPerms);
+                key = mergeLiteralType(key, currentKey, entry.getKey(), "Map keys");
+                value = mergeLiteralType(value, currentValue, entry.getValue(), "Map values");
+            }
+            if (key == null) key = VeloraTypes.UNIT;
+            if (value == null) value = VeloraTypes.UNIT;
+            if (key != VeloraTypes.UNIT && !key.isHashable()) {
+                error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "Map key type must be hashable, got " + key.name(), map.line(), map.column());
+            }
+            return VeloraTypes.map(key, value);
         }
         if (expr instanceof InterpolationExpressionNode interp) {
             for (InterpolationExpressionNode.Segment seg : interp.segments()) {
@@ -403,47 +439,66 @@ public final class SemanticAnalyzer {
         if (expr instanceof IndexExpressionNode idx) {
             VeloraType recvType = checkExpression(idx.receiver(), scope, currentFn, requiredPerms);
             VeloraType indexType = checkExpression(idx.index(), scope, currentFn, requiredPerms);
-            // Check index type
-            if (recvType != null && recvType.name().startsWith("List")) {
+            VeloraType elementType = VeloraTypes.listElement(recvType);
+            if (elementType != null) {
                 if (indexType != null && indexType != VeloraTypes.INT && indexType != VeloraTypes.UNIT) {
-                    error(DiagnosticCode.SEMANTIC_INDEX_TYPE_MISMATCH, "List index must be int, got " + indexType.name(), idx.line(), idx.column());
+                    error(DiagnosticCode.SEMANTIC_INDEX_TYPE_MISMATCH, "List index must be Int, got " + indexType.name(), idx.line(), idx.column());
                 }
-            } else if (recvType != null && recvType.name().startsWith("Map<")) {
-                // Extract key type from name: "Map<K, V>"
-                String name = recvType.name();
-                int start = name.indexOf('<');
-                int comma = name.indexOf(',');
-                if (start >= 0 && comma > start) {
-                    String keyTypeName = name.substring(start + 1, comma).trim();
-                    if (indexType != null && indexType != VeloraTypes.UNIT) {
-                        String indexTypeName = indexType.name();
-                        // Handle nullable types
-                        if (indexTypeName.endsWith("?")) indexTypeName = indexTypeName.substring(0, indexTypeName.length() - 1);
-                        if (!keyTypeName.equals(indexTypeName) && !keyTypeName.equals(indexType.name())) {
-                            error(DiagnosticCode.SEMANTIC_INDEX_TYPE_MISMATCH, "Map key type mismatch: expected " + keyTypeName + ", got " + indexType.name(), idx.line(), idx.column());
-                        }
-                    }
+                return elementType;
+            }
+            VeloraType keyType = VeloraTypes.mapKey(recvType);
+            if (keyType != null) {
+                if (indexType != null && indexType != VeloraTypes.UNIT && !isAssignable(indexType, keyType)) {
+                    error(DiagnosticCode.SEMANTIC_INDEX_TYPE_MISMATCH, "Map key type mismatch: expected " + keyType.name() + ", got " + indexType.name(), idx.line(), idx.column());
                 }
+                VeloraType valueType = VeloraTypes.mapValue(recvType);
+                return valueType == null ? VeloraTypes.UNIT : valueType;
             }
             return VeloraTypes.UNIT;
         }
         if (expr instanceof AssignmentExpressionNode assign) {
+            VeloraType targetType = checkExpression(assign.target(), scope, currentFn, requiredPerms);
             if (assign.target() instanceof IdentifierExpressionNode id) {
-                Symbol s = scope.resolve(id.name());
-                if (s != null && s.isConstProperty()) {
-                    error(DiagnosticCode.SEMANTIC_CONST_ASSIGNMENT, "Cannot assign to constant '" + id.name() + "'", id.line(), id.column());
+                Symbol symbol = scope.resolve(id.name());
+                if (symbol != null && symbol.isConstProperty()) error(DiagnosticCode.SEMANTIC_CONST_ASSIGNMENT, "Cannot assign to constant '" + id.name() + "'", id.line(), id.column());
+                if (symbol != null && symbol.isSetting()) error(DiagnosticCode.SEMANTIC_SETTING_WRITE, "Cannot assign to setting '" + id.name() + "' (settings are read-only)", id.line(), id.column());
+            } else {
+                error(DiagnosticCode.SEMANTIC_INVALID_ASSIGNMENT_TARGET, "Only variables and script fields are assignable", assign.target().line(), assign.target().column());
+            }
+            if (assign.operator().equals("++") || assign.operator().equals("--")) {
+                if (!isNumeric(targetType) && targetType != VeloraTypes.UNIT) {
+                    error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Operator " + assign.operator() + " requires a numeric target, got " + targetType.name(), assign.line(), assign.column());
                 }
-                if (s != null && s.isSetting()) {
-                    error(DiagnosticCode.SEMANTIC_SETTING_WRITE, "Cannot assign to setting '" + id.name() + "' (settings are read-only)", id.line(), id.column());
+                return targetType;
+            }
+            VeloraType valueType = assign.value() == null ? VeloraTypes.UNIT : checkExpression(assign.value(), scope, currentFn, requiredPerms);
+            if (assign.operator().equals("=")) {
+                if (targetType != VeloraTypes.UNIT && valueType != VeloraTypes.UNIT && !isAssignable(valueType, targetType)) {
+                    error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Assignment type mismatch: expected " + targetType.name() + ", got " + valueType.name(), assign.line(), assign.column());
+                }
+            } else {
+                String binaryOperator = assign.operator().substring(0, 1);
+                VeloraType result = checkBinary(binaryOperator, targetType, valueType, assign.line(), assign.column());
+                if (targetType != VeloraTypes.UNIT && result != VeloraTypes.UNIT && !isAssignable(result, targetType)) {
+                    error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Compound assignment result " + result.name() + " cannot be stored in " + targetType.name(), assign.line(), assign.column());
                 }
             }
-            checkExpression(assign.target(), scope, currentFn, requiredPerms);
-            if (assign.value() != null) checkExpression(assign.value(), scope, currentFn, requiredPerms);
-            return VeloraTypes.UNIT;
+            return targetType;
         }
         if (expr instanceof SpawnExpressionNode spawn) {
-            checkCallExpression(spawn.callee(), spawn.arguments(), scope, currentFn, requiredPerms);
-            return VeloraTypes.UNIT;
+            if (!(spawn.callee() instanceof IdentifierExpressionNode id)) {
+                checkCallExpression(spawn.callee(), spawn.arguments(), scope, currentFn, requiredPerms);
+                error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "spawn requires a script function", spawn.line(), spawn.column());
+                return VeloraTypes.task(VeloraTypes.UNIT);
+            }
+            Symbol symbol = scope.resolve(id.name());
+            if (symbol == null || !symbol.isFunction()) {
+                checkCallExpression(spawn.callee(), spawn.arguments(), scope, currentFn, requiredPerms);
+                error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "spawn requires a script function", spawn.line(), spawn.column());
+                return VeloraTypes.task(VeloraTypes.UNIT);
+            }
+            VeloraType resultType = checkCallExpression(spawn.callee(), spawn.arguments(), scope, currentFn, requiredPerms);
+            return VeloraTypes.task(resultType == null ? VeloraTypes.UNIT : resultType);
         }
         return VeloraTypes.UNIT;
     }
@@ -459,29 +514,18 @@ public final class SemanticAnalyzer {
                 // API call: namespace.function(args)
                 FunctionDescriptor fd = apiRegistry.find(ns.name(), mem.member());
                 if (fd != null) {
-                    // Check arity (skip for placeholder functions with 0 params)
-                    int required = fd.parameters().size();
-                    if (required > 0) {
-                        int minArgs = required;
-                        for (var p : fd.parameters()) {
-                            if (p.hasDefault()) minArgs--;
+                    List<ExpressionNode> bound = bindArguments(fd.qualifiedName(), args, fd.parameters().stream().map(io.velora.api.function.ParameterDescriptor::name).toList(), fd.parameters().stream().map(io.velora.api.function.ParameterDescriptor::hasDefault).toList(), scope, currentFn, requiredPerms, mem.line(), mem.column());
+                    for (int i = 0; i < bound.size(); i++) {
+                        ExpressionNode argExpr = bound.get(i);
+                        if (argExpr == null) continue;
+                        VeloraType argType = checkExpression(argExpr, scope, currentFn, requiredPerms);
+                        VeloraType paramType = fd.parameters().get(i).type();
+                        if (argType != null && argType != VeloraTypes.UNIT && !isAssignable(argType, paramType)) {
+                            error(DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE, "Argument '" + fd.parameters().get(i).name() + "' type mismatch: expected " + paramType.name() + ", got " + argType.name(), argExpr.line(), argExpr.column());
                         }
-                        int actualArgs = args.size();
-                        if (actualArgs < minArgs || actualArgs > required) {
-                            error(DiagnosticCode.SEMANTIC_WRONG_ARITY, "Wrong number of arguments for " + ns.name() + "." + mem.member() + ": expected " + minArgs + ".." + required + ", got " + actualArgs, mem.line(), mem.column());
-                        }
-                        // Check argument types
-                        for (int i = 0; i < Math.min(actualArgs, required); i++) {
-                            VeloraType argType = checkExpression(args.get(i), scope, currentFn, requiredPerms);
-                            if (argType != null && argType != VeloraTypes.UNIT) {
-                                VeloraType paramType = fd.parameters().get(i).type();
-                                if (!isAssignable(argType, paramType)) {
-                                    error(DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE, "Argument " + (i+1) + " type mismatch: expected " + paramType.name() + ", got " + argType.name(), args.get(i).line(), args.get(i).column());
-                                }
-                            }
-                        }
-                    } else {
-                        for (ExpressionNode a : args) checkExpression(a, scope, currentFn, requiredPerms);
+                    }
+                    if (fd.suspending() && !currentFn.suspending()) {
+                        error(DiagnosticCode.SEMANTIC_ASYNC_VIOLATION, "Sync function cannot call async API '" + fd.qualifiedName() + "'", mem.line(), mem.column());
                     }
                     if (fd.permission() != null) requiredPerms.add(fd.permission());
                     return fd.returnType();
@@ -490,9 +534,9 @@ public final class SemanticAnalyzer {
                 for (ExpressionNode a : args) checkExpression(a, scope, currentFn, requiredPerms);
                 return VeloraTypes.UNIT;
             }
-            // method call on a value
             checkExpression(mem.target(), scope, currentFn, requiredPerms);
             for (ExpressionNode a : args) checkExpression(a, scope, currentFn, requiredPerms);
+            error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "Unknown method: " + mem.member(), mem.line(), mem.column());
             return VeloraTypes.UNIT;
         }
         if (callee instanceof IdentifierExpressionNode id) {
@@ -505,62 +549,62 @@ public final class SemanticAnalyzer {
                         if (calledFn.suspending() && !currentFn.suspending()) {
                             error(DiagnosticCode.SEMANTIC_ASYNC_VIOLATION, "Sync function cannot call async function '" + id.name() + "'", id.line(), id.column());
                         }
-                        // Check named arguments
-                        Set<String> namedSeen = new HashSet<>();
-                        Set<String> paramNames = new HashSet<>();
-                        for (var p : calledFn.parameters()) paramNames.add(p.name());
-                        for (ExpressionNode a : args) {
-                            if (a instanceof NamedArgumentExpressionNode na) {
-                                if (!paramNames.contains(na.argumentName())) {
-                                    error(DiagnosticCode.SEMANTIC_NAMED_ARG_UNKNOWN, "Unknown named argument '" + na.argumentName() + "' for function " + id.name(), na.line(), na.column());
-                                }
-                                if (!namedSeen.add(na.argumentName())) {
-                                    error(DiagnosticCode.SEMANTIC_NAMED_ARG_DUPLICATE, "Duplicate named argument '" + na.argumentName() + "'", na.line(), na.column());
-                                }
-                            }
-                        }
-                        // Check arity
-                        int required = calledFn.parameters().size();
-                        int minArgs = required;
-                        for (var p : calledFn.parameters()) {
-                            if (p.hasDefault()) minArgs--;
-                        }
-                        int actualArgs = args.size();
-                        if (actualArgs < minArgs || actualArgs > required) {
-                            error(DiagnosticCode.SEMANTIC_WRONG_ARITY, "Wrong number of arguments for " + id.name() + ": expected " + minArgs + ".." + required + ", got " + actualArgs, id.line(), id.column());
-                        }
-                        // Check argument types
-                        for (int i = 0; i < Math.min(actualArgs, required); i++) {
-                            ExpressionNode argExpr = args.get(i);
-                            if (argExpr instanceof NamedArgumentExpressionNode na) {
-                                argExpr = na.value();
-                            }
+                        List<ExpressionNode> bound = bindArguments(id.name(), args, calledFn.parameters().stream().map(ResolvedScript.ResolvedParam::name).toList(), calledFn.parameters().stream().map(ResolvedScript.ResolvedParam::hasDefault).toList(), scope, currentFn, requiredPerms, id.line(), id.column());
+                        for (int i = 0; i < bound.size(); i++) {
+                            ExpressionNode argExpr = bound.get(i);
+                            if (argExpr == null) continue;
                             VeloraType argType = checkExpression(argExpr, scope, currentFn, requiredPerms);
-                            if (argType != null && argType != VeloraTypes.UNIT) {
-                                VeloraType paramType = calledFn.parameters().get(i).type();
-                                if (!isAssignable(argType, paramType)) {
-                                    error(DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE, "Argument " + (i+1) + " type mismatch: expected " + paramType.name() + ", got " + argType.name(), argExpr.line(), argExpr.column());
-                                }
+                            VeloraType paramType = calledFn.parameters().get(i).type();
+                            if (argType != null && argType != VeloraTypes.UNIT && !isAssignable(argType, paramType)) {
+                                error(DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE, "Argument '" + calledFn.parameters().get(i).name() + "' type mismatch: expected " + paramType.name() + ", got " + argType.name(), argExpr.line(), argExpr.column());
                             }
                         }
                     }
                 }
-                for (ExpressionNode a : args) checkExpression(a, scope, currentFn, requiredPerms);
                 return s.type();
             }
-            // Check for delay/yield/await in non-async function
-            if (id.name().equals("delay") && !currentFn.suspending()) {
-                error(DiagnosticCode.SEMANTIC_ASYNC_VIOLATION, "Sync function cannot call delay()", id.line(), id.column());
+            if (id.name().equals("delay")) {
+                if (!currentFn.suspending()) error(DiagnosticCode.SEMANTIC_ASYNC_VIOLATION, "Sync function cannot call delay()", id.line(), id.column());
+                if (args.size() != 1) {
+                    error(DiagnosticCode.SEMANTIC_WRONG_ARITY, "delay expects exactly one argument", id.line(), id.column());
+                    for (ExpressionNode a : args) checkExpression(a, scope, currentFn, requiredPerms);
+                    return VeloraTypes.UNIT;
+                }
+                VeloraType delayType = checkExpression(args.get(0), scope, currentFn, requiredPerms);
+                if (delayType != VeloraTypes.DURATION && !isNumeric(delayType) && delayType != VeloraTypes.UNIT) {
+                    error(DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE, "delay expects Duration or a nanosecond number, got " + delayType.name(), args.get(0).line(), args.get(0).column());
+                }
+                return VeloraTypes.UNIT;
+            }
+            if (id.name().equals("yield")) {
+                if (!currentFn.suspending()) error(DiagnosticCode.SEMANTIC_ASYNC_VIOLATION, "Sync function cannot call yield()", id.line(), id.column());
+                if (!args.isEmpty()) {
+                    error(DiagnosticCode.SEMANTIC_WRONG_ARITY, "yield expects no arguments", id.line(), id.column());
+                    for (ExpressionNode a : args) checkExpression(a, scope, currentFn, requiredPerms);
+                }
+                return VeloraTypes.UNIT;
+            }
+            if (id.name().equals("await")) {
+                if (!currentFn.suspending()) error(DiagnosticCode.SEMANTIC_ASYNC_VIOLATION, "Sync function cannot call await()", id.line(), id.column());
+                if (args.size() != 1) {
+                    error(DiagnosticCode.SEMANTIC_WRONG_ARITY, "await expects exactly one Task", id.line(), id.column());
+                    for (ExpressionNode a : args) checkExpression(a, scope, currentFn, requiredPerms);
+                    return VeloraTypes.UNIT;
+                }
+                VeloraType taskType = checkExpression(args.get(0), scope, currentFn, requiredPerms);
+                VeloraType resultType = VeloraTypes.taskResult(taskType == null ? VeloraTypes.UNIT : taskType.nonNull());
+                if (resultType == null) {
+                    if (taskType != VeloraTypes.UNIT) error(DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE, "await expects Task<T>, got " + taskType.name(), args.get(0).line(), args.get(0).column());
+                    return VeloraTypes.UNIT;
+                }
+                return resultType;
+            }
+            if (id.name().equals("spawn")) {
+                error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "Use the spawn keyword before a script function call", id.line(), id.column());
                 for (ExpressionNode a : args) checkExpression(a, scope, currentFn, requiredPerms);
                 return VeloraTypes.UNIT;
             }
-            // Check for unresolved function calls (not a known built-in)
-            if (!id.name().equals("delay") && !id.name().equals("yield") && !id.name().equals("await")
-                    && !id.name().equals("spawn") && !id.name().equals("listOf") && !id.name().equals("mapOf")
-                    && !id.name().equals("setOf") && !id.name().equals("log")) {
-                error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "Unresolved function: " + id.name(), id.line(), id.column());
-            }
-            // Could be a stdlib function like delay, listOf, etc.
+            error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "Unresolved function: " + id.name(), id.line(), id.column());
             for (ExpressionNode a : args) checkExpression(a, scope, currentFn, requiredPerms);
             return VeloraTypes.UNIT;
         }
@@ -581,20 +625,111 @@ public final class SemanticAnalyzer {
         };
     }
 
-    private VeloraType binaryType(String op, VeloraType lt, VeloraType rt) {
-        if (op.equals("==") || op.equals("!=") || op.equals("<") || op.equals("<=")
-                || op.equals(">") || op.equals(">=") || op.equals("&&") || op.equals("||")) {
+    private VeloraType checkBinary(BinaryExpressionNode expression, VeloraType left, VeloraType right) {
+        return checkBinary(expression.operator(), left, right, expression.line(), expression.column());
+    }
+
+    private VeloraType checkBinary(String operator, VeloraType left, VeloraType right, int line, int column) {
+        if (operator.equals("&&") || operator.equals("||")) {
+            if ((left != VeloraTypes.BOOLEAN && left != VeloraTypes.UNIT) || (right != VeloraTypes.BOOLEAN && right != VeloraTypes.UNIT)) {
+                error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Operator " + operator + " requires Boolean operands", line, column);
+            }
             return VeloraTypes.BOOLEAN;
         }
-        // string concatenation
-        if (op.equals("+") && (lt == VeloraTypes.STRING || rt == VeloraTypes.STRING)) {
-            return VeloraTypes.STRING;
+        if (operator.equals("==") || operator.equals("!=")) {
+            if (!areComparable(left, right)) error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Cannot compare " + left.name() + " and " + right.name(), line, column);
+            return VeloraTypes.BOOLEAN;
         }
-        // arithmetic: widen
-        if (lt == VeloraTypes.DOUBLE || rt == VeloraTypes.DOUBLE) return VeloraTypes.DOUBLE;
-        if (lt == VeloraTypes.LONG || rt == VeloraTypes.LONG) return VeloraTypes.LONG;
-        if (lt == VeloraTypes.FLOAT || rt == VeloraTypes.FLOAT) return VeloraTypes.FLOAT;
+        if (operator.equals("<") || operator.equals("<=") || operator.equals(">") || operator.equals(">=")) {
+            boolean valid = isNumeric(left) && isNumeric(right) || left == VeloraTypes.STRING && right == VeloraTypes.STRING;
+            if (!valid && left != VeloraTypes.UNIT && right != VeloraTypes.UNIT) error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Operator " + operator + " requires numeric operands or two Strings", line, column);
+            return VeloraTypes.BOOLEAN;
+        }
+        if (operator.equals("+") && (left == VeloraTypes.STRING || right == VeloraTypes.STRING)) return VeloraTypes.STRING;
+        if (operator.equals("+") || operator.equals("-") || operator.equals("*") || operator.equals("/") || operator.equals("%")) {
+            if ((!isNumeric(left) || !isNumeric(right)) && left != VeloraTypes.UNIT && right != VeloraTypes.UNIT) {
+                error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Operator " + operator + " requires numeric operands, got " + left.name() + " and " + right.name(), line, column);
+                return VeloraTypes.UNIT;
+            }
+            return commonNumericType(left, right);
+        }
+        return VeloraTypes.UNIT;
+    }
+
+    private boolean isNumeric(VeloraType type) {
+        return type == VeloraTypes.BYTE || type == VeloraTypes.INT || type == VeloraTypes.LONG || type == VeloraTypes.FLOAT || type == VeloraTypes.DOUBLE;
+    }
+
+    private VeloraType commonNumericType(VeloraType left, VeloraType right) {
+        if (left == VeloraTypes.DOUBLE || right == VeloraTypes.DOUBLE) return VeloraTypes.DOUBLE;
+        if (left == VeloraTypes.FLOAT || right == VeloraTypes.FLOAT) return VeloraTypes.FLOAT;
+        if (left == VeloraTypes.LONG || right == VeloraTypes.LONG) return VeloraTypes.LONG;
         return VeloraTypes.INT;
+    }
+
+    private VeloraType commonType(VeloraType left, VeloraType right) {
+        if (left == right) return left;
+        if (isNumeric(left) && isNumeric(right)) return commonNumericType(left, right);
+        if (isAssignable(left, right)) return right;
+        if (isAssignable(right, left)) return left;
+        return null;
+    }
+
+    private VeloraType mergeLiteralType(VeloraType accumulated, VeloraType current, AstNode node, String label) {
+        if (accumulated == null || accumulated == VeloraTypes.UNIT) return current;
+        if (current == null || current == VeloraTypes.UNIT) return accumulated;
+        VeloraType common = commonType(accumulated, current);
+        if (common == null) {
+            error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, label + " must have compatible types, got " + accumulated.name() + " and " + current.name(), node.line(), node.column());
+            return accumulated;
+        }
+        return common;
+    }
+
+    private boolean areComparable(VeloraType left, VeloraType right) {
+        return isNullType(left) || isNullType(right) || left == VeloraTypes.UNIT || right == VeloraTypes.UNIT || left == right || isNumeric(left) && isNumeric(right) || isAssignable(left, right) || isAssignable(right, left);
+    }
+
+    private boolean isNullType(VeloraType type) {
+        return type != null && type.isNullable() && type.name().equals("Unit?");
+    }
+
+    private List<ExpressionNode> bindArguments(String functionName, List<ExpressionNode> args, List<String> parameterNames, List<Boolean> defaults, Scope scope, ResolvedScript.ResolvedFunction currentFn, Set<ScriptPermission> requiredPerms, int line, int column) {
+        List<ExpressionNode> bound = new ArrayList<>(Collections.nCopies(parameterNames.size(), null));
+        boolean namedStarted = false;
+        int positional = 0;
+        for (ExpressionNode argument : args) {
+            if (argument instanceof NamedArgumentExpressionNode named) {
+                namedStarted = true;
+                int index = parameterNames.indexOf(named.argumentName());
+                if (index < 0) {
+                    error(DiagnosticCode.SEMANTIC_NAMED_ARG_UNKNOWN, "Unknown named argument '" + named.argumentName() + "' for " + functionName, named.line(), named.column());
+                    checkExpression(named.value(), scope, currentFn, requiredPerms);
+                } else if (bound.get(index) != null) {
+                    error(DiagnosticCode.SEMANTIC_NAMED_ARG_DUPLICATE, "Duplicate argument '" + named.argumentName() + "'", named.line(), named.column());
+                    checkExpression(named.value(), scope, currentFn, requiredPerms);
+                } else {
+                    bound.set(index, named.value());
+                }
+                continue;
+            }
+            if (namedStarted) {
+                error(DiagnosticCode.SEMANTIC_WRONG_ARITY, "Positional arguments cannot follow named arguments in " + functionName, argument.line(), argument.column());
+            }
+            while (positional < bound.size() && bound.get(positional) != null) positional++;
+            if (positional >= bound.size()) {
+                error(DiagnosticCode.SEMANTIC_WRONG_ARITY, "Too many arguments for " + functionName, line, column);
+                checkExpression(argument, scope, currentFn, requiredPerms);
+            } else {
+                bound.set(positional++, argument);
+            }
+        }
+        for (int i = 0; i < bound.size(); i++) {
+            if (bound.get(i) == null && !defaults.get(i)) {
+                error(DiagnosticCode.SEMANTIC_WRONG_ARITY, "Missing required argument '" + parameterNames.get(i) + "' for " + functionName, line, column);
+            }
+        }
+        return bound;
     }
 
     private boolean isApiNamespace(String name) {
@@ -603,23 +738,43 @@ public final class SemanticAnalyzer {
 
     private VeloraType resolveType(TypeNode typeNode, AstNode node) {
         if (typeNode == null) return null;
-        VeloraType base = resolveBaseType(typeNode.typeName(), node);
-        if (base == null) return null;
-        // type arguments
-        if (!typeNode.typeArguments().isEmpty() && (base == VeloraTypes.UNIT)) {
-            // List<T>, Map<K,V>, Set<T>
-            VeloraType elem = resolveType(typeNode.typeArguments().get(0), node);
-            if (typeNode.typeName().equals("List")) return VeloraTypes.list(elem);
-            if (typeNode.typeName().equals("Set")) return VeloraTypes.set(elem);
-            if (typeNode.typeName().equals("Map") && typeNode.typeArguments().size() >= 2) {
-                VeloraType v = resolveType(typeNode.typeArguments().get(1), node);
-                return VeloraTypes.map(elem, v);
+        String name = typeNode.typeName();
+        List<TypeNode> arguments = typeNode.typeArguments();
+        VeloraType type;
+        if (name.equals("List") || name.equals("Set") || name.equals("Task")) {
+            if (arguments.size() != 1) {
+                error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, name + " requires exactly one type argument", node.line(), node.column());
+                return null;
             }
+            VeloraType argument = resolveType(arguments.get(0), node);
+            if (argument == null) return null;
+            type = name.equals("List") ? VeloraTypes.list(argument) : name.equals("Set") ? VeloraTypes.set(argument) : VeloraTypes.task(argument);
+        } else if (name.equals("Map")) {
+            if (arguments.size() != 2) {
+                error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Map requires exactly two type arguments", node.line(), node.column());
+                return null;
+            }
+            VeloraType key = resolveType(arguments.get(0), node);
+            VeloraType value = resolveType(arguments.get(1), node);
+            if (key == null || value == null) return null;
+            if (!key.isHashable()) error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Map key type must be hashable, got " + key.name(), node.line(), node.column());
+            type = VeloraTypes.map(key, value);
+        } else {
+            if (!arguments.isEmpty()) {
+                error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, name + " does not accept type arguments", node.line(), node.column());
+                return null;
+            }
+            type = resolveBaseType(name, node);
+            if (type == null) return null;
         }
-        if (typeNode.nullable()) {
-            return base.nullable();
-        }
-        return base;
+        return typeNode.nullable() ? type.nullable() : type;
+    }
+
+    private boolean isPersistableType(VeloraType type) {
+        VeloraType value = type.nonNull();
+        return value == VeloraTypes.BYTE || value == VeloraTypes.INT || value == VeloraTypes.LONG || value == VeloraTypes.FLOAT
+                || value == VeloraTypes.DOUBLE || value == VeloraTypes.BOOLEAN || value == VeloraTypes.CHAR || value == VeloraTypes.STRING
+                || value == VeloraTypes.DURATION || value == VeloraTypes.UUID;
     }
 
     private VeloraType resolveBaseType(String name, AstNode node) {
@@ -637,19 +792,8 @@ public final class SemanticAnalyzer {
             case "Duration" -> VeloraTypes.DURATION;
             case "Vec2" -> VeloraTypes.VEC2;
             case "Vec3" -> VeloraTypes.VEC3;
-            case "BlockPos" -> VeloraTypes.BLOCK_POS;
-            case "Rotation" -> VeloraTypes.ROTATION;
             case "Color" -> VeloraTypes.COLOR;
-            case "Key" -> VeloraTypes.KEY;
             case "UUID" -> VeloraTypes.UUID;
-            case "Identifier" -> VeloraTypes.IDENTIFIER;
-            case "BlockId" -> VeloraTypes.BLOCK_ID;
-            case "ItemId" -> VeloraTypes.ITEM_ID;
-            case "EntityTypeId" -> VeloraTypes.ENTITY_TYPE_ID;
-            case "List", "Map", "Set" -> VeloraTypes.UNIT;
-            case "TickEvent", "ChatMessageEvent" -> VeloraTypes.UNIT;
-            case "PlayerRef", "BlockRef" -> VeloraTypes.UNIT;
-            case "task", "Task" -> VeloraTypes.UNIT;
             default -> {
                 VeloraType registered = typeRegistry.find(name);
                 if (registered != null) yield registered;
@@ -665,17 +809,114 @@ public final class SemanticAnalyzer {
         return null;
     }
 
-    private Object extractConstValue(ExpressionNode init) {
-        if (init == null) return null;
-        if (init instanceof LiteralExpressionNode lit) return lit.value();
-        if (init instanceof IdentifierExpressionNode id) {
-            // Reference to another const field
-            ResolvedScript.ResolvedProperty prop = null;
-            // Look up in properties already resolved
-            // This is a simplification - full const folding would be more complex
-            return null;
+    private ConstantEvaluation evaluateConstant(ExpressionNode expression, Map<String, ResolvedScript.ResolvedProperty> properties) {
+        if (expression instanceof LiteralExpressionNode literal) return new ConstantEvaluation(true, literal.value());
+        if (expression instanceof IdentifierExpressionNode identifier) {
+            ResolvedScript.ResolvedProperty property = properties.get(identifier.name());
+            return property != null && property.isConst() ? new ConstantEvaluation(true, property.constValue()) : ConstantEvaluation.NOT_CONSTANT;
         }
+        if (expression instanceof UnaryExpressionNode unary) {
+            ConstantEvaluation operand = evaluateConstant(unary.operand(), properties);
+            if (!operand.constant()) return operand;
+            Object value = operand.value();
+            try {
+                return switch (unary.operator()) {
+                    case "!" -> value instanceof Boolean b ? new ConstantEvaluation(true, !b) : ConstantEvaluation.NOT_CONSTANT;
+                    case "-" -> value instanceof Number n ? new ConstantEvaluation(true, negateConstant(n)) : ConstantEvaluation.NOT_CONSTANT;
+                    case "+" -> value instanceof Number ? operand : ConstantEvaluation.NOT_CONSTANT;
+                    default -> ConstantEvaluation.NOT_CONSTANT;
+                };
+            } catch (ArithmeticException ignored) { return ConstantEvaluation.NOT_CONSTANT; }
+        }
+        if (expression instanceof BinaryExpressionNode binary) {
+            ConstantEvaluation left = evaluateConstant(binary.left(), properties);
+            ConstantEvaluation right = evaluateConstant(binary.right(), properties);
+            if (!left.constant() || !right.constant()) return ConstantEvaluation.NOT_CONSTANT;
+            try { return new ConstantEvaluation(true, binaryConstant(binary.operator(), left.value(), right.value())); }
+            catch (IllegalArgumentException | ArithmeticException ignored) { return ConstantEvaluation.NOT_CONSTANT; }
+        }
+        if (expression instanceof ElvisExpressionNode elvis) {
+            ConstantEvaluation left = evaluateConstant(elvis.left(), properties);
+            if (!left.constant()) return ConstantEvaluation.NOT_CONSTANT;
+            return left.value() != null ? left : evaluateConstant(elvis.right(), properties);
+        }
+        if (expression instanceof InterpolationExpressionNode interpolation) {
+            StringBuilder value = new StringBuilder();
+            for (InterpolationExpressionNode.Segment segment : interpolation.segments()) {
+                if (segment instanceof InterpolationExpressionNode.Text text) value.append(text.value());
+                else if (segment instanceof InterpolationExpressionNode.Expr expr) {
+                    ConstantEvaluation part = evaluateConstant(expr.expression(), properties);
+                    if (!part.constant()) return ConstantEvaluation.NOT_CONSTANT;
+                    value.append(String.valueOf(part.value()));
+                }
+            }
+            return new ConstantEvaluation(true, value.toString());
+        }
+        return ConstantEvaluation.NOT_CONSTANT;
+    }
+
+    private Object binaryConstant(String operator, Object left, Object right) {
+        if (operator.equals("+") && (left instanceof String || right instanceof String)) return String.valueOf(left) + right;
+        if (operator.equals("==")) return constantEquals(left, right);
+        if (operator.equals("!=")) return !constantEquals(left, right);
+        if (operator.equals("&&") && left instanceof Boolean a && right instanceof Boolean b) return a && b;
+        if (operator.equals("||") && left instanceof Boolean a && right instanceof Boolean b) return a || b;
+        if (left instanceof Number a && right instanceof Number b) {
+            if (operator.equals("<")) return a.doubleValue() < b.doubleValue();
+            if (operator.equals("<=")) return a.doubleValue() <= b.doubleValue();
+            if (operator.equals(">")) return a.doubleValue() > b.doubleValue();
+            if (operator.equals(">=")) return a.doubleValue() >= b.doubleValue();
+            return numericConstant(operator, a, b);
+        }
+        throw new IllegalArgumentException();
+    }
+
+    private Object numericConstant(String operator, Number left, Number right) {
+        if ((operator.equals("/") || operator.equals("%")) && right.doubleValue() == 0) throw new ArithmeticException();
+        if (left instanceof Double || right instanceof Double) {
+            double a = left.doubleValue(), b = right.doubleValue();
+            return switch (operator) { case "+" -> a + b; case "-" -> a - b; case "*" -> a * b; case "/" -> a / b; case "%" -> a % b; default -> throw new IllegalArgumentException(); };
+        }
+        if (left instanceof Float || right instanceof Float) {
+            float a = left.floatValue(), b = right.floatValue();
+            return switch (operator) { case "+" -> a + b; case "-" -> a - b; case "*" -> a * b; case "/" -> a / b; case "%" -> a % b; default -> throw new IllegalArgumentException(); };
+        }
+        long a = left.longValue(), b = right.longValue();
+        long result = switch (operator) { case "+" -> a + b; case "-" -> a - b; case "*" -> a * b; case "/" -> a / b; case "%" -> a % b; default -> throw new IllegalArgumentException(); };
+        if (left instanceof Long || right instanceof Long) return result;
+        return (int) result;
+    }
+
+    private boolean constantEquals(Object left, Object right) {
+        if (left instanceof Number a && right instanceof Number b) {
+            if (a instanceof Float || a instanceof Double || b instanceof Float || b instanceof Double) return Double.compare(a.doubleValue(), b.doubleValue()) == 0;
+            return a.longValue() == b.longValue();
+        }
+        return Objects.equals(left, right);
+    }
+
+    private Object negateConstant(Number value) {
+        if (value instanceof Double d) return -d;
+        if (value instanceof Float f) return -f;
+        if (value instanceof Long l) return -l;
+        return -value.intValue();
+    }
+
+    private VeloraType constantType(Object value) {
+        if (value == null) return null;
+        if (value instanceof Byte) return VeloraTypes.BYTE;
+        if (value instanceof Integer || value instanceof Short) return VeloraTypes.INT;
+        if (value instanceof Long) return VeloraTypes.LONG;
+        if (value instanceof Float) return VeloraTypes.FLOAT;
+        if (value instanceof Double) return VeloraTypes.DOUBLE;
+        if (value instanceof Boolean) return VeloraTypes.BOOLEAN;
+        if (value instanceof Character) return VeloraTypes.CHAR;
+        if (value instanceof String) return VeloraTypes.STRING;
         return null;
+    }
+
+    private record ConstantEvaluation(boolean constant, Object value) {
+        private static final ConstantEvaluation NOT_CONSTANT = new ConstantEvaluation(false, null);
     }
 
     private ResolvedScript.ScriptMetadata extractMetadata(ScriptNode script) {

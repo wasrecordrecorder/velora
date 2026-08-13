@@ -9,17 +9,21 @@ import io.velora.api.setting.SettingDescriptor;
 import io.velora.api.task.TaskState;
 import io.velora.api.task.VeloraTask;
 import io.velora.internal.bytecode.*;
+import io.velora.internal.security.ResourceLimitViolation;
 
 import java.util.*;
 
 public final class VirtualMachine {
 
+    private static final Opcode[] OPCODES = Opcode.values();
     private final ApiRegistry apiRegistry;
     private final List<SettingDescriptor> settings;
     private final io.velora.internal.setting.SettingStore settingStore;
     private final int instructionLimit;
     private final int maxCallDepth;
     private final int maxStringLength;
+    private final int maxCollectionElements;
+    private final int maxCollectionDepth;
     private final Map<Integer, ScriptValue> staticFields = new HashMap<>();
     private final Map<Integer, ScriptValue> instanceFields = new HashMap<>();
     private CompiledModule currentModule;
@@ -30,18 +34,26 @@ public final class VirtualMachine {
 
     public VirtualMachine(ApiRegistry apiRegistry, List<SettingDescriptor> settings,
                           io.velora.internal.setting.SettingStore settingStore, int instructionLimit) {
-        this(apiRegistry, settings, settingStore, instructionLimit, Integer.MAX_VALUE, Integer.MAX_VALUE);
+        this(apiRegistry, settings, settingStore, instructionLimit, Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE);
     }
 
     public VirtualMachine(ApiRegistry apiRegistry, List<SettingDescriptor> settings,
                           io.velora.internal.setting.SettingStore settingStore, int instructionLimit,
                           int maxCallDepth, int maxStringLength) {
+        this(apiRegistry, settings, settingStore, instructionLimit, maxCallDepth, maxStringLength, Integer.MAX_VALUE, Integer.MAX_VALUE);
+    }
+
+    public VirtualMachine(ApiRegistry apiRegistry, List<SettingDescriptor> settings,
+                          io.velora.internal.setting.SettingStore settingStore, int instructionLimit,
+                          int maxCallDepth, int maxStringLength, int maxCollectionElements, int maxCollectionDepth) {
         this.apiRegistry = apiRegistry;
         this.settings = settings;
         this.settingStore = settingStore;
         this.instructionLimit = instructionLimit;
         this.maxCallDepth = maxCallDepth;
         this.maxStringLength = maxStringLength;
+        this.maxCollectionElements = maxCollectionElements;
+        this.maxCollectionDepth = maxCollectionDepth;
     }
 
     private void initializeFields(CompiledModule module) {
@@ -106,52 +118,50 @@ public final class VirtualMachine {
                 }
 
                 int ordinal = code[frame.ip];
-                Opcode[] opcodes = Opcode.values();
-                if (ordinal < 0 || ordinal >= opcodes.length) {
+                if (ordinal < 0 || ordinal >= OPCODES.length) {
                     return VmExecutionResult.failure(VmError.of(DiagnosticCode.BYTECODE_INVALID_OPCODE,
                             "Invalid opcode: " + ordinal, 0, fiberId), instructions, System.nanoTime() - startTime);
                 }
-                Opcode op = opcodes[ordinal];
-                int[] operands = new int[op.operandWords()];
-                for (int i = 0; i < op.operandWords(); i++) {
-                    operands[i] = code[frame.ip + 1 + i];
+                Opcode op = OPCODES[ordinal];
+                if (frame.ip + op.operandWords() >= code.length) {
+                    return VmExecutionResult.failure(VmError.of(DiagnosticCode.BYTECODE_BAD_OPERAND,
+                            "Truncated operand for " + op, 0, fiberId), instructions, System.nanoTime() - startTime);
                 }
+                int operand0 = op.operandWords() > 0 ? code[frame.ip + 1] : 0;
+                int operand1 = op.operandWords() > 1 ? code[frame.ip + 2] : 0;
                 frame.ip += op.instructionWords();
                 instructions++;
 
                 switch (op) {
                     case CONST -> {
-                        ConstantPool.Tag tag = module.constantPool().tag(operands[0]);
-                        ScriptValue cv = constToValue(module.constantPool(), operands[0], tag);
-                        if (cv instanceof StringValue sv && sv.value().length() > maxStringLength) {
-                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_RESOURCE_LIMIT,
-                                    "String length limit exceeded", 0, fiberId), instructions, System.nanoTime() - startTime);
-                        }
+                        ConstantPool.Tag tag = module.constantPool().tag(operand0);
+                        ScriptValue cv = constToValue(module.constantPool(), operand0, tag);
+                        enforceValueLimits(cv);
                         stack.push(cv);
                     }
                     case NULL -> stack.push(PrimitiveValue.nullValue());
                     case TRUE -> stack.push(PrimitiveValue.of(true));
                     case FALSE -> stack.push(PrimitiveValue.of(false));
-                    case LOAD_LOCAL -> stack.push(frame.locals[operands[0]]);
-                    case STORE_LOCAL -> frame.locals[operands[0]] = stack.pop();
+                    case LOAD_LOCAL -> stack.push(frame.locals[operand0]);
+                    case STORE_LOCAL -> frame.locals[operand0] = stack.pop();
                     case LOAD_FIELD -> {
                         if (host != null) {
-                            stack.push(host.loadField(operands[0]));
+                            stack.push(host.loadField(operand0));
                         } else {
-                            stack.push(instanceFields.getOrDefault(operands[0], PrimitiveValue.nullValue()));
+                            stack.push(instanceFields.getOrDefault(operand0, PrimitiveValue.nullValue()));
                         }
                     }
                     case STORE_FIELD -> {
                         ScriptValue val = stack.pop();
-                        if (host != null) host.storeField(operands[0], val);
-                        else instanceFields.put(operands[0], val);
+                        if (host != null) host.storeField(operand0, val);
+                        else instanceFields.put(operand0, val);
                     }
                     case LOAD_SETTING -> {
                         if (settingStore != null) {
-                            var sv = settingStore.getByIndex(operands[0]);
+                            var sv = settingStore.getByIndex(operand0);
                             stack.push(sv != null ? javaToValue(sv.value()) : PrimitiveValue.nullValue());
-                        } else if (operands[0] < settings.size()) {
-                            Object def = settings.get(operands[0]).defaultValue();
+                        } else if (operand0 < settings.size()) {
+                            Object def = settings.get(operand0).defaultValue();
                             stack.push(javaToValue(def));
                         } else {
                             stack.push(PrimitiveValue.nullValue());
@@ -159,15 +169,15 @@ public final class VirtualMachine {
                     }
                     case LOAD_STATIC -> {
                         if (host != null) {
-                            stack.push(host.loadStatic(operands[0]));
+                            stack.push(host.loadStatic(operand0));
                         } else {
-                            stack.push(staticFields.getOrDefault(operands[0], PrimitiveValue.nullValue()));
+                            stack.push(staticFields.getOrDefault(operand0, PrimitiveValue.nullValue()));
                         }
                     }
                     case STORE_STATIC -> {
                         ScriptValue sval = stack.pop();
-                        if (host != null) host.storeStatic(operands[0], sval);
-                        else staticFields.put(operands[0], sval);
+                        if (host != null) host.storeStatic(operand0, sval);
+                        else staticFields.put(operand0, sval);
                     }
                     case POP -> stack.pop();
                     case DUP -> stack.dup();
@@ -185,10 +195,10 @@ public final class VirtualMachine {
                     case GREATER_EQUAL -> { ScriptValue b = stack.pop(); ScriptValue a = stack.pop(); stack.push(PrimitiveValue.of(compare(a, b) >= 0)); }
                     case NOT -> { ScriptValue a = stack.pop(); stack.push(PrimitiveValue.of(!toBoolean(a))); }
                     case IS_NULL -> { ScriptValue a = stack.pop(); stack.push(PrimitiveValue.of(a.isNull())); }
-                    case JUMP -> frame.ip = operands[0];
-                    case JUMP_IF_FALSE -> { if (!toBoolean(stack.pop())) frame.ip = operands[0]; }
-                    case JUMP_IF_TRUE -> { if (toBoolean(stack.pop())) frame.ip = operands[0]; }
-                    case LOOP -> frame.ip = operands[0];
+                    case JUMP -> frame.ip = operand0;
+                    case JUMP_IF_FALSE -> { if (!toBoolean(stack.pop())) frame.ip = operand0; }
+                    case JUMP_IF_TRUE -> { if (toBoolean(stack.pop())) frame.ip = operand0; }
+                    case LOOP -> frame.ip = operand0;
                     case RETURN -> {
                         ScriptValue retVal = stack.isEmpty() ? PrimitiveValue.nullValue() : stack.pop();
                         callStack.pop();
@@ -198,9 +208,9 @@ public final class VirtualMachine {
                         stack.push(retVal);
                     }
                     case CALL -> {
-                        int funcIdx = operands[0];
-                        int argCount = operands[1];
-                        if (callStack.size() > maxCallDepth) {
+                        int funcIdx = operand0;
+                        int argCount = operand1;
+                        if (callStack.size() >= maxCallDepth) {
                             return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_RESOURCE_LIMIT,
                                     "Call depth limit exceeded", 0, fiberId), instructions, System.nanoTime() - startTime);
                         }
@@ -220,13 +230,19 @@ public final class VirtualMachine {
                         callStack.push(newFrame);
                     }
                     case CALL_API -> {
-                        int apiIdx = operands[0];
-                        int argCount = operands[1];
+                        int apiIdx = operand0;
+                        int argCount = operand1;
                         FunctionDescriptor fd = apiRegistry.findByIndex(apiIdx);
                         if (fd == null || fd.invoker() == null) {
                             for (int i = 0; i < argCount; i++) stack.pop();
-                            stack.push(PrimitiveValue.nullValue());
+                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                                    "API function not found: " + apiIdx, 0, fiberId), instructions, System.nanoTime() - startTime);
                         } else {
+                            if (host != null && !host.consumeApiCost(fiberId, fd.cost())) {
+                                for (int i = 0; i < argCount; i++) stack.pop();
+                                return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_RESOURCE_LIMIT,
+                                        "API cost limit exceeded", 0, fiberId), instructions, System.nanoTime() - startTime);
+                            }
                             if (fd.permission() != null && module.maximumPermissions() != null && !module.maximumPermissions().isEmpty() && host == null) {
                                 for (int i = 0; i < argCount; i++) stack.pop();
                                 return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
@@ -238,26 +254,31 @@ public final class VirtualMachine {
                             }
                             try {
                                 Object result = fd.invoker().invoke(new SimpleFunctionContext(fd, apiArgs, module.scriptId(), fiberId));
-                                ScriptValue sv = javaToValue(result);
-                                if (sv instanceof HandleValue && !fd.returnType().isHandle()) {
-                                    return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
-                                            "Unsupported return type: host handle not allowed for " + fd.returnType().name(), 0, fiberId), instructions, System.nanoTime() - startTime);
-                                }
+                                ScriptValue sv = apiResult(fd, result);
+                                enforceValueLimits(sv);
                                 stack.push(sv);
+                            } catch (ResourceLimitException e) {
+                                throw e;
                             } catch (Throwable t) {
                                 return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
-                                        t.getMessage(), 0, fiberId), instructions, System.nanoTime() - startTime);
+                                        t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName(), 0, fiberId), instructions, System.nanoTime() - startTime);
                             }
                         }
                     }
                     case CALL_SUSPEND -> {
-                        int apiIdx = operands[0];
-                        int argCount = operands[1];
+                        int apiIdx = operand0;
+                        int argCount = operand1;
                         FunctionDescriptor fd = apiRegistry.findByIndex(apiIdx);
                         if (fd == null || fd.invoker() == null) {
                             for (int i = 0; i < argCount; i++) stack.pop();
-                            stack.push(PrimitiveValue.nullValue());
+                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                                    "API function not found: " + apiIdx, 0, fiberId), instructions, System.nanoTime() - startTime);
                         } else {
+                            if (host != null && !host.consumeApiCost(fiberId, fd.cost())) {
+                                for (int i = 0; i < argCount; i++) stack.pop();
+                                return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_RESOURCE_LIMIT,
+                                        "API cost limit exceeded", 0, fiberId), instructions, System.nanoTime() - startTime);
+                            }
                             Object[] apiArgs = new Object[argCount];
                             for (int i = argCount - 1; i >= 0; i--) {
                                 apiArgs[i] = stack.pop().boxed();
@@ -266,34 +287,40 @@ public final class VirtualMachine {
                                 Object result = fd.invoker().invoke(new SimpleFunctionContext(fd, apiArgs, module.scriptId(), fiberId));
                                 if (result instanceof VeloraTask<?> task) {
                                     if (task.state() == TaskState.PENDING) {
-                                        long taskId = System.identityHashCode(task);
-                                        if (host != null) {
-                                            host.watchTask(fiberId, taskId, task);
+                                        if (host == null) {
+                                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                                                    "Suspending API requires a scheduler", 0, fiberId), instructions, System.nanoTime() - startTime);
+                                        }
+                                        long taskId = host.watchTask(fiberId, task, fd.returnType());
+                                        if (taskId == 0) {
+                                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_RESOURCE_LIMIT,
+                                                    "Task limit exceeded", 0, fiberId), instructions, System.nanoTime() - startTime);
                                         }
                                         return VmExecutionResult.suspended(VmExecutionResult.SuspendReason.AWAIT,
                                                 taskId, instructions, System.nanoTime() - startTime);
                                     } else if (task.state() == TaskState.SUCCEEDED) {
-                                        stack.push(javaToValue(task.result()));
+                                        ScriptValue taskResult = apiResult(fd, task.result());
+                                        enforceValueLimits(taskResult);
+                                        stack.push(taskResult);
                                     } else {
                                         return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
                                                 "Task " + task.state(), 0, fiberId), instructions, System.nanoTime() - startTime);
                                     }
                                 } else {
-                                    ScriptValue sv = javaToValue(result);
-                                    if (sv instanceof HandleValue && !fd.returnType().isHandle()) {
-                                        return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
-                                                "Unsupported return type: host handle not allowed for " + fd.returnType().name(), 0, fiberId), instructions, System.nanoTime() - startTime);
-                                    }
+                                    ScriptValue sv = apiResult(fd, result);
+                                    enforceValueLimits(sv);
                                     stack.push(sv);
                                 }
+                            } catch (ResourceLimitException e) {
+                                throw e;
                             } catch (Throwable t) {
                                 return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
-                                        t.getMessage(), 0, fiberId), instructions, System.nanoTime() - startTime);
+                                        t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName(), 0, fiberId), instructions, System.nanoTime() - startTime);
                             }
                         }
                     }
                     case GET_MEMBER -> {
-                        String memberName = module.constantPool().stringValue(operands[0]);
+                        String memberName = module.constantPool().stringValue(operand0);
                         ScriptValue recv = stack.pop();
                         if (recv instanceof StringValue sv && memberName.equals("length")) {
                             stack.push(PrimitiveValue.of(sv.value().length()));
@@ -301,31 +328,41 @@ public final class VirtualMachine {
                             stack.push(PrimitiveValue.of(lv.elements().size()));
                         } else if (recv instanceof MapValue mv && memberName.equals("size")) {
                             stack.push(PrimitiveValue.of(mv.entries().size()));
+                        } else if (recv instanceof SetValue sv && memberName.equals("size")) {
+                            stack.push(PrimitiveValue.of(sv.elements().size()));
+                        } else if (recv instanceof StructValue struct) {
+                            stack.push(struct.fields().getOrDefault(memberName, PrimitiveValue.nullValue()));
                         } else {
-                            stack.push(PrimitiveValue.nullValue());
+                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                                    "Member not found: " + memberName, 0, fiberId), instructions, System.nanoTime() - startTime);
                         }
                     }
                     case SET_MEMBER -> {
-                        String memberName = module.constantPool().stringValue(operands[0]);
-                        ScriptValue val = stack.pop();
-                        ScriptValue recv = stack.pop();
+                        stack.pop();
+                        stack.pop();
+                        return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                                "Member assignment is not supported for immutable script values", 0, fiberId), instructions, System.nanoTime() - startTime);
                     }
                     case CREATE_LIST -> {
-                        int count = operands[0];
+                        int count = operand0;
                         List<ScriptValue> elements = new ArrayList<>();
                         for (int i = 0; i < count; i++) elements.add(stack.pop());
                         Collections.reverse(elements);
-                        stack.push(new ListValue(elements));
+                        ScriptValue value = new ListValue(elements);
+                        enforceValueLimits(value);
+                        stack.push(value);
                     }
                     case CREATE_MAP -> {
-                        int count = operands[0];
+                        int count = operand0;
                         Map<ScriptValue, ScriptValue> entries = new LinkedHashMap<>();
                         for (int i = 0; i < count; i++) {
                             ScriptValue v = stack.pop();
                             ScriptValue k = stack.pop();
                             entries.put(k, v);
                         }
-                        stack.push(new MapValue(entries));
+                        ScriptValue value = new MapValue(entries);
+                        enforceValueLimits(value);
+                        stack.push(value);
                     }
                     case GET_INDEX -> {
                         ScriptValue idx = stack.pop();
@@ -340,8 +377,8 @@ public final class VirtualMachine {
                         }
                     }
                     case SPAWN -> {
-                        int funcIdx = operands[0];
-                        int ac = operands[1];
+                        int funcIdx = operand0;
+                        int ac = operand1;
                         ScriptValue[] spawnArgs = new ScriptValue[ac];
                         for (int i = ac - 1; i >= 0; i--) {
                             spawnArgs[i] = stack.pop();
@@ -354,35 +391,59 @@ public final class VirtualMachine {
                                 stack.push(new TaskValue(childId, io.velora.api.task.TaskState.PENDING));
                             }
                         } else {
-                            stack.push(PrimitiveValue.nullValue());
+                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                                    "spawn requires a scheduler", 0, fiberId), instructions, System.nanoTime() - startTime);
                         }
                     }
                     case AWAIT -> {
                         ScriptValue task = stack.pop();
-                        if (host != null && task instanceof TaskValue tv) {
-                            host.awaitFiber(fiberId, tv.taskId());
-                            return VmExecutionResult.suspended(VmExecutionResult.SuspendReason.AWAIT,
-                                    tv.taskId(), instructions, System.nanoTime() - startTime);
+                        if (!(task instanceof TaskValue tv)) {
+                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                                    "await requires Task<T>", 0, fiberId), instructions, System.nanoTime() - startTime);
                         }
-                        stack.push(PrimitiveValue.nullValue());
+                        if (tv.state() == TaskState.FAILED || tv.taskId() < 0) {
+                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                                    "Task failed before await", 0, fiberId), instructions, System.nanoTime() - startTime);
+                        }
+                        if (host == null) {
+                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                                    "await requires a scheduler", 0, fiberId), instructions, System.nanoTime() - startTime);
+                        }
+                        host.awaitFiber(fiberId, tv.taskId());
+                        return VmExecutionResult.suspended(VmExecutionResult.SuspendReason.AWAIT,
+                                tv.taskId(), instructions, System.nanoTime() - startTime);
                     }
                     case DELAY -> {
                         ScriptValue d = stack.pop();
-                        long nanos = 0;
+                        long nanos;
                         if (d instanceof PrimitiveValue.LongV lv) nanos = lv.value();
                         else if (d instanceof PrimitiveValue.IntV iv) nanos = iv.value();
-                        if (host != null) {
-                            host.sleepFiber(fiberId, System.nanoTime() + nanos);
-                            return VmExecutionResult.suspended(VmExecutionResult.SuspendReason.SLEEP,
-                                    nanos, instructions, System.nanoTime() - startTime);
+                        else if (d instanceof PrimitiveValue.FloatV fv) nanos = (long) fv.value();
+                        else if (d instanceof PrimitiveValue.DoubleV dv) nanos = (long) dv.value();
+                        else {
+                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                                    "delay requires Duration or a nanosecond number", 0, fiberId), instructions, System.nanoTime() - startTime);
                         }
+                        if (nanos < 0) {
+                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                                    "delay cannot be negative", 0, fiberId), instructions, System.nanoTime() - startTime);
+                        }
+                        if (host == null) {
+                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                                    "delay requires a scheduler", 0, fiberId), instructions, System.nanoTime() - startTime);
+                        }
+                        host.sleepFiber(fiberId, System.nanoTime() + nanos);
+                        return VmExecutionResult.suspended(VmExecutionResult.SuspendReason.SLEEP,
+                                nanos, instructions, System.nanoTime() - startTime);
                     }
                     case YIELD -> {
-                        if (host != null) {
-                            host.yieldFiber(fiberId);
-                            return VmExecutionResult.suspended(VmExecutionResult.SuspendReason.YIELD,
-                                    0, instructions, System.nanoTime() - startTime);
+                        if (host == null) {
+                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                                    "yield requires a scheduler", 0, fiberId), instructions, System.nanoTime() - startTime);
                         }
+                        host.yieldFiber(fiberId);
+                        return VmExecutionResult.suspended(VmExecutionResult.SuspendReason.YIELD,
+                                0, instructions, System.nanoTime() - startTime);
                     }
                     case CHECK_CANCELLED -> {
                         if (host != null && host.isCancelled(fiberId)) {
@@ -397,9 +458,15 @@ public final class VirtualMachine {
 
             return VmExecutionResult.success(PrimitiveValue.nullValue(), instructions, System.nanoTime() - startTime);
 
+        } catch (ResourceLimitException | ResourceLimitViolation e) {
+            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_RESOURCE_LIMIT,
+                    e.getMessage(), 0, fiberId), instructions, System.nanoTime() - startTime);
+        } catch (ArithmeticException e) {
+            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_DIVISION_BY_ZERO,
+                    e.getMessage(), 0, fiberId), instructions, System.nanoTime() - startTime);
         } catch (Throwable t) {
             return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
-                    t.getMessage(), 0, fiberId), instructions, System.nanoTime() - startTime);
+                    t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName(), 0, fiberId), instructions, System.nanoTime() - startTime);
         }
     }
 
@@ -418,6 +485,7 @@ public final class VirtualMachine {
 
     public static ScriptValue javaToValue(Object o) {
         if (o == null) return PrimitiveValue.nullValue();
+        if (o instanceof ScriptValue value) return value;
         if (o instanceof Integer i) return PrimitiveValue.of(i);
         if (o instanceof Long l) return PrimitiveValue.of(l);
         if (o instanceof Float f) return PrimitiveValue.of(f);
@@ -433,12 +501,113 @@ public final class VirtualMachine {
         }
         if (o instanceof Map<?, ?> map) {
             Map<ScriptValue, ScriptValue> entries = new LinkedHashMap<>();
-            for (var e : map.entrySet()) {
-                entries.put(javaToValue(e.getKey()), javaToValue(e.getValue()));
-            }
+            for (var e : map.entrySet()) entries.put(javaToValue(e.getKey()), javaToValue(e.getValue()));
             return new MapValue(entries);
         }
+        if (o instanceof Set<?> set) {
+            Set<ScriptValue> elements = new LinkedHashSet<>();
+            for (Object element : set) elements.add(javaToValue(element));
+            return new SetValue(elements);
+        }
         return new HandleValue(o.getClass().getSimpleName(), o);
+    }
+
+    private ScriptValue apiResult(FunctionDescriptor descriptor, Object result) {
+        return javaToValue(descriptor.returnType(), result);
+    }
+
+    public static ScriptValue javaToValue(io.velora.api.type.VeloraType type, Object value) {
+        io.velora.api.type.VeloraType expected = type.nonNull();
+        if (value == null) {
+            if (expected == io.velora.api.type.VeloraTypes.UNIT || type.isNullable()) return PrimitiveValue.nullValue();
+            throw new IllegalArgumentException("Host returned null for non-null type " + type.name());
+        }
+        if (value instanceof ScriptValue scriptValue) {
+            if (expected.isHandle()) {
+                if (!(scriptValue instanceof HandleValue handle) || !handle.typeName().equals(expected.name())) {
+                    throw new IllegalArgumentException("Handle type mismatch: expected " + expected.name());
+                }
+            }
+            return scriptValue;
+        }
+        io.velora.api.type.VeloraType listElement = io.velora.api.type.VeloraTypes.listElement(expected);
+        if (listElement != null) {
+            if (!(value instanceof List<?> list)) throw typeMismatch(expected, value);
+            List<ScriptValue> elements = new ArrayList<>(list.size());
+            for (Object element : list) elements.add(javaToValue(listElement, element));
+            return new ListValue(elements);
+        }
+        io.velora.api.type.VeloraType setElement = io.velora.api.type.VeloraTypes.setElement(expected);
+        if (setElement != null) {
+            if (!(value instanceof Set<?> set)) throw typeMismatch(expected, value);
+            Set<ScriptValue> elements = new LinkedHashSet<>();
+            for (Object element : set) elements.add(javaToValue(setElement, element));
+            return new SetValue(elements);
+        }
+        io.velora.api.type.VeloraType mapKey = io.velora.api.type.VeloraTypes.mapKey(expected);
+        io.velora.api.type.VeloraType mapValue = io.velora.api.type.VeloraTypes.mapValue(expected);
+        if (mapKey != null && mapValue != null) {
+            if (!(value instanceof Map<?, ?> map)) throw typeMismatch(expected, value);
+            Map<ScriptValue, ScriptValue> entries = new LinkedHashMap<>();
+            for (var entry : map.entrySet()) entries.put(javaToValue(mapKey, entry.getKey()), javaToValue(mapValue, entry.getValue()));
+            return new MapValue(entries);
+        }
+        if (expected instanceof io.velora.api.type.HandleType) {
+            Class<?> javaClass = expected.javaClass();
+            if (!javaClass.isInstance(value)) throw new IllegalArgumentException("Handle type mismatch: expected " + expected.name() + " (" + javaClass.getTypeName() + "), got " + value.getClass().getTypeName());
+            return new HandleValue(expected.name(), value);
+        }
+        if (expected instanceof io.velora.api.type.StructType struct) {
+            if (!struct.javaClass().isInstance(value)) throw typeMismatch(expected, value);
+            Map<String, ScriptValue> fields = new LinkedHashMap<>();
+            for (io.velora.api.type.StructType.Property property : struct.properties()) {
+                fields.put(property.name(), javaToValue(property.type(), property.accessor().apply(value)));
+            }
+            return new StructValue(expected.name(), fields, value);
+        }
+        if (expected instanceof io.velora.api.type.EnumType enumType) {
+            if (!enumType.javaClass().isInstance(value)) throw typeMismatch(expected, value);
+            for (int i = 0; i < enumType.constants().size(); i++) {
+                io.velora.api.type.EnumType.Constant constant = enumType.constants().get(i);
+                if (Objects.equals(constant.value(), value) || value instanceof Enum<?> javaEnum && javaEnum.name().equals(constant.name())) {
+                    return new EnumValue(expected.name(), constant.name(), i, value);
+                }
+            }
+            throw new IllegalArgumentException("Unknown enum value for " + expected.name() + ": " + value);
+        }
+        if (expected == io.velora.api.type.VeloraTypes.UNIT) return PrimitiveValue.nullValue();
+        if (expected == io.velora.api.type.VeloraTypes.BYTE && value instanceof Number number) return PrimitiveValue.of(number.byteValue());
+        if (expected == io.velora.api.type.VeloraTypes.INT && value instanceof Number number) return PrimitiveValue.of(number.intValue());
+        if (expected == io.velora.api.type.VeloraTypes.LONG && value instanceof Number number) return PrimitiveValue.of(number.longValue());
+        if (expected == io.velora.api.type.VeloraTypes.FLOAT && value instanceof Number number) return PrimitiveValue.of(number.floatValue());
+        if (expected == io.velora.api.type.VeloraTypes.DOUBLE && value instanceof Number number) return PrimitiveValue.of(number.doubleValue());
+        if (expected == io.velora.api.type.VeloraTypes.BOOLEAN && value instanceof Boolean bool) return PrimitiveValue.of(bool);
+        if (expected == io.velora.api.type.VeloraTypes.CHAR && value instanceof Character character) return PrimitiveValue.of(character);
+        if (expected == io.velora.api.type.VeloraTypes.STRING && value instanceof String string) return new StringValue(string);
+        if (expected == io.velora.api.type.VeloraTypes.DURATION && value instanceof java.time.Duration duration) return PrimitiveValue.of(duration.toNanos());
+        if (expected == io.velora.api.type.VeloraTypes.DURATION && value instanceof Number number) return PrimitiveValue.of(number.longValue());
+        if (expected == io.velora.api.type.VeloraTypes.UUID && value instanceof java.util.UUID uuid) return new StringValue(uuid.toString());
+        if (expected == io.velora.api.type.VeloraTypes.UUID && value instanceof String string) {
+            java.util.UUID.fromString(string);
+            return new StringValue(string);
+        }
+        if ((expected == io.velora.api.type.VeloraTypes.VEC2 || expected == io.velora.api.type.VeloraTypes.VEC3) && value instanceof double[] array) {
+            List<ScriptValue> elements = new ArrayList<>(array.length);
+            for (double element : array) elements.add(PrimitiveValue.of(element));
+            return new ListValue(elements);
+        }
+        if (expected == io.velora.api.type.VeloraTypes.COLOR && value instanceof int[] array) {
+            List<ScriptValue> elements = new ArrayList<>(array.length);
+            for (int element : array) elements.add(PrimitiveValue.of(element));
+            return new ListValue(elements);
+        }
+        ScriptValue converted = javaToValue(value);
+        if (converted instanceof HandleValue) throw typeMismatch(expected, value);
+        return converted;
+    }
+
+    private static IllegalArgumentException typeMismatch(io.velora.api.type.VeloraType expected, Object value) {
+        return new IllegalArgumentException("Host value type mismatch: expected " + expected.name() + " (" + expected.javaClass().getTypeName() + "), got " + value.getClass().getTypeName());
     }
 
     private boolean toBoolean(ScriptValue v) {
@@ -450,80 +619,111 @@ public final class VirtualMachine {
     private boolean equal(ScriptValue a, ScriptValue b) {
         if (a.isNull() && b.isNull()) return true;
         if (a.isNull() || b.isNull()) return false;
+        if (a.boxed() instanceof Number left && b.boxed() instanceof Number right) {
+            if (left instanceof Float || left instanceof Double || right instanceof Float || right instanceof Double) return Double.compare(left.doubleValue(), right.doubleValue()) == 0;
+            return left.longValue() == right.longValue();
+        }
         return a.boxed().equals(b.boxed());
     }
 
     private int compare(ScriptValue a, ScriptValue b) {
-        if (a.boxed() instanceof Number n && b.boxed() instanceof Number n2) {
-            return Double.compare(n.doubleValue(), n2.doubleValue());
-        }
-        return 0;
+        if (a.boxed() instanceof Number left && b.boxed() instanceof Number right) return Double.compare(left.doubleValue(), right.doubleValue());
+        if (a instanceof StringValue left && b instanceof StringValue right) return left.value().compareTo(right.value());
+        throw new IllegalArgumentException("Values are not comparable");
     }
 
     private ScriptValue add(ScriptValue a, ScriptValue b) {
-        if (a instanceof PrimitiveValue.IntV ia && b instanceof PrimitiveValue.IntV ib) return PrimitiveValue.of(ia.value() + ib.value());
-        if (a instanceof PrimitiveValue.LongV la && b instanceof PrimitiveValue.LongV lb) return PrimitiveValue.of(la.value() + lb.value());
-        if (a instanceof PrimitiveValue.DoubleV da && b instanceof PrimitiveValue.DoubleV db) return PrimitiveValue.of(da.value() + db.value());
-        if (a instanceof PrimitiveValue.FloatV fa && b instanceof PrimitiveValue.FloatV fb) return PrimitiveValue.of(fa.value() + fb.value());
-        if (a instanceof StringValue || b instanceof StringValue) return new StringValue(valueToString(a) + valueToString(b));
-        return PrimitiveValue.nullValue();
+        if (a instanceof StringValue || b instanceof StringValue) {
+            ScriptValue value = new StringValue(valueToString(a) + valueToString(b));
+            enforceValueLimits(value);
+            return value;
+        }
+        return numeric(a, b, '+');
     }
 
-    private String valueToString(ScriptValue v) {
-        if (v instanceof StringValue sv) return sv.value();
-        if (v == null || v.isNull()) return "null";
-        Object boxed = v.boxed();
+    private String valueToString(ScriptValue value) {
+        if (value instanceof StringValue string) return string.value();
+        if (value == null || value.isNull()) return "null";
+        Object boxed = value.boxed();
         return boxed != null ? boxed.toString() : "null";
     }
 
-    private ScriptValue sub(ScriptValue a, ScriptValue b) {
-        if (a instanceof PrimitiveValue.IntV ia && b instanceof PrimitiveValue.IntV ib) return PrimitiveValue.of(ia.value() - ib.value());
-        if (a instanceof PrimitiveValue.LongV la && b instanceof PrimitiveValue.LongV lb) return PrimitiveValue.of(la.value() - lb.value());
-        if (a instanceof PrimitiveValue.DoubleV da && b instanceof PrimitiveValue.DoubleV db) return PrimitiveValue.of(da.value() - db.value());
-        return PrimitiveValue.nullValue();
+    private ScriptValue sub(ScriptValue a, ScriptValue b) { return numeric(a, b, '-'); }
+    private ScriptValue mul(ScriptValue a, ScriptValue b) { return numeric(a, b, '*'); }
+    private ScriptValue div(ScriptValue a, ScriptValue b) { return numeric(a, b, '/'); }
+    private ScriptValue mod(ScriptValue a, ScriptValue b) { return numeric(a, b, '%'); }
+
+    private ScriptValue numeric(ScriptValue a, ScriptValue b, char op) {
+        if (!(a.boxed() instanceof Number left) || !(b.boxed() instanceof Number right)) throw new IllegalArgumentException("Numeric operator requires numbers");
+        if ((op == '/' || op == '%') && right.doubleValue() == 0.0d) throw new ArithmeticException(op == '/' ? "Division by zero" : "Modulo by zero");
+        if (a instanceof PrimitiveValue.DoubleV || b instanceof PrimitiveValue.DoubleV) {
+            double x = left.doubleValue(), y = right.doubleValue();
+            return PrimitiveValue.of(switch (op) { case '+' -> x + y; case '-' -> x - y; case '*' -> x * y; case '/' -> x / y; case '%' -> x % y; default -> throw new IllegalArgumentException(); });
+        }
+        if (a instanceof PrimitiveValue.FloatV || b instanceof PrimitiveValue.FloatV) {
+            float x = left.floatValue(), y = right.floatValue();
+            return PrimitiveValue.of(switch (op) { case '+' -> x + y; case '-' -> x - y; case '*' -> x * y; case '/' -> x / y; case '%' -> x % y; default -> throw new IllegalArgumentException(); });
+        }
+        if (a instanceof PrimitiveValue.LongV || b instanceof PrimitiveValue.LongV) {
+            long x = left.longValue(), y = right.longValue();
+            return PrimitiveValue.of(switch (op) { case '+' -> x + y; case '-' -> x - y; case '*' -> x * y; case '/' -> x / y; case '%' -> x % y; default -> throw new IllegalArgumentException(); });
+        }
+        int x = left.intValue(), y = right.intValue();
+        return PrimitiveValue.of(switch (op) { case '+' -> x + y; case '-' -> x - y; case '*' -> x * y; case '/' -> x / y; case '%' -> x % y; default -> throw new IllegalArgumentException(); });
     }
 
-    private ScriptValue mul(ScriptValue a, ScriptValue b) {
-        if (a instanceof PrimitiveValue.IntV ia && b instanceof PrimitiveValue.IntV ib) return PrimitiveValue.of(ia.value() * ib.value());
-        if (a instanceof PrimitiveValue.LongV la && b instanceof PrimitiveValue.LongV lb) return PrimitiveValue.of(la.value() * lb.value());
-        if (a instanceof PrimitiveValue.DoubleV da && b instanceof PrimitiveValue.DoubleV db) return PrimitiveValue.of(da.value() * db.value());
-        return PrimitiveValue.nullValue();
+    private ScriptValue negate(ScriptValue value) {
+        if (value instanceof PrimitiveValue.IntV v) return PrimitiveValue.of(-v.value());
+        if (value instanceof PrimitiveValue.LongV v) return PrimitiveValue.of(-v.value());
+        if (value instanceof PrimitiveValue.FloatV v) return PrimitiveValue.of(-v.value());
+        if (value instanceof PrimitiveValue.DoubleV v) return PrimitiveValue.of(-v.value());
+        if (value instanceof PrimitiveValue.ByteV v) return PrimitiveValue.of(-v.value());
+        throw new IllegalArgumentException("Unary minus requires a number");
     }
 
-    private ScriptValue div(ScriptValue a, ScriptValue b) {
-        if (a instanceof PrimitiveValue.IntV ia && b instanceof PrimitiveValue.IntV ib) {
-            if (ib.value() == 0) throw new ArithmeticException("Division by zero");
-            return PrimitiveValue.of(ia.value() / ib.value());
-        }
-        if (a instanceof PrimitiveValue.LongV la && b instanceof PrimitiveValue.LongV lb) {
-            if (lb.value() == 0) throw new ArithmeticException("Division by zero");
-            return PrimitiveValue.of(la.value() / lb.value());
-        }
-        if (a instanceof PrimitiveValue.DoubleV da && b instanceof PrimitiveValue.DoubleV db) {
-            if (db.value() == 0) throw new ArithmeticException("Division by zero");
-            return PrimitiveValue.of(da.value() / db.value());
-        }
-        return PrimitiveValue.nullValue();
+    private void enforceValueLimits(ScriptValue value) {
+        validateValue(value, 0);
     }
 
-    private ScriptValue mod(ScriptValue a, ScriptValue b) {
-        if (a instanceof PrimitiveValue.IntV ia && b instanceof PrimitiveValue.IntV ib) {
-            if (ib.value() == 0) throw new ArithmeticException("Modulo by zero");
-            return PrimitiveValue.of(ia.value() % ib.value());
+    private void validateValue(ScriptValue value, int depth) {
+        if (depth > maxCollectionDepth) throw new ResourceLimitException("Collection depth limit exceeded");
+        if (value instanceof StringValue string) {
+            if (string.value().length() > maxStringLength) throw new ResourceLimitException("String length limit exceeded");
+            return;
         }
-        return PrimitiveValue.nullValue();
+        if (value instanceof ListValue list) {
+            if (list.elements().size() > maxCollectionElements) throw new ResourceLimitException("Collection element limit exceeded");
+            for (ScriptValue element : list.elements()) validateValue(element, depth + 1);
+            return;
+        }
+        if (value instanceof MapValue map) {
+            if (map.entries().size() > maxCollectionElements) throw new ResourceLimitException("Collection element limit exceeded");
+            for (var entry : map.entries().entrySet()) {
+                validateValue(entry.getKey(), depth + 1);
+                validateValue(entry.getValue(), depth + 1);
+            }
+            return;
+        }
+        if (value instanceof SetValue set) {
+            if (set.elements().size() > maxCollectionElements) throw new ResourceLimitException("Collection element limit exceeded");
+            for (ScriptValue element : set.elements()) validateValue(element, depth + 1);
+            return;
+        }
+        if (value instanceof StructValue struct) {
+            if (struct.fields().size() > maxCollectionElements) throw new ResourceLimitException("Collection element limit exceeded");
+            for (ScriptValue field : struct.fields().values()) validateValue(field, depth + 1);
+        }
     }
 
-    private ScriptValue negate(ScriptValue a) {
-        if (a instanceof PrimitiveValue.IntV ia) return PrimitiveValue.of(-ia.value());
-        if (a instanceof PrimitiveValue.LongV la) return PrimitiveValue.of(-la.value());
-        if (a instanceof PrimitiveValue.DoubleV da) return PrimitiveValue.of(-da.value());
-        return PrimitiveValue.nullValue();
+    private static final class ResourceLimitException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        private ResourceLimitException(String message) { super(message); }
     }
 
     private record SimpleFunctionContext(FunctionDescriptor descriptor, Object[] args, String scriptId, long fiberId) implements FunctionContext {
         @Override public <T> T argument(String name, Class<T> type) { return type.cast(argument(name)); }
-        @Override public <T> T argument(int index, Class<T> type) {
+        @Override @SuppressWarnings("unchecked") public <T> T argument(int index, Class<T> type) {
             Object value = args[index];
             if (type == int.class) return (T) (Object) Integer.valueOf(((Number) value).intValue());
             if (type == long.class) return (T) (Object) Long.valueOf(((Number) value).longValue());

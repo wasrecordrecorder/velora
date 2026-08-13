@@ -10,6 +10,9 @@ import io.velora.internal.parser.*;
 import io.velora.internal.scheduler.*;
 import io.velora.internal.semantic.*;
 import io.velora.internal.runtime.*;
+import io.velora.internal.registry.*;
+import io.velora.internal.compiler.*;
+import io.velora.internal.script.*;
 import io.velora.internal.setting.*;
 import io.velora.internal.vm.*;
 
@@ -35,7 +38,7 @@ class SchedulerV2Test {
         settingRegistry = new DefaultSettingRegistry();
         permissionRegistry = new DefaultPermissionRegistry();
         constantRegistry = new DefaultConstantRegistry();
-        apiRegistry = new DefaultApiRegistry();
+        apiRegistry = new DefaultApiRegistry(new DefaultTypeRegistry());
     }
 
     private CompiledModule compile(String source) {
@@ -137,7 +140,7 @@ class SchedulerV2Test {
             @Script(name="T", version="1")
             script T {
                 int child() { return 42 }
-                async int run() { int r = spawn child()
+                async int run() { Task<int> r = spawn child()
                     return await(r) }
             }
             """);

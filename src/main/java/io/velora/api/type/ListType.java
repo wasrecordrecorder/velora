@@ -25,7 +25,7 @@ final class ListType implements VeloraType {
 
     @Override
     public String name() {
-        return "List<" + element.name() + ">";
+        return "List<" + element.name() + ">" + (nullable ? "?" : "");
     }
 
     @Override

@@ -33,7 +33,7 @@ public interface EventRegistry {
 
     /**
      * Emit an already-safe immutable payload. Allowed from any thread. The payload
-     * must not reference live Minecraft/world state.
+     * must not reference live host state.
      */
     <T> void emitSafe(EventKey<T> key, T payload);
 

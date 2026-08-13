@@ -12,8 +12,10 @@ public final class DefaultLanguageService implements LanguageService {
 
     @Override
     public EditorSession openEditor(String scriptId, String filePath) {
+        if (!available) throw new IllegalStateException("Language service is closed");
         DefaultEditorSession session = new DefaultEditorSession(scriptId, filePath);
-        sessions.put(scriptId + ":" + filePath, session);
+        DefaultEditorSession previous = sessions.put(scriptId + ":" + filePath, session);
+        if (previous != null) previous.close();
         return session;
     }
 

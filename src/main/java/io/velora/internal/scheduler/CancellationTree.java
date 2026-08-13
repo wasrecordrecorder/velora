@@ -22,6 +22,16 @@ public final class CancellationTree {
         return cancelled.contains(fiberId);
     }
 
+    public void remove(long fiberId, long parentId) {
+        cancelled.remove(fiberId);
+        children.remove(fiberId);
+        Set<Long> siblings = children.get(parentId);
+        if (siblings != null) {
+            siblings.remove(fiberId);
+            if (siblings.isEmpty()) children.remove(parentId);
+        }
+    }
+
     public void clear() {
         children.clear();
         cancelled.clear();

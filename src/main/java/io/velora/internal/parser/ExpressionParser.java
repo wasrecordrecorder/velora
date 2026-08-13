@@ -14,7 +14,7 @@ import java.util.Set;
 public final class ExpressionParser {
 
     private static final Set<String> DURATION_UNITS = Set.of(
-            "tick", "ticks", "millis", "milliseconds", "ms",
+            "millis", "milliseconds", "ms",
             "seconds", "second", "sec", "s",
             "minutes", "minute", "min",
             "hours", "hour", "h",

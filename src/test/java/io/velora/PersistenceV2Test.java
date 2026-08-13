@@ -1,6 +1,7 @@
 package io.velora;
 
 import io.velora.api.setting.SettingValue;
+import io.velora.api.type.VeloraTypes;
 import io.velora.internal.persistence.SettingsFileCodec;
 import io.velora.internal.persistence.StateFileCodec;
 import org.junit.jupiter.api.Test;
@@ -250,4 +251,27 @@ class PersistenceV2Test {
         Map<String, Object> decoded = StateFileCodec.decode(encoded);
         assertEquals(original, decoded);
     }
+    @Test
+    @DisplayName("SettingsFileCodec: preserves explicit scalar types and multiline strings")
+    void settingsCodec_typedScalarsAndMultilineString() {
+        Map<String, SettingValue> original = new LinkedHashMap<>();
+        original.put("longValue", SettingValue.ofLong(42L));
+        original.put("floatValue", SettingValue.of(VeloraTypes.FLOAT, 1.25f));
+        original.put("message", SettingValue.ofString("true\ncount=42\n# literal"));
+        assertEquals(original, SettingsFileCodec.decode(SettingsFileCodec.encode(original)));
+    }
+
+    @Test
+    @DisplayName("StateFileCodec: preserves string identity and scalar wrappers")
+    void stateCodec_preservesAmbiguousStringsAndWrappers() {
+        Map<String, Object> original = new LinkedHashMap<>();
+        original.put("truth", "true");
+        original.put("number", "123");
+        original.put("multiline", "a=b\n# not a comment");
+        original.put("longValue", 42L);
+        original.put("floatValue", 1.5f);
+        original.put("nullValue", null);
+        assertEquals(original, StateFileCodec.decode(StateFileCodec.encode(original)));
+    }
+
 }

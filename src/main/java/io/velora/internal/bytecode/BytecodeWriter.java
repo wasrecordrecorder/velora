@@ -10,10 +10,14 @@ import java.util.*;
 public final class BytecodeWriter {
 
     public CompiledModule write(IrModule module) {
-        return write(module, "sha256");
+        return write(module, "", "");
     }
 
     public CompiledModule write(IrModule module, String sourceHash) {
+        return write(module, sourceHash, "");
+    }
+
+    public CompiledModule write(IrModule module, String sourceHash, String registryHash) {
         ConstantPool pool = new ConstantPool();
         List<CompiledFunction> functions = new ArrayList<>();
         List<String> lifecycleHooks = new ArrayList<>(module.lifecycleHooks());
@@ -35,7 +39,7 @@ public final class BytecodeWriter {
 
         return new CompiledModule(
                 module.scriptId(), module.scriptName(), module.version(), module.languageVersion(),
-                sourceHash, "sha256", pool, functions, module.settings(),
+                sourceHash, registryHash, pool, functions, module.settings(),
                 module.persistentFieldIds(), module.persistentFieldTypes(),
                 module.persistentFieldIndices(), module.persistentFieldIsStatic(),
                 module.requiredPermissions(), module.maximumPermissions(),

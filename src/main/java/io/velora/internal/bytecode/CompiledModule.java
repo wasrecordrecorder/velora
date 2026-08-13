@@ -5,7 +5,9 @@ import io.velora.api.setting.SettingDescriptor;
 import io.velora.api.setting.SettingSchema;
 import io.velora.internal.vm.ScriptValue;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * A fully compiled, verified script module ready for VM execution.
@@ -22,6 +24,7 @@ public final class CompiledModule {
     private final String registryHash;
     private final ConstantPool constantPool;
     private final List<CompiledFunction> functions;
+    private final Map<String, CompiledFunction> functionsByName;
     private final List<SettingDescriptor> settings;
     private final List<String> persistentFieldIds;
     private final List<String> persistentFieldTypes;
@@ -77,6 +80,9 @@ public final class CompiledModule {
         this.registryHash = registryHash;
         this.constantPool = constantPool;
         this.functions = List.copyOf(functions);
+        Map<String, CompiledFunction> byName = new LinkedHashMap<>();
+        for (CompiledFunction function : this.functions) byName.put(function.name(), function);
+        this.functionsByName = Map.copyOf(byName);
         this.settings = List.copyOf(settings);
         this.persistentFieldIds = List.copyOf(persistentFieldIds);
         this.persistentFieldTypes = List.copyOf(persistentFieldTypes);
@@ -112,14 +118,11 @@ public final class CompiledModule {
     public List<FieldInitializer> fieldInitializers() { return fieldInitializers; }
 
     public CompiledFunction function(int index) {
-        return functions.get(index);
+        return index >= 0 && index < functions.size() ? functions.get(index) : null;
     }
 
     public CompiledFunction functionByName(String name) {
-        for (CompiledFunction f : functions) {
-            if (f.name().equals(name)) return f;
-        }
-        return null;
+        return functionsByName.get(name);
     }
 
     public record EventHandlerInfo(String eventReference, String functionName, int functionIndex, boolean suspending) {}

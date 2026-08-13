@@ -1,7 +1,7 @@
 package io.velora.internal.ast;
 
 /**
- * Duration literal: {@code 1.tick}, {@code 50.milliseconds}, {@code 2.seconds}.
+ * Duration literal: {@code 1.second}, {@code 50.milliseconds}, {@code 2.seconds}.
  * The amount is an expression (usually an integer literal); the unit selects the
  * conversion to {@link java.time.Duration}.
  */

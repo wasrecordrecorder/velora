@@ -8,8 +8,6 @@ import io.velora.host.VeloraHost;
 public final class VeloraEngineBuilder {
 
     private VeloraHost host;
-    private int compilerThreads = 1;
-    private int ioThreads = 1;
     private VeloraLimits limits = VeloraLimits.defaults();
 
     VeloraEngineBuilder() {}
@@ -19,24 +17,12 @@ public final class VeloraEngineBuilder {
         return this;
     }
 
-    public VeloraEngineBuilder compilerThreads(int n) {
-        this.compilerThreads = Math.max(1, n);
-        return this;
-    }
-
-    public VeloraEngineBuilder ioThreads(int n) {
-        this.ioThreads = Math.max(1, n);
-        return this;
-    }
-
     public VeloraEngineBuilder limits(VeloraLimits limits) {
         this.limits = limits;
         return this;
     }
 
     public VeloraHost host() { return host; }
-    public int compilerThreads() { return compilerThreads; }
-    public int ioThreads() { return ioThreads; }
     public VeloraLimits limits() { return limits; }
 
     public VeloraEngine build() {
