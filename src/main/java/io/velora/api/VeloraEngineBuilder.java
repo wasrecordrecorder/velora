@@ -1,0 +1,48 @@
+package io.velora.api;
+
+import io.velora.host.VeloraHost;
+
+/**
+ * Builder for {@link VeloraEngine}.
+ */
+public final class VeloraEngineBuilder {
+
+    private VeloraHost host;
+    private int compilerThreads = 1;
+    private int ioThreads = 1;
+    private VeloraLimits limits = VeloraLimits.defaults();
+
+    VeloraEngineBuilder() {}
+
+    public VeloraEngineBuilder host(VeloraHost host) {
+        this.host = host;
+        return this;
+    }
+
+    public VeloraEngineBuilder compilerThreads(int n) {
+        this.compilerThreads = Math.max(1, n);
+        return this;
+    }
+
+    public VeloraEngineBuilder ioThreads(int n) {
+        this.ioThreads = Math.max(1, n);
+        return this;
+    }
+
+    public VeloraEngineBuilder limits(VeloraLimits limits) {
+        this.limits = limits;
+        return this;
+    }
+
+    public VeloraHost host() { return host; }
+    public int compilerThreads() { return compilerThreads; }
+    public int ioThreads() { return ioThreads; }
+    public VeloraLimits limits() { return limits; }
+
+    public VeloraEngine build() {
+        if (host == null) {
+            throw new VeloraException("VeloraHost is required");
+        }
+        return io.velora.internal.runtime.DefaultVeloraEngine.create(this);
+    }
+}
