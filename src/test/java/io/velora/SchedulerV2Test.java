@@ -23,6 +23,7 @@ import org.junit.jupiter.api.DisplayName;
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 class SchedulerV2Test {
 
@@ -120,6 +121,26 @@ class SchedulerV2Test {
     }
 
     @Test
+    @DisplayName("Injected runtime clock drives delay scheduling")
+    void injectedClockDrivesDelayScheduling() {
+        CompiledModule m = compile("@Script(name=\"T\", version=\"1\")\nscript T { async void run() { delay(100) } }");
+        AtomicLong now = new AtomicLong(1_000);
+        ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), apiRegistry,
+                new io.velora.internal.debug.RuntimeErrorStore(10), null, constantRegistry, typeRegistry, now::get);
+        ScriptFiber fiber = scheduler.spawnFiber("T", 0, new ScriptValue[0]);
+        assertEquals(1_000L, fiber.createdAtNanos());
+        scheduler.tick(now.get(), modules(m), emptySettings());
+        assertEquals(FiberState.SLEEPING, fiber.state());
+        assertEquals(1_100L, fiber.sleepUntilNanos());
+        now.set(1_099);
+        scheduler.tick(now.get(), modules(m), emptySettings());
+        assertEquals(FiberState.SLEEPING, fiber.state());
+        now.set(1_100);
+        scheduler.tick(now.get(), modules(m), emptySettings());
+        assertTrue(fiber.isDone());
+    }
+
+    @Test
     @DisplayName("Short delay completes quickly")
     void shortDelay() {
         CompiledModule m = compile("@Script(name=\"T\", version=\"1\")\nscript T {\n    async void run() { delay(1) }\n}");
@@ -157,6 +178,31 @@ class SchedulerV2Test {
     }
 
     @Test
+    @DisplayName("Completed spawned tasks remain awaitable")
+    void completedSpawnedTasksRemainAwaitable() {
+        CompiledModule m = compile("""
+            @Script(name="T", version="1")
+            script T {
+                int first() { return 20 }
+                int second() { return 22 }
+                async int run() {
+                    Task<int> a = spawn first()
+                    Task<int> b = spawn second()
+                    return await(a) + await(b)
+                }
+            }
+            """);
+        ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), apiRegistry);
+        ScriptFiber parent = scheduler.spawnFiber("T", m.functionByName("run").index(), new ScriptValue[0]);
+        long now = System.nanoTime();
+        scheduler.tick(now, modules(m), emptySettings());
+        scheduler.tick(now + 1, modules(m), emptySettings());
+        scheduler.tick(now + 2, modules(m), emptySettings());
+        assertTrue(parent.isDone());
+        assertEquals(42, ((Number) parent.result().boxed()).intValue());
+    }
+
+    @Test
     @DisplayName("Spawn child without await - child runs independently")
     void spawnNoAwait() {
         CompiledModule m = compile("""
@@ -190,6 +236,7 @@ class SchedulerV2Test {
         scheduler.cancelFiber(fiber.id());
         scheduler.tick(now + 1, modules(m), emptySettings());
         assertTrue(fiber.isDone(), "Fiber should be done after cancellation");
+        assertEquals(1L, scheduler.cancellations("T"));
     }
 
     @Test
@@ -240,6 +287,7 @@ class SchedulerV2Test {
         scheduler.tick(System.nanoTime(), Map.of(), Map.of());
         assertTrue(fiber.isDone());
         assertEquals(FiberState.FAILED, fiber.state());
+        assertEquals(1L, scheduler.failures("nonexistent"));
     }
 
     // === FiberState enum ===

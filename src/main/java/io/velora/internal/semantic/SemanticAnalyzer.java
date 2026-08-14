@@ -5,6 +5,8 @@ import io.velora.api.compiler.DiagnosticCode;
 import io.velora.api.compiler.DiagnosticSeverity;
 import io.velora.api.compiler.SourceRange;
 import io.velora.api.function.ApiRegistry;
+import io.velora.api.event.EventDescriptor;
+import io.velora.api.event.EventRegistry;
 import io.velora.api.function.FunctionDescriptor;
 import io.velora.api.permission.PermissionSet;
 import io.velora.api.permission.ScriptPermission;
@@ -15,9 +17,12 @@ import io.velora.api.registry.TypeRegistry;
 import io.velora.api.setting.SettingDescriptor;
 import io.velora.api.setting.SettingEditorDescriptor;
 import io.velora.api.setting.SettingKind;
+import io.velora.api.setting.SettingValidationResult;
+import io.velora.api.setting.SettingValue;
 import io.velora.api.type.VeloraType;
 import io.velora.api.type.VeloraTypes;
 import io.velora.internal.ast.*;
+import io.velora.internal.setting.SettingValidator;
 
 import java.util.*;
 
@@ -32,17 +37,25 @@ public final class SemanticAnalyzer {
     private final ApiRegistry apiRegistry;
     private final ConstantRegistry constantRegistry;
     private final PermissionRegistry permissionRegistry;
+    private final EventRegistry eventRegistry;
     private final List<Diagnostic> diagnostics = new ArrayList<>();
     private Map<String, ResolvedScript.ResolvedFunction> resolvedFunctions;
 
     public SemanticAnalyzer(TypeRegistry typeRegistry, SettingRegistry settingRegistry,
                             ApiRegistry apiRegistry, ConstantRegistry constantRegistry,
                             PermissionRegistry permissionRegistry) {
+        this(typeRegistry, settingRegistry, apiRegistry, constantRegistry, permissionRegistry, null);
+    }
+
+    public SemanticAnalyzer(TypeRegistry typeRegistry, SettingRegistry settingRegistry,
+                            ApiRegistry apiRegistry, ConstantRegistry constantRegistry,
+                            PermissionRegistry permissionRegistry, EventRegistry eventRegistry) {
         this.typeRegistry = typeRegistry;
         this.settingRegistry = settingRegistry;
         this.apiRegistry = apiRegistry;
         this.constantRegistry = constantRegistry;
         this.permissionRegistry = permissionRegistry;
+        this.eventRegistry = eventRegistry;
     }
 
     public List<Diagnostic> diagnostics() {
@@ -51,13 +64,7 @@ public final class SemanticAnalyzer {
 
     public ResolvedScript analyze(ScriptNode script) {
         diagnostics.clear();
-        // Check for unknown annotations
-        for (AnnotationNode ann : script.annotations()) {
-            if (!ann.name().equals("Script") && !ann.name().equals("Permissions")
-                    && !ann.name().equals("Persistent") && !ann.name().equals("Event")) {
-                error(DiagnosticCode.SEMANTIC_UNKNOWN_ANNOTATION, "Unknown annotation: @" + ann.name(), ann.line(), ann.column());
-            }
-        }
+        validateScriptAnnotations(script);
         ResolvedScript.ScriptMetadata metadata = extractMetadata(script);
         List<SettingDescriptor> settings = buildSettings(script.settingBlock());
         Map<String, ResolvedScript.ResolvedProperty> properties = new LinkedHashMap<>();
@@ -113,7 +120,7 @@ public final class SemanticAnalyzer {
                     } else {
                         constValue = evaluation.value();
                         VeloraType valueType = constantType(constValue);
-                        if (propType != VeloraTypes.UNIT && valueType != null && !isAssignable(valueType, propType)) {
+                        if (propType != VeloraTypes.UNIT && valueType != null && !isAssignableExpression(prop.initializer(), valueType, propType)) {
                             error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Field '" + prop.name() + "' expects " + propType.name() + ", got " + valueType.name(), prop.line(), prop.column());
                         }
                     }
@@ -150,8 +157,19 @@ public final class SemanticAnalyzer {
                         error(DiagnosticCode.SEMANTIC_DEFAULT_BEFORE_REQUIRED, "Required parameter '" + p.name() + "' after default parameter", p.line(), p.column());
                     }
                     Object defVal = null;
-                    if (p.hasDefault() && p.defaultValue() instanceof LiteralExpressionNode lit) {
-                        defVal = lit.value();
+                    if (p.hasDefault()) {
+                        ConstantEvaluation evaluation = evaluateConstant(p.defaultValue(), properties);
+                        if (!evaluation.constant()) {
+                            error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "Default value for '" + p.name() + "' must be compile-time evaluable", p.line(), p.column());
+                        } else {
+                            defVal = evaluation.value();
+                            VeloraType defaultType = constantType(defVal);
+                            if (defVal == null) {
+                                if (isPrimitiveType(pt) && !pt.isNullable()) error(DiagnosticCode.SEMANTIC_PRIMITIVE_NULL, "Default value for '" + p.name() + "' cannot be null", p.line(), p.column());
+                            } else if (defaultType != null && !isAssignableExpression(p.defaultValue(), defaultType, pt)) {
+                                error(DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE, "Default value for '" + p.name() + "' expects " + pt.name() + ", got " + defaultType.name(), p.line(), p.column());
+                            }
+                        }
                     }
                     params.add(new ResolvedScript.ResolvedParam(p.name(), pt, p.hasDefault(), i, defVal));
                 }
@@ -163,12 +181,32 @@ public final class SemanticAnalyzer {
                 VeloraType retType = VeloraTypes.UNIT;
                 ResolvedScript.ResolvedFunction rf = new ResolvedScript.ResolvedFunction(
                         lc.hook().name(), List.of(), retType, lc.suspending(), lc.body(), functionIndex++, true);
-                lifecycle.put(lc.hook(), rf);
+                if (lifecycle.putIfAbsent(lc.hook(), rf) != null) {
+                    error(DiagnosticCode.SEMANTIC_DUPLICATE_SYMBOL, "Duplicate lifecycle handler: " + lc.hook().name(), lc.line(), lc.column());
+                }
             } else if (member instanceof EventHandlerNode eh) {
-                VeloraType paramType = resolveType(eh.parameterType(), eh);
+                boolean hasParameter = eh.parameterName() != null;
+                VeloraType paramType = hasParameter ? resolveType(eh.parameterType(), eh) : VeloraTypes.UNIT;
                 if (paramType == null) paramType = VeloraTypes.UNIT;
+                String eventReference = eh.eventReference();
+                EventDescriptor event = resolveEvent(eventReference);
+                if (eventRegistry != null) {
+                    if (event == null) {
+                        error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "Unknown event: " + eventReference, eh.line(), eh.column());
+                    } else {
+                        boolean payloadless = event.payloadType().nonNull() == VeloraTypes.UNIT || event.payloadType().nonNull() == VeloraTypes.NOTHING;
+                        if (!hasParameter && !payloadless) {
+                            error(DiagnosticCode.SEMANTIC_WRONG_ARITY, "Event '" + event.scriptName() + "' requires a payload parameter of type " + event.payloadType().name(), eh.line(), eh.column());
+                        } else if (hasParameter && !eventPayloadAssignable(event.payloadType(), paramType)) {
+                            error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Event '" + event.scriptName() + "' payload is " + event.payloadType().name() + ", handler expects " + paramType.name(), eh.line(), eh.column());
+                        }
+                        if (event.permission() != null) requiredPerms.add(event.permission());
+                        eventReference = event.id();
+                    }
+                }
+                String functionName = "$event$" + eventReference.replaceAll("[^A-Za-z0-9_$]", "_") + "$" + functionIndex;
                 ResolvedScript.ResolvedEventHandler reh = new ResolvedScript.ResolvedEventHandler(
-                        eh.eventReference(), eh.parameterName(), eh.parameterName(), paramType,
+                        eventReference, functionName, eh.parameterName(), paramType,
                         eh.suspending(), eh.body(), functionIndex++);
                 eventHandlers.add(reh);
             }
@@ -184,10 +222,15 @@ public final class SemanticAnalyzer {
         }
         for (ResolvedScript.ResolvedEventHandler eh : eventHandlers) {
             Scope handlerScope = new Scope(scriptScope);
-            handlerScope.define(new Symbol(eh.parameterName(), eh.parameterType(), Symbol.Kind.PARAMETER));
+            List<ResolvedScript.ResolvedParam> parameters;
+            if (eh.parameterName() != null) {
+                handlerScope.define(new Symbol(eh.parameterName(), eh.parameterType(), Symbol.Kind.PARAMETER));
+                parameters = List.of(new ResolvedScript.ResolvedParam(eh.parameterName(), eh.parameterType(), false, 0, null));
+            } else {
+                parameters = List.of();
+            }
             ResolvedScript.ResolvedFunction asFn = new ResolvedScript.ResolvedFunction(
-                    eh.functionName(), List.of(new ResolvedScript.ResolvedParam(eh.parameterName(), eh.parameterType(), false, 0, null)),
-                    VeloraTypes.BOOLEAN, eh.suspending(), eh.body(), eh.functionIndex(), true);
+                    eh.functionName(), parameters, VeloraTypes.UNIT, eh.suspending(), eh.body(), eh.functionIndex(), true);
             checkFunction(asFn, handlerScope, requiredPerms);
         }
 
@@ -209,6 +252,20 @@ public final class SemanticAnalyzer {
         return result;
     }
 
+    private EventDescriptor resolveEvent(String reference) {
+        if (eventRegistry == null || reference == null) return null;
+        EventDescriptor descriptor = eventRegistry.find(reference);
+        if (descriptor != null) return descriptor;
+        String scriptName = reference.startsWith("Event.") ? reference.substring(6) : reference;
+        return eventRegistry.findByScriptName(scriptName);
+    }
+
+    private boolean eventPayloadAssignable(VeloraType payload, VeloraType parameter) {
+        if (payload == null || parameter == null) return false;
+        if (!payload.nonNull().name().equals(parameter.nonNull().name())) return false;
+        return !payload.isNullable() || parameter.isNullable();
+    }
+
     private void checkFunction(ResolvedScript.ResolvedFunction rf, Scope parentScope, Set<ScriptPermission> requiredPerms) {
         Scope fnScope = new Scope(parentScope);
         for (ResolvedScript.ResolvedParam p : rf.parameters()) {
@@ -216,19 +273,32 @@ public final class SemanticAnalyzer {
         }
         if (rf.body() != null) {
             checkBlock(rf.body(), fnScope, rf, requiredPerms);
-            if (rf.returnType() != VeloraTypes.UNIT && !rf.isLifecycle() && !hasReturnStatement(rf.body())) {
-                error(DiagnosticCode.SEMANTIC_MISSING_RETURN, "Missing return in function " + rf.name(), rf.body().line(), rf.body().column());
+            if (rf.returnType() != VeloraTypes.UNIT && !rf.isLifecycle() && !blockAlwaysReturns(rf.body())) {
+                error(DiagnosticCode.SEMANTIC_MISSING_RETURN, "Not every path returns a value in function " + rf.name(), rf.body().line(), rf.body().column());
             }
         }
     }
 
-    private boolean hasReturnStatement(BlockNode block) {
+    private boolean blockAlwaysReturns(BlockNode block) {
+        if (block == null) return false;
         for (StatementNode stmt : block.statements()) {
-            if (stmt instanceof ReturnStatementNode) return true;
-            if (stmt instanceof IfStatementNode iff) {
-                if (iff.thenBlock() != null && hasReturnStatement(iff.thenBlock())) return true;
-                if (iff.elseBlock() != null && hasReturnStatement(iff.elseBlock())) return true;
+            if (statementAlwaysReturns(stmt)) return true;
+        }
+        return false;
+    }
+
+    private boolean statementAlwaysReturns(StatementNode stmt) {
+        if (stmt instanceof ReturnStatementNode) return true;
+        if (stmt instanceof IfStatementNode iff) {
+            return iff.thenBlock() != null && iff.elseBlock() != null
+                    && blockAlwaysReturns(iff.thenBlock()) && blockAlwaysReturns(iff.elseBlock());
+        }
+        if (stmt instanceof WhenStatementNode when) {
+            if (when.elseBody() == null || !blockAlwaysReturns(when.elseBody())) return false;
+            for (WhenStatementNode.Case c : when.cases()) {
+                if (!blockAlwaysReturns(c.body())) return false;
             }
+            return true;
         }
         return false;
     }
@@ -249,10 +319,15 @@ public final class SemanticAnalyzer {
     private void checkStatement(StatementNode stmt, Scope scope, ResolvedScript.ResolvedFunction currentFn, Set<ScriptPermission> requiredPerms) {
         if (stmt instanceof VariableDeclarationNode vd) {
             VeloraType type = vd.declaredType() != null ? resolveType(vd.declaredType(), vd) : null;
-            if (vd.initializer() != null) {
+            if (scope.definesLocally(vd.name())) {
+                error(DiagnosticCode.SEMANTIC_DUPLICATE_SYMBOL, "Duplicate local variable: " + vd.name(), vd.line(), vd.column());
+            }
+            if (vd.initializer() == null) {
+                error(DiagnosticCode.SEMANTIC_MISSING_INITIALIZER, "Local variable '" + vd.name() + "' requires an initializer", vd.line(), vd.column());
+            } else {
                 VeloraType initType = checkExpression(vd.initializer(), scope, currentFn, requiredPerms);
                 if (type == null) type = initType;
-                else if (initType != null && initType != VeloraTypes.UNIT && !isAssignable(initType, type)) {
+                else if (initType != null && initType != VeloraTypes.UNIT && !isAssignableExpression(vd.initializer(), initType, type)) {
                     error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Variable '" + vd.name() + "' expects " + type.name() + ", got " + initType.name(), vd.line(), vd.column());
                 }
             }
@@ -277,25 +352,37 @@ public final class SemanticAnalyzer {
             if (ws.body() != null) checkBlock(ws.body(), scope, currentFn, requiredPerms);
         } else if (stmt instanceof ForStatementNode fs) {
             VeloraType iterType = checkExpression(fs.iterable(), scope, currentFn, requiredPerms);
-            if (iterType != null && !iterType.name().startsWith("List") && iterType != VeloraTypes.UNIT) {
+            VeloraType elemType = VeloraTypes.listElement(iterType);
+            if (iterType != null && elemType == null && iterType != VeloraTypes.UNIT) {
                 error(DiagnosticCode.SEMANTIC_NON_ITERABLE, "For loop iterable must be a List, got " + iterType.name(), fs.line(), fs.column());
             }
-            Scope forScope = new Scope(scope);
-            VeloraType elemType = VeloraTypes.listElement(iterType);
             if (elemType == null) elemType = VeloraTypes.UNIT;
-            forScope.define(new Symbol(fs.variable(), elemType, Symbol.Kind.LOCAL));
+            VeloraType declaredType = resolveType(fs.variableType(), fs);
+            if (declaredType != null && elemType != VeloraTypes.UNIT && !isAssignable(elemType, declaredType)) {
+                error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Loop variable '" + fs.variable() + "' expects " + declaredType.name() + ", got " + elemType.name(), fs.line(), fs.column());
+            }
+            Scope forScope = new Scope(scope);
+            forScope.define(new Symbol(fs.variable(), declaredType != null ? declaredType : elemType, Symbol.Kind.LOCAL));
             if (fs.body() != null) checkBlock(fs.body(), forScope, currentFn, requiredPerms);
         } else if (stmt instanceof WhenStatementNode ws) {
             VeloraType subjType = checkExpression(ws.subject(), scope, currentFn, requiredPerms);
             for (WhenStatementNode.Case c : ws.cases()) {
                 for (ExpressionNode cond : c.conditions()) {
-                    checkExpression(cond, scope, currentFn, requiredPerms);
+                    VeloraType condType = checkExpression(cond, scope, currentFn, requiredPerms);
+                    if (subjType != VeloraTypes.UNIT && condType != VeloraTypes.UNIT
+                            && !isAssignable(condType, subjType) && !isAssignable(subjType, condType)) {
+                        error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "when case type " + condType.name() + " is incompatible with " + subjType.name(), cond.line(), cond.column());
+                    }
                 }
                 if (c.body() != null) checkBlock(c.body(), scope, currentFn, requiredPerms);
             }
             if (ws.elseBody() != null) checkBlock(ws.elseBody(), scope, currentFn, requiredPerms);
         } else if (stmt instanceof ReturnStatementNode rs) {
-            if (rs.value() != null) {
+            if (rs.value() == null) {
+                if (currentFn.returnType() != VeloraTypes.UNIT) {
+                    error(DiagnosticCode.SEMANTIC_WRONG_RETURN_TYPE, "Function returning " + currentFn.returnType().name() + " requires a return value", rs.line(), rs.column());
+                }
+            } else {
                 VeloraType retExprType = checkExpression(rs.value(), scope, currentFn, requiredPerms);
                 // Check void method returning a value
                 if (currentFn.returnType() == VeloraTypes.UNIT) {
@@ -303,7 +390,7 @@ public final class SemanticAnalyzer {
                 }
                 // Check return type mismatch (only for non-void, non-unit return types)
                 if (currentFn.returnType() != null && currentFn.returnType() != VeloraTypes.UNIT && retExprType != null && retExprType != VeloraTypes.UNIT) {
-                    if (!isAssignable(retExprType, currentFn.returnType())) {
+                    if (!isAssignableExpression(rs.value(), retExprType, currentFn.returnType())) {
                         error(DiagnosticCode.SEMANTIC_WRONG_RETURN_TYPE, "Return type mismatch: expected " + currentFn.returnType().name() + ", got " + retExprType.name(), rs.line(), rs.column());
                     }
                 }
@@ -320,6 +407,14 @@ public final class SemanticAnalyzer {
         if (VeloraTypes.isWidening(from, to)) return true;
         if (from.name().equals(to.name())) return true;
         return to.isNullable() && from.nonNull().name().equals(to.nonNull().name());
+    }
+
+    private boolean isAssignableExpression(ExpressionNode expression, VeloraType from, VeloraType to) {
+        if (isAssignable(from, to)) return true;
+        VeloraType target = to != null ? to.nonNull() : null;
+        if (expression instanceof ListLiteralExpressionNode list && list.elements().isEmpty()) return VeloraTypes.listElement(target) != null;
+        if (expression instanceof MapLiteralExpressionNode map && map.entries().isEmpty()) return VeloraTypes.mapKey(target) != null;
+        return false;
     }
 
     private VeloraType checkExpression(ExpressionNode expr, Scope scope, ResolvedScript.ResolvedFunction currentFn, Set<ScriptPermission> requiredPerms) {
@@ -361,17 +456,38 @@ public final class SemanticAnalyzer {
             return checkCall(call, scope, currentFn, requiredPerms);
         }
         if (expr instanceof MemberAccessExpressionNode mem) {
+            if (mem.target() instanceof IdentifierExpressionNode namespace) {
+                ConstantRegistry.Constant constant = constantRegistry.find(namespace.name(), mem.member());
+                if (constant != null) return constant.type();
+                VeloraType enumType = typeRegistry.find(namespace.name());
+                if (enumType instanceof io.velora.api.type.EnumType registeredEnum && registeredEnum.hasConstant(mem.member())) return registeredEnum;
+            }
             VeloraType recvType = checkExpression(mem.target(), scope, currentFn, requiredPerms);
-            if (recvType instanceof io.velora.api.type.StructType st && st.hasProperty(mem.member())) return st.property(mem.member()).type();
-            if (recvType == VeloraTypes.STRING && mem.member().equals("length")) return VeloraTypes.INT;
-            if ((VeloraTypes.listElement(recvType) != null || VeloraTypes.mapKey(recvType) != null || VeloraTypes.setElement(recvType) != null) && mem.member().equals("size")) return VeloraTypes.INT;
+            VeloraType baseType = recvType != null ? recvType.nonNull() : VeloraTypes.UNIT;
+            VeloraType memberType = null;
+            if (baseType instanceof io.velora.api.type.StructType st && st.hasProperty(mem.member())) memberType = st.property(mem.member()).type();
+            else if (baseType == VeloraTypes.STRING && mem.member().equals("length")) memberType = VeloraTypes.INT;
+            else if ((VeloraTypes.listElement(baseType) != null || VeloraTypes.mapKey(baseType) != null || VeloraTypes.setElement(baseType) != null) && mem.member().equals("size")) memberType = VeloraTypes.INT;
+            else if ((baseType == VeloraTypes.VEC2 || baseType == VeloraTypes.VEC3 || baseType == VeloraTypes.COLOR) && mem.member().equals("size")) memberType = VeloraTypes.INT;
+            else if (baseType == VeloraTypes.VEC2 && (mem.member().equals("x") || mem.member().equals("y"))) memberType = VeloraTypes.DOUBLE;
+            else if (baseType == VeloraTypes.VEC3 && (mem.member().equals("x") || mem.member().equals("y") || mem.member().equals("z"))) memberType = VeloraTypes.DOUBLE;
+            else if (baseType == VeloraTypes.COLOR && (mem.member().equals("r") || mem.member().equals("g") || mem.member().equals("b") || mem.member().equals("a"))) memberType = VeloraTypes.INT;
+            if (memberType != null) {
+                if (recvType != null && recvType.isNullable() && !mem.isSafeAccess()) {
+                    error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Nullable value requires safe member access (?.)", mem.line(), mem.column());
+                }
+                return mem.isSafeAccess() ? memberType.nullable() : memberType;
+            }
             if (mem.target() instanceof IdentifierExpressionNode ns && isApiNamespace(ns.name())) {
                 FunctionDescriptor fd = apiRegistry.find(ns.name(), mem.member());
                 if (fd != null && fd.parameters().isEmpty()) {
                     if (fd.permission() != null) requiredPerms.add(fd.permission());
                     return fd.returnType();
                 }
+                error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "Unknown API property: " + ns.name() + "." + mem.member(), mem.line(), mem.column());
+                return VeloraTypes.UNIT;
             }
+            if (recvType != VeloraTypes.UNIT) error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "Unknown member '" + mem.member() + "' on " + baseType.name(), mem.line(), mem.column());
             return VeloraTypes.UNIT;
         }
         if (expr instanceof QualifiedExpressionNode q) {
@@ -386,12 +502,28 @@ public final class SemanticAnalyzer {
             return VeloraTypes.UNIT;
         }
         if (expr instanceof ElvisExpressionNode el) {
-            VeloraType lt = checkExpression(el.left(), scope, currentFn, requiredPerms);
-            VeloraType rt = checkExpression(el.right(), scope, currentFn, requiredPerms);
-            return rt;
+            VeloraType left = checkExpression(el.left(), scope, currentFn, requiredPerms);
+            VeloraType right = checkExpression(el.right(), scope, currentFn, requiredPerms);
+            if (left == VeloraTypes.UNIT || right == VeloraTypes.UNIT) return right;
+            if (!left.isNullable()) {
+                error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Elvis operator requires a nullable left operand, got " + left.name(), el.line(), el.column());
+                return left;
+            }
+            if (isNullType(left)) return right;
+            VeloraType result = commonType(left.nonNull(), right);
+            if (result == null) {
+                error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Elvis operands are incompatible: " + left.name() + " and " + right.name(), el.line(), el.column());
+                return left.nonNull();
+            }
+            return result;
         }
         if (expr instanceof IsExpressionNode is) {
-            checkExpression(is.operand(), scope, currentFn, requiredPerms);
+            VeloraType operandType = checkExpression(is.operand(), scope, currentFn, requiredPerms);
+            VeloraType targetType = resolveType(is.type(), is);
+            if (operandType != VeloraTypes.UNIT && targetType != null
+                    && !operandType.nonNull().name().equals(targetType.nonNull().name())) {
+                error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Cannot test " + operandType.name() + " against unrelated type " + targetType.name(), is.line(), is.column());
+            }
             return VeloraTypes.BOOLEAN;
         }
         if (expr instanceof ListLiteralExpressionNode list) {
@@ -439,14 +571,30 @@ public final class SemanticAnalyzer {
         if (expr instanceof IndexExpressionNode idx) {
             VeloraType recvType = checkExpression(idx.receiver(), scope, currentFn, requiredPerms);
             VeloraType indexType = checkExpression(idx.index(), scope, currentFn, requiredPerms);
-            VeloraType elementType = VeloraTypes.listElement(recvType);
+            if (recvType != null && recvType.isNullable()) {
+                error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Cannot index a nullable value", idx.line(), idx.column());
+            }
+            VeloraType baseType = recvType != null ? recvType.nonNull() : VeloraTypes.UNIT;
+            VeloraType elementType = VeloraTypes.listElement(baseType);
             if (elementType != null) {
                 if (indexType != null && indexType != VeloraTypes.INT && indexType != VeloraTypes.UNIT) {
                     error(DiagnosticCode.SEMANTIC_INDEX_TYPE_MISMATCH, "List index must be Int, got " + indexType.name(), idx.line(), idx.column());
                 }
                 return elementType;
             }
-            VeloraType keyType = VeloraTypes.mapKey(recvType);
+            if (baseType == VeloraTypes.VEC2 || baseType == VeloraTypes.VEC3 || baseType == VeloraTypes.COLOR) {
+                if (indexType != null && indexType != VeloraTypes.INT && indexType != VeloraTypes.UNIT) {
+                    error(DiagnosticCode.SEMANTIC_INDEX_TYPE_MISMATCH, baseType.name() + " index must be Int, got " + indexType.name(), idx.line(), idx.column());
+                }
+                return baseType == VeloraTypes.COLOR ? VeloraTypes.INT : VeloraTypes.DOUBLE;
+            }
+            if (baseType == VeloraTypes.STRING) {
+                if (indexType != null && indexType != VeloraTypes.INT && indexType != VeloraTypes.UNIT) {
+                    error(DiagnosticCode.SEMANTIC_INDEX_TYPE_MISMATCH, "String index must be Int, got " + indexType.name(), idx.line(), idx.column());
+                }
+                return VeloraTypes.CHAR;
+            }
+            VeloraType keyType = VeloraTypes.mapKey(baseType);
             if (keyType != null) {
                 if (indexType != null && indexType != VeloraTypes.UNIT && !isAssignable(indexType, keyType)) {
                     error(DiagnosticCode.SEMANTIC_INDEX_TYPE_MISMATCH, "Map key type mismatch: expected " + keyType.name() + ", got " + indexType.name(), idx.line(), idx.column());
@@ -454,6 +602,7 @@ public final class SemanticAnalyzer {
                 VeloraType valueType = VeloraTypes.mapValue(recvType);
                 return valueType == null ? VeloraTypes.UNIT : valueType;
             }
+            error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Type " + baseType.name() + " is not indexable", idx.line(), idx.column());
             return VeloraTypes.UNIT;
         }
         if (expr instanceof AssignmentExpressionNode assign) {
@@ -473,7 +622,7 @@ public final class SemanticAnalyzer {
             }
             VeloraType valueType = assign.value() == null ? VeloraTypes.UNIT : checkExpression(assign.value(), scope, currentFn, requiredPerms);
             if (assign.operator().equals("=")) {
-                if (targetType != VeloraTypes.UNIT && valueType != VeloraTypes.UNIT && !isAssignable(valueType, targetType)) {
+                if (targetType != VeloraTypes.UNIT && valueType != VeloraTypes.UNIT && !isAssignableExpression(assign.value(), valueType, targetType)) {
                     error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Assignment type mismatch: expected " + targetType.name() + ", got " + valueType.name(), assign.line(), assign.column());
                 }
             } else {
@@ -520,7 +669,7 @@ public final class SemanticAnalyzer {
                         if (argExpr == null) continue;
                         VeloraType argType = checkExpression(argExpr, scope, currentFn, requiredPerms);
                         VeloraType paramType = fd.parameters().get(i).type();
-                        if (argType != null && argType != VeloraTypes.UNIT && !isAssignable(argType, paramType)) {
+                        if (argType != null && argType != VeloraTypes.UNIT && !isAssignableExpression(argExpr, argType, paramType)) {
                             error(DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE, "Argument '" + fd.parameters().get(i).name() + "' type mismatch: expected " + paramType.name() + ", got " + argType.name(), argExpr.line(), argExpr.column());
                         }
                     }
@@ -555,7 +704,7 @@ public final class SemanticAnalyzer {
                             if (argExpr == null) continue;
                             VeloraType argType = checkExpression(argExpr, scope, currentFn, requiredPerms);
                             VeloraType paramType = calledFn.parameters().get(i).type();
-                            if (argType != null && argType != VeloraTypes.UNIT && !isAssignable(argType, paramType)) {
+                            if (argType != null && argType != VeloraTypes.UNIT && !isAssignableExpression(argExpr, argType, paramType)) {
                                 error(DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE, "Argument '" + calledFn.parameters().get(i).name() + "' type mismatch: expected " + paramType.name() + ", got " + argType.name(), argExpr.line(), argExpr.column());
                             }
                         }
@@ -919,6 +1068,42 @@ public final class SemanticAnalyzer {
         private static final ConstantEvaluation NOT_CONSTANT = new ConstantEvaluation(false, null);
     }
 
+    private void validateScriptAnnotations(ScriptNode script) {
+        Set<String> seen = new HashSet<>();
+        Set<String> scriptKeys = Set.of("id", "name", "version", "author", "description", "languageVersion", "minEngineVersion");
+        for (AnnotationNode annotation : script.annotations()) {
+            if (!annotation.name().equals("Script") && !annotation.name().equals("Permissions")) {
+                error(DiagnosticCode.SEMANTIC_UNKNOWN_ANNOTATION, "Annotation @" + annotation.name() + " is not supported at script level", annotation.line(), annotation.column());
+                continue;
+            }
+            if (!seen.add(annotation.name())) {
+                error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "Duplicate @" + annotation.name() + " annotation", annotation.line(), annotation.column());
+            }
+            if (annotation.name().equals("Script")) {
+                if (!annotation.positionalArgs().isEmpty()) error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "@Script accepts named arguments only", annotation.line(), annotation.column());
+                for (var entry : annotation.namedArgs().entrySet()) {
+                    if (!scriptKeys.contains(entry.getKey())) {
+                        error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "Unknown @Script argument: " + entry.getKey(), annotation.line(), annotation.column());
+                    } else if (entry.getKey().equals("languageVersion")) {
+                        if (!(entry.getValue() instanceof Number number) || number.intValue() < 1) error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "@Script languageVersion must be a positive integer", annotation.line(), annotation.column());
+                    } else if (!(entry.getValue() instanceof String)) {
+                        error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "@Script " + entry.getKey() + " must be String", annotation.line(), annotation.column());
+                    }
+                }
+                Object id = annotation.namedArg("id");
+                if (id instanceof String value && value.isBlank()) error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "@Script id cannot be blank", annotation.line(), annotation.column());
+                Object name = annotation.namedArg("name");
+                if (name instanceof String value && value.isBlank()) error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "@Script name cannot be blank", annotation.line(), annotation.column());
+            } else {
+                for (String key : annotation.namedArgs().keySet()) {
+                    if (!key.equals("maximum")) error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "Unknown @Permissions argument: " + key, annotation.line(), annotation.column());
+                }
+                Object maximum = annotation.namedArg("maximum");
+                if (maximum != null && !(maximum instanceof List<?>)) error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "@Permissions maximum must be a list", annotation.line(), annotation.column());
+            }
+        }
+    }
+
     private ResolvedScript.ScriptMetadata extractMetadata(ScriptNode script) {
         String id = null, name = script.scriptName(), version = "1.0.0", author = "", description = "";
         Integer languageVersion = 1;
@@ -1015,70 +1200,156 @@ public final class SemanticAnalyzer {
     }
 
     private SettingDescriptor buildSettingDescriptor(SettingKind kind, SettingDeclarationNode decl, int index) {
-        List<Object> pos = decl.positionalArguments();
+        List<Object> positional = decl.positionalArguments();
         Map<String, Object> named = decl.namedArguments();
-        String id = decl.identifier();
-        String displayName = pos.size() > 0 ? String.valueOf(pos.get(0)) : id;
-        Object defaultValue = null;
-        VeloraType type = kind.resolveType(new SettingKind.SettingDeclaration(decl.annotationName(), decl.identifier(), pos, named));
-
-        String description = stringNamed(named, "description");
-        String category = stringNamed(named, "category");
-        int order = intNamed(named, "order", 0);
-        boolean advanced = boolNamed(named, "advanced", false);
-        boolean restartRequired = boolNamed(named, "restartRequired", false);
-        boolean secret = boolNamed(named, "secret", false);
-        String idAlias = stringNamed(named, "idAlias");
-
-        List<SettingDescriptor.Constraint> constraints = new ArrayList<>();
-        SettingEditorDescriptor editor = kind.editor().orElse(null);
-
-        // V2: @Number id ("name", min..max, step, default, @Number.Slider)
-        // Parser expands min..max into two positional args
-        switch (kind.name()) {
-            case "Slider", "Number" -> {
-                Object min = pos.size() > 1 ? pos.get(1) : null;
-                Object max = pos.size() > 2 ? pos.get(2) : null;
-                Object step = pos.size() > 3 ? pos.get(3) : null;
-                defaultValue = pos.size() > 4 ? pos.get(4) : null;
-                if (min != null && max != null) {
-                    constraints.add(SettingDescriptor.Constraint.range(min, max));
-                    double mn = ((Number) min).doubleValue();
-                    double mx = ((Number) max).doubleValue();
-                    if (mn > mx) {
-                        error(DiagnosticCode.SETTING_OUT_OF_RANGE, "Invalid range: min " + mn + " > max " + mx, decl.line(), decl.column());
-                    }
-                    if (defaultValue instanceof Number dn) {
-                        double dv = dn.doubleValue();
-                        if (dv < mn || dv > mx) {
-                            error(DiagnosticCode.SETTING_OUT_OF_RANGE, "Default value " + dv + " is outside range " + mn + ".." + mx, decl.line(), decl.column());
-                        }
-                    }
-                }
-                if (step != null) constraints.add(SettingDescriptor.Constraint.step(step));
-            }
-            case "String", "Text" -> {
-                Object minLen = pos.size() > 1 ? pos.get(1) : null;
-                Object maxLen = pos.size() > 2 ? pos.get(2) : null;
-                defaultValue = pos.size() > 3 ? pos.get(3) : null;
-                if (minLen instanceof Number mn && maxLen instanceof Number mx) {
-                    if (mn.intValue() > mx.intValue()) {
-                        error(DiagnosticCode.SETTING_OUT_OF_RANGE, "Invalid string range: min " + mn + " > max " + mx, decl.line(), decl.column());
-                    }
-                    constraints.add(SettingDescriptor.Constraint.maxLength(mx.intValue()));
-                } else if (maxLen instanceof Number n) {
-                    constraints.add(SettingDescriptor.Constraint.maxLength(n.intValue()));
-                }
-                String pattern = stringNamed(named, "pattern");
-                if (pattern != null) constraints.add(SettingDescriptor.Constraint.pattern(pattern));
-            }
-            case "Boolean" -> {
-                defaultValue = pos.size() > 1 ? pos.get(1) : null;
-            }
+        List<SettingKind.Parameter> schema = kind.parameterSchema().stream().filter(parameter -> parameter.role() != SettingKind.Parameter.ParameterRole.IDENTIFIER).toList();
+        if (positional.size() > schema.size()) {
+            error(DiagnosticCode.SEMANTIC_WRONG_ARITY, "@" + kind.name() + " expects at most " + schema.size() + " arguments after the setting id, got " + positional.size(), decl.line(), decl.column());
+        }
+        Set<String> allowedNamed = new HashSet<>(List.of("description", "category", "order", "advanced", "restartRequired", "secret", "idAlias", "pattern", "editor"));
+        for (SettingKind.Parameter parameter : schema) allowedNamed.add(parameter.name());
+        for (String name : named.keySet()) {
+            if (!allowedNamed.contains(name)) error(DiagnosticCode.SEMANTIC_NAMED_ARG_UNKNOWN, "Unknown setting argument '" + name + "' for @" + kind.name(), decl.line(), decl.column());
         }
 
-        return new SettingDescriptor(id, displayName, type, defaultValue, editor, description, category,
-                order, advanced, restartRequired, secret, idAlias, constraints, index);
+        Map<String, Object> values = new LinkedHashMap<>();
+        Set<String> provided = new HashSet<>();
+        for (int i = 0; i < schema.size(); i++) {
+            SettingKind.Parameter parameter = schema.get(i);
+            boolean positionalProvided = i < positional.size();
+            boolean namedProvided = named.containsKey(parameter.name());
+            if (positionalProvided && namedProvided) {
+                error(DiagnosticCode.SEMANTIC_NAMED_ARG_DUPLICATE, "Setting argument '" + parameter.name() + "' is provided both positionally and by name", decl.line(), decl.column());
+            }
+            if (positionalProvided || namedProvided) {
+                Object value = positionalProvided ? positional.get(i) : named.get(parameter.name());
+                values.put(parameter.name(), value);
+                provided.add(parameter.name());
+                validateSettingArgument(kind, parameter, value, decl);
+            } else if (parameter.required()) {
+                error(DiagnosticCode.SEMANTIC_WRONG_ARITY, "Missing required setting argument '" + parameter.name() + "' for @" + kind.name(), decl.line(), decl.column());
+            }
+        }
+        validateNamedSettingMetadata(named, decl);
+
+        VeloraType type;
+        try {
+            type = kind.resolveType(new SettingKind.SettingDeclaration(decl.annotationName(), decl.identifier(), positional, named));
+        } catch (RuntimeException error) {
+            this.error(DiagnosticCode.SETTING_INVALID_DEFAULT, "Cannot resolve setting type for '" + decl.identifier() + "': " + error.getMessage(), decl.line(), decl.column());
+            return null;
+        }
+        if (type == null) {
+            error(DiagnosticCode.SETTING_INVALID_DEFAULT, "Setting kind @" + kind.name() + " resolved to no type", decl.line(), decl.column());
+            return null;
+        }
+
+        String id = decl.identifier();
+        String displayName = id;
+        Object defaultValue = null;
+        boolean hasDefault = false;
+        Object min = null;
+        Object max = null;
+        List<SettingDescriptor.Constraint> constraints = new ArrayList<>();
+        SettingEditorDescriptor editor = kind.editor().orElse(null);
+        for (SettingKind.Parameter parameter : schema) {
+            if (!provided.contains(parameter.name())) continue;
+            Object value = values.get(parameter.name());
+            switch (parameter.role()) {
+                case DISPLAY_NAME -> { if (value != null) displayName = String.valueOf(value); }
+                case DEFAULT_VALUE -> { defaultValue = value; hasDefault = true; }
+                case MIN -> min = value;
+                case MAX -> max = value;
+                case STEP -> { if (value != null) constraints.add(SettingDescriptor.Constraint.step(value)); }
+                case VALUES -> { if (value instanceof Collection<?> collection) constraints.add(SettingDescriptor.Constraint.values(collection)); }
+                case NAMED -> { if (parameter.name().equals("editor") && value != null) editor = SettingEditorDescriptor.of(String.valueOf(value)); }
+                default -> {}
+            }
+        }
+        if (named.containsKey("editor") && named.get("editor") != null) editor = SettingEditorDescriptor.of(String.valueOf(named.get("editor")));
+        if (type.nonNull() == VeloraTypes.STRING) {
+            if (min instanceof Number number) constraints.add(SettingDescriptor.Constraint.minLength(number.intValue()));
+            if (max instanceof Number number) constraints.add(SettingDescriptor.Constraint.maxLength(number.intValue()));
+            if (min instanceof Number a && max instanceof Number b && a.intValue() > b.intValue()) error(DiagnosticCode.SETTING_OUT_OF_RANGE, "Invalid string length range: " + a + ".." + b, decl.line(), decl.column());
+        } else {
+            if (min != null && max != null) {
+                constraints.add(SettingDescriptor.Constraint.range(min, max));
+                if (min instanceof Number a && max instanceof Number b && a.doubleValue() > b.doubleValue()) error(DiagnosticCode.SETTING_OUT_OF_RANGE, "Invalid range: " + a + ".." + b, decl.line(), decl.column());
+            } else if (min != null) constraints.add(SettingDescriptor.Constraint.min(min));
+            else if (max != null) constraints.add(SettingDescriptor.Constraint.max(max));
+        }
+        String pattern = stringNamed(named, "pattern");
+        if (pattern != null) {
+            try { java.util.regex.Pattern.compile(pattern); }
+            catch (java.util.regex.PatternSyntaxException error) { this.error(DiagnosticCode.SETTING_INVALID_DEFAULT, "Invalid setting pattern: " + error.getDescription(), decl.line(), decl.column()); }
+            constraints.add(SettingDescriptor.Constraint.pattern(pattern));
+        }
+
+        SettingDescriptor descriptor = new SettingDescriptor(id, displayName, type, defaultValue, editor, stringNamed(named, "description"), stringNamed(named, "category"),
+                intNamed(named, "order", 0), boolNamed(named, "advanced", false), boolNamed(named, "restartRequired", false), boolNamed(named, "secret", false),
+                stringNamed(named, "idAlias"), constraints, index);
+        if (hasDefault) {
+            if (defaultValue == null && !type.isNullable()) {
+                error(DiagnosticCode.SETTING_INVALID_DEFAULT, "Default value for setting '" + id + "' cannot be null", decl.line(), decl.column());
+            } else if (defaultValue != null) {
+                VeloraType defaultType = annotationValueType(defaultValue);
+                if (defaultType != null && !isAssignable(defaultType, type)) {
+                    error(DiagnosticCode.SETTING_INVALID_DEFAULT, "Default value for setting '" + id + "' expects " + type.name() + ", got " + defaultType.name(), decl.line(), decl.column());
+                } else {
+                    SettingValidationResult validation = SettingValidator.validate(descriptor, SettingValue.of(type, defaultValue));
+                    if (!validation.isValid()) error(DiagnosticCode.SETTING_INVALID_DEFAULT, validation.errorMessage(), decl.line(), decl.column());
+                }
+            }
+        }
+        return descriptor;
+    }
+
+    private void validateSettingArgument(SettingKind kind, SettingKind.Parameter parameter, Object value, SettingDeclarationNode decl) {
+        VeloraType expected = parameter.type();
+        if (expected == null) return;
+        if (value == null) {
+            if (!expected.isNullable()) error(DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE, "Setting argument '" + parameter.name() + "' for @" + kind.name() + " cannot be null", decl.line(), decl.column());
+            return;
+        }
+        VeloraType actual = annotationValueType(value);
+        if (actual != null && !isAssignable(actual, expected)) {
+            error(DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE, "Setting argument '" + parameter.name() + "' for @" + kind.name() + " expects " + expected.name() + ", got " + actual.name(), decl.line(), decl.column());
+        }
+    }
+
+    private void validateNamedSettingMetadata(Map<String, Object> named, SettingDeclarationNode decl) {
+        checkNamedSettingType(named, "description", VeloraTypes.STRING, decl);
+        checkNamedSettingType(named, "category", VeloraTypes.STRING, decl);
+        checkNamedSettingType(named, "idAlias", VeloraTypes.STRING, decl);
+        checkNamedSettingType(named, "pattern", VeloraTypes.STRING, decl);
+        checkNamedSettingType(named, "editor", VeloraTypes.STRING, decl);
+        checkNamedSettingType(named, "order", VeloraTypes.INT, decl);
+        checkNamedSettingType(named, "advanced", VeloraTypes.BOOLEAN, decl);
+        checkNamedSettingType(named, "restartRequired", VeloraTypes.BOOLEAN, decl);
+        checkNamedSettingType(named, "secret", VeloraTypes.BOOLEAN, decl);
+    }
+
+    private void checkNamedSettingType(Map<String, Object> named, String name, VeloraType expected, SettingDeclarationNode decl) {
+        if (!named.containsKey(name)) return;
+        Object value = named.get(name);
+        VeloraType actual = annotationValueType(value);
+        if (value == null || actual == null || !isAssignable(actual, expected)) error(DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE, "Named setting argument '" + name + "' expects " + expected.name(), decl.line(), decl.column());
+    }
+
+    private VeloraType annotationValueType(Object value) {
+        VeloraType scalar = constantType(value);
+        if (scalar != null || value == null) return scalar;
+        if (value instanceof List<?> list) {
+            VeloraType element = null;
+            for (Object item : list) {
+                VeloraType itemType = annotationValueType(item);
+                if (itemType == null) continue;
+                element = element == null ? itemType : commonType(element, itemType);
+                if (element == null) return null;
+            }
+            return VeloraTypes.list(element != null ? element : VeloraTypes.UNIT);
+        }
+        return null;
     }
 
     private String stringArg(AnnotationNode ann, String key) {

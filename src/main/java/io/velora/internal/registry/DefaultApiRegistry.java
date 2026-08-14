@@ -23,32 +23,31 @@ public final class DefaultApiRegistry implements ApiRegistry {
     public void namespace(String name, Consumer<NamespaceBuilder> configurator) {
         checkFrozen();
         validateNamespace(name);
-        NamespaceBuilderImpl builder = new NamespaceBuilderImpl(name);
-        configurator.accept(builder);
+        Objects.requireNonNull(configurator, "configurator");
+        int snapshot = all.size();
+        try {
+            configurator.accept(new NamespaceBuilderImpl(name));
+        } catch (Throwable error) {
+            rollbackTo(snapshot);
+            throw error;
+        }
     }
 
     private void validateNamespace(String name) {
-        if (name == null || name.isEmpty()) {
-            throw new IllegalArgumentException("Namespace cannot be empty");
+        if (!isIdentifier(name)) throw new IllegalArgumentException("Namespace must be a script identifier: " + name);
+    }
+
+    private void validateFunctionName(String name) {
+        if (!isIdentifier(name)) throw new IllegalArgumentException("Function name must be a script identifier: " + name);
+    }
+
+    private boolean isIdentifier(String value) {
+        if (value == null || value.isEmpty() || !(Character.isLetter(value.charAt(0)) || value.charAt(0) == '_')) return false;
+        for (int i = 1; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (!Character.isLetterOrDigit(c) && c != '_') return false;
         }
-        if (name.trim().isEmpty()) {
-            throw new IllegalArgumentException("Namespace cannot be whitespace only");
-        }
-        if (Character.isDigit(name.charAt(0))) {
-            throw new IllegalArgumentException("Namespace cannot start with a digit");
-        }
-        if (name.contains(" ")) {
-            throw new IllegalArgumentException("Namespace cannot contain spaces");
-        }
-        if (name.contains("/")) {
-            throw new IllegalArgumentException("Namespace cannot contain slashes");
-        }
-        if (name.contains("..")) {
-            throw new IllegalArgumentException("Namespace cannot contain consecutive dots");
-        }
-        if (name.contains("@")) {
-            throw new IllegalArgumentException("Namespace cannot contain @");
-        }
+        return true;
     }
 
     @Override
@@ -66,43 +65,28 @@ public final class DefaultApiRegistry implements ApiRegistry {
     }
 
     private void validateDescriptor(FunctionDescriptor descriptor) {
-        if (descriptor.description() == null || descriptor.description().isBlank()) {
-            throw new IllegalArgumentException("Function descriptor requires non-blank description: " + descriptor.namespace() + "." + descriptor.name());
-        }
-        if (descriptor.categoryId() == null || descriptor.categoryId().isBlank()) {
-            throw new IllegalArgumentException("Function descriptor requires non-blank categoryId: " + descriptor.namespace() + "." + descriptor.name());
-        }
+        Objects.requireNonNull(descriptor, "descriptor");
+        validateFunctionName(descriptor.name());
     }
 
-    void registerOrReplace(FunctionDescriptor descriptor) {
-        checkFrozen();
-        validateNamespace(descriptor.namespace());
-        Map<String, FunctionDescriptor> ns = byNamespace.get(descriptor.namespace());
-        if (ns != null && ns.containsKey(descriptor.name())) {
-            FunctionDescriptor old = ns.get(descriptor.name());
-            if (builtInFunctions.contains(descriptor.namespace() + "." + descriptor.name())) {
-                ns.remove(descriptor.name());
-                all.remove(old);
-            } else {
-                throw new IllegalStateException("Function already registered: " + descriptor.namespace() + "." + descriptor.name());
-            }
-        }
-        byNamespace.computeIfAbsent(descriptor.namespace(), k -> new LinkedHashMap<>())
-                .put(descriptor.name(), descriptor);
-        all.add(descriptor);
+    private void registerFromBuilder(FunctionDescriptor descriptor) {
+        register(descriptor);
     }
-
-    public void markBuiltIn(String namespace, String name) {
-        builtInFunctions.add(namespace + "." + name);
-    }
-
-    private final Set<String> builtInFunctions = new HashSet<>();
 
     @Override
     public void registerAnnotated(Object binding) {
         checkFrozen();
-        new io.velora.binding.BindingScanner(new io.velora.binding.BindingDescriptorFactory(typeRegistry))
-                .scan(binding).forEach(this::register);
+        List<FunctionDescriptor> descriptors = new io.velora.binding.BindingScanner(new io.velora.binding.BindingDescriptorFactory(typeRegistry)).scan(binding);
+        for (FunctionDescriptor descriptor : descriptors) {
+            validateNamespace(descriptor.namespace());
+            validateDescriptor(descriptor);
+            Map<String, FunctionDescriptor> ns = byNamespace.get(descriptor.namespace());
+            if (ns != null && ns.containsKey(descriptor.name())) throw new IllegalStateException("Function already registered: " + descriptor.qualifiedName());
+        }
+        for (FunctionDescriptor descriptor : descriptors) {
+            byNamespace.computeIfAbsent(descriptor.namespace(), ignored -> new LinkedHashMap<>()).put(descriptor.name(), descriptor);
+            all.add(descriptor);
+        }
     }
 
     @Override
@@ -194,7 +178,7 @@ public final class DefaultApiRegistry implements ApiRegistry {
                     .invoker(getter)
                     .description(description)
                     .build();
-            registerOrReplace(fd);
+            registerFromBuilder(fd);
             lastRegistered = fd;
             return this;
         }
@@ -225,65 +209,75 @@ public final class DefaultApiRegistry implements ApiRegistry {
                     .permission(permission)
                     .invoker(invoker)
                     .build();
-            registerOrReplace(fd);
+            registerFromBuilder(fd);
             lastRegistered = fd;
             return this;
         }
 
         @Override
         public NamespaceBuilder description(String description) {
-            if (lastRegistered != null) {
-                Map<String, FunctionDescriptor> nsMap = byNamespace.get(ns);
-                if (nsMap != null) {
-                    nsMap.remove(lastRegistered.name());
-                }
-                all.remove(lastRegistered);
-
-                FunctionDescriptor newFd = FunctionDescriptor.builder()
-                        .namespace(lastRegistered.namespace())
-                        .name(lastRegistered.name())
-                        .parameters(lastRegistered.parameters())
-                        .returns(lastRegistered.returnType())
-                        .suspending(lastRegistered.suspending())
-                        .thread(lastRegistered.thread())
-                        .permission(lastRegistered.permission())
-                        .cost(lastRegistered.cost())
-                        .invoker(lastRegistered.invoker())
-                        .description(description)
-                        .categoryId(lastRegistered.categoryId())
-                        .build();
-                registerOrReplace(newFd);
-                lastRegistered = newFd;
-            }
+            if (lastRegistered != null) replaceLast(copyLast(description, lastRegistered.categoryId()));
             return this;
         }
 
         @Override
         public NamespaceBuilder categoryId(String categoryId) {
-            if (lastRegistered != null) {
-                Map<String, FunctionDescriptor> nsMap = byNamespace.get(ns);
-                if (nsMap != null) {
-                    nsMap.remove(lastRegistered.name());
-                }
-                all.remove(lastRegistered);
-
-                FunctionDescriptor newFd = FunctionDescriptor.builder()
-                        .namespace(lastRegistered.namespace())
-                        .name(lastRegistered.name())
-                        .parameters(lastRegistered.parameters())
-                        .returns(lastRegistered.returnType())
-                        .suspending(lastRegistered.suspending())
-                        .thread(lastRegistered.thread())
-                        .permission(lastRegistered.permission())
-                        .cost(lastRegistered.cost())
-                        .invoker(lastRegistered.invoker())
-                        .description(lastRegistered.description())
-                        .categoryId(categoryId)
-                        .build();
-                registerOrReplace(newFd);
-                lastRegistered = newFd;
-            }
+            if (lastRegistered != null) replaceLast(copyLast(lastRegistered.description(), categoryId));
             return this;
+        }
+
+
+        @Override
+        public NamespaceBuilder thread(ScriptThread thread) {
+            if (lastRegistered != null) replaceLast(copyLast(thread, lastRegistered.cost()));
+            return this;
+        }
+
+        @Override
+        public NamespaceBuilder cost(int cost) {
+            if (cost <= 0) throw new IllegalArgumentException("Cost must be positive");
+            if (lastRegistered != null) replaceLast(copyLast(lastRegistered.thread(), cost));
+            return this;
+        }
+
+        private FunctionDescriptor copyLast(ScriptThread thread, int cost) {
+            return FunctionDescriptor.builder()
+                    .namespace(lastRegistered.namespace())
+                    .name(lastRegistered.name())
+                    .parameters(lastRegistered.parameters())
+                    .returns(lastRegistered.returnType())
+                    .suspending(lastRegistered.suspending())
+                    .thread(thread)
+                    .permission(lastRegistered.permission())
+                    .cost(cost)
+                    .invoker(lastRegistered.invoker())
+                    .description(lastRegistered.description())
+                    .categoryId(lastRegistered.categoryId())
+                    .build();
+        }
+
+        private FunctionDescriptor copyLast(String description, String categoryId) {
+            return FunctionDescriptor.builder()
+                    .namespace(lastRegistered.namespace())
+                    .name(lastRegistered.name())
+                    .parameters(lastRegistered.parameters())
+                    .returns(lastRegistered.returnType())
+                    .suspending(lastRegistered.suspending())
+                    .thread(lastRegistered.thread())
+                    .permission(lastRegistered.permission())
+                    .cost(lastRegistered.cost())
+                    .invoker(lastRegistered.invoker())
+                    .description(description)
+                    .categoryId(categoryId)
+                    .build();
+        }
+
+        private void replaceLast(FunctionDescriptor descriptor) {
+            Map<String, FunctionDescriptor> nsMap = byNamespace.get(ns);
+            if (nsMap != null) nsMap.remove(lastRegistered.name());
+            all.remove(lastRegistered);
+            registerFromBuilder(descriptor);
+            lastRegistered = descriptor;
         }
 
         @Override
@@ -303,7 +297,7 @@ public final class DefaultApiRegistry implements ApiRegistry {
                     .permission(permission)
                     .invoker(invoker)
                     .build();
-            registerOrReplace(fd);
+            registerFromBuilder(fd);
             lastRegistered = fd;
             return this;
         }

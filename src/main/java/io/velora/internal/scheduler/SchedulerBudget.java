@@ -15,7 +15,7 @@ public final class SchedulerBudget {
         this.limits = limits;
     }
 
-    public void resetTick(long nowNanos) {
+    public void resetTick() {
         scriptInstructions.clear();
         engineInstructions = 0;
         wallTimeStartNanos = System.nanoTime();

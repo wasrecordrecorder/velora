@@ -1,8 +1,15 @@
 package io.velora.internal.compiler;
 
 import io.velora.api.compiler.*;
+import io.velora.api.event.EventDescriptor;
+import io.velora.api.event.EventRegistry;
 import io.velora.api.function.ApiRegistry;
+import io.velora.api.function.FunctionDescriptor;
 import io.velora.api.registry.*;
+import io.velora.api.setting.SettingKind;
+import io.velora.api.type.EnumType;
+import io.velora.api.type.StructType;
+import io.velora.api.type.VeloraType;
 import io.velora.internal.bytecode.*;
 import io.velora.internal.ir.*;
 import io.velora.internal.lexer.Lexer;
@@ -25,17 +32,25 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
     private final ApiRegistry apiRegistry;
     private final ConstantRegistry constantRegistry;
     private final PermissionRegistry permissionRegistry;
+    private final EventRegistry eventRegistry;
     private final BytecodeCache cache = new BytecodeCache();
     private boolean frozen;
 
     public DefaultScriptCompiler(TypeRegistry typeRegistry, SettingRegistry settingRegistry,
                                  ApiRegistry apiRegistry, ConstantRegistry constantRegistry,
                                  PermissionRegistry permissionRegistry) {
+        this(typeRegistry, settingRegistry, apiRegistry, constantRegistry, permissionRegistry, null);
+    }
+
+    public DefaultScriptCompiler(TypeRegistry typeRegistry, SettingRegistry settingRegistry,
+                                 ApiRegistry apiRegistry, ConstantRegistry constantRegistry,
+                                 PermissionRegistry permissionRegistry, EventRegistry eventRegistry) {
         this.typeRegistry = typeRegistry;
         this.settingRegistry = settingRegistry;
         this.apiRegistry = apiRegistry;
         this.constantRegistry = constantRegistry;
         this.permissionRegistry = permissionRegistry;
+        this.eventRegistry = eventRegistry;
     }
 
     @Override
@@ -63,10 +78,17 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             return Compilation.failure(diagnostics);
         }
 
+        Set<String> sourcePaths = new HashSet<>();
         for (SourceFile source : request.sources()) {
-            if (source.relativePath().contains("..")) {
+            String path = normalizedSourcePath(source.relativePath());
+            if (path == null) {
                 diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_PATH_TRAVERSAL,
-                        "Path traversal not allowed: " + source.relativePath(), SourceRange.of(source.relativePath(), 0, 0)));
+                        "Invalid source path: " + source.relativePath(), SourceRange.of(source.relativePath(), 0, 0)));
+                return Compilation.failure(diagnostics);
+            }
+            if (!sourcePaths.add(path)) {
+                diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_BAD_SOURCE,
+                        "Duplicate source path: " + path, SourceRange.of(path, 0, 0)));
                 return Compilation.failure(diagnostics);
             }
         }
@@ -84,20 +106,21 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             return Compilation.failure(diagnostics);
         }
 
-        LexerResult lexerResult = new Lexer(bundle.source, "main.vls").lex();
+        LexerResult lexerResult = new Lexer(bundle.source, bundle.filePath).lex();
         diagnostics.addAll(lexerResult.diagnostics());
         if (hasErrors(diagnostics)) return Compilation.failure(diagnostics);
 
-        ParseResult parseResult = Parser.parse(bundle.source, "main.vls");
+        ParseResult parseResult = Parser.parse(bundle.source, bundle.filePath);
         diagnostics.addAll(parseResult.diagnostics());
         if (hasErrors(diagnostics) || parseResult.scriptNode() == null) return Compilation.failure(diagnostics);
 
-        SemanticAnalyzer analyzer = new SemanticAnalyzer(typeRegistry, settingRegistry, apiRegistry, constantRegistry, permissionRegistry);
+        SemanticAnalyzer analyzer = new SemanticAnalyzer(typeRegistry, settingRegistry, apiRegistry, constantRegistry, permissionRegistry, eventRegistry);
         ResolvedScript resolved = analyzer.analyze(parseResult.scriptNode());
         diagnostics.addAll(analyzer.diagnostics());
+        validateScriptMetadata(request, parseResult, resolved, diagnostics);
         if (hasErrors(diagnostics)) return Compilation.failure(diagnostics);
 
-        IrModule irModule = new IrOptimizer().optimize(new IrBuilder(resolved, apiRegistry).build());
+        IrModule irModule = new IrOptimizer().optimize(new IrBuilder(resolved, apiRegistry, constantRegistry, typeRegistry, request.scriptId()).build());
         diagnostics.addAll(new IrVerifier().verify(irModule));
         if (hasErrors(diagnostics)) return Compilation.failure(diagnostics);
 
@@ -108,21 +131,77 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
         return new Compilation(module, diagnostics, bundle.sourceHash, registryHash);
     }
 
+
+    private void validateScriptMetadata(CompileRequest request, ParseResult parseResult, ResolvedScript resolved, List<Diagnostic> diagnostics) {
+        if (resolved.languageVersion() != 1) {
+            diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_UNSUPPORTED_VERSION,
+                    "Unsupported language version: " + resolved.languageVersion(), SourceRange.of(parseResult.scriptNode().filePath(), 0, 0)));
+        }
+        String declaredId = null;
+        for (var annotation : parseResult.scriptNode().annotations()) {
+            if (annotation.name().equals("Script") && annotation.namedArg("id") instanceof String id) declaredId = id;
+        }
+        if (declaredId != null && !declaredId.equals(request.scriptId())) {
+            diagnostics.add(Diagnostic.error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT,
+                    "@Script id '" + declaredId + "' must match project id '" + request.scriptId() + "'", SourceRange.of(parseResult.scriptNode().filePath(), 0, 0)));
+        }
+        String minimum = resolved.metadata().minEngineVersion();
+        if (minimum != null) {
+            int comparison = compareVersions(io.velora.api.Velora.version(), minimum);
+            if (comparison == Integer.MIN_VALUE) {
+                diagnostics.add(Diagnostic.error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT,
+                        "Invalid minEngineVersion: " + minimum, SourceRange.of(parseResult.scriptNode().filePath(), 0, 0)));
+            } else if (comparison < 0) {
+                diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_UNSUPPORTED_VERSION,
+                        "Script requires Velora " + minimum + " or newer; current engine is " + io.velora.api.Velora.version(), SourceRange.of(parseResult.scriptNode().filePath(), 0, 0)));
+            }
+        }
+    }
+
+    private int compareVersions(String current, String required) {
+        int[] left = numericVersion(current);
+        int[] right = numericVersion(required);
+        if (left == null || right == null) return Integer.MIN_VALUE;
+        for (int i = 0; i < 3; i++) {
+            int comparison = Integer.compare(left[i], right[i]);
+            if (comparison != 0) return comparison;
+        }
+        return 0;
+    }
+
+    private int[] numericVersion(String value) {
+        if (value == null || !value.matches("\\d+(\\.\\d+){0,2}")) return null;
+        String[] parts = value.split("\\.");
+        int[] result = new int[3];
+        try {
+            for (int i = 0; i < parts.length; i++) result[i] = Integer.parseInt(parts[i]);
+            return result;
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
     private SourceBundle sourceBundle(List<SourceFile> sources, List<Diagnostic> diagnostics) {
         StringBuilder hashInput = new StringBuilder();
         String mainSource = null;
+        String mainPath = null;
         List<String> helpers = new ArrayList<>();
-        for (SourceFile source : sources) {
-            if (!source.relativePath().endsWith(".vls")) continue;
-            hashInput.append(source.relativePath()).append('\0').append(source.contentHash()).append('\0');
-            boolean declaresScript = new Lexer(source.content(), source.relativePath()).lex().tokens().stream().anyMatch(token -> token.type() == TokenType.KW_SCRIPT);
+        List<SourceFile> ordered = sources.stream()
+                .filter(source -> source.relativePath().toLowerCase(Locale.ROOT).endsWith(".vls"))
+                .sorted(Comparator.comparing(source -> normalizedSourcePath(source.relativePath())))
+                .toList();
+        for (SourceFile source : ordered) {
+            String path = normalizedSourcePath(source.relativePath());
+            hashInput.append(path).append('\0').append(source.contentHash()).append('\0');
+            boolean declaresScript = new Lexer(source.content(), path).lex().tokens().stream().anyMatch(token -> token.type() == TokenType.KW_SCRIPT);
             if (declaresScript) {
                 if (mainSource != null) {
                     diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_MULTIPLE_SCRIPTS,
-                            "Multiple script declarations across files", SourceRange.of(source.relativePath(), 0, 0)));
+                            "Multiple script declarations across files", SourceRange.of(path, 0, 0)));
                     return null;
                 }
                 mainSource = source.content();
+                mainPath = path;
             } else {
                 helpers.add(source.content());
             }
@@ -145,7 +224,7 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             }
             mainSource = merged.toString();
         }
-        return new SourceBundle(mainSource, SourceHash.compute(hashInput.toString()));
+        return new SourceBundle(mainSource, mainPath, SourceHash.compute(hashInput.toString()));
     }
 
     @Override
@@ -158,10 +237,64 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
     }
 
     private String computeRegistryHash() {
-        return SourceHash.compute(typeRegistry.all() + "|" + apiRegistry.all() + "|" + settingRegistry.all() + "|" + constantRegistry.all() + "|" + permissionRegistry.all());
+        StringBuilder out = new StringBuilder();
+        typeRegistry.all().stream().sorted(Comparator.comparing(VeloraType::name)).forEach(type -> {
+            out.append("T|").append(type.name()).append('|').append(type.javaClass().getName()).append('|').append(type.isHashable()).append('|').append(type.isHandle()).append(';');
+            if (type instanceof StructType struct) {
+                struct.properties().forEach(property -> out.append(property.name()).append(':').append(property.type().name()).append(','));
+                out.append(struct.valueEquality()).append(';');
+            } else if (type instanceof EnumType enumType) {
+                enumType.constants().forEach(constant -> out.append(constant.name()).append('=').append(stableValue(constant.value())).append(','));
+            }
+        });
+        apiRegistry.all().stream().sorted(Comparator.comparing(FunctionDescriptor::qualifiedName)).forEach(function -> {
+            out.append("F|").append(function.qualifiedName()).append('|').append(function.returnType().name()).append('|').append(function.suspending()).append('|').append(function.thread()).append('|').append(function.cost()).append('|');
+            if (function.permission() != null) out.append(function.permission().id());
+            out.append('|');
+            function.parameters().forEach(parameter -> out.append(parameter.name()).append(':').append(parameter.type().name()).append(':').append(parameter.required()).append(':').append(parameter.hasDefault()).append(':').append(stableValue(parameter.defaultValue())).append(','));
+            out.append(';');
+        });
+        settingRegistry.all().stream().sorted(Comparator.comparing(SettingKind::name)).forEach(kind -> {
+            out.append("S|").append(kind.name()).append('|').append(kind.categoryId()).append('|').append(kind.resultType().map(VeloraType::name).orElse("dynamic")).append('|');
+            kind.parameterSchema().forEach(parameter -> out.append(parameter.name()).append(':').append(parameter.role()).append(':').append(parameter.type() != null ? parameter.type().name() : "-").append(':').append(parameter.required()).append(','));
+            out.append(kind.editor().map(editor -> editor.editorId()).orElse("")).append(';');
+        });
+        constantRegistry.all().stream().sorted(Comparator.comparing(ConstantRegistry.Constant::qualifiedName)).forEach(constant -> out.append("C|").append(constant.qualifiedName()).append('|').append(constant.type().name()).append('|').append(stableValue(constant.value())).append(';'));
+        permissionRegistry.all().stream().sorted(Comparator.comparing(io.velora.api.permission.ScriptPermission::id)).forEach(permission -> out.append("P|").append(permission.id()).append('|').append(permission.displayName()).append('|').append(permission.description()).append('|').append(permission.categoryId()).append('|').append(permission.extensionId()).append(';'));
+        if (eventRegistry != null) {
+            eventRegistry.all().stream().sorted(Comparator.comparing(EventDescriptor::id)).forEach(event -> out.append("E|").append(event.id()).append('|').append(event.scriptName()).append('|').append(event.payloadType().name()).append('|').append(event.defaultConcurrency()).append('|').append(event.queueLimit()).append('|').append(event.overflowPolicy()).append('|').append(event.cost()).append('|').append(event.permission() != null ? event.permission().id() : "").append(';'));
+        }
+        return SourceHash.compute(out.toString());
     }
 
-    private record SourceBundle(String source, String sourceHash) {}
+    private String stableValue(Object value) {
+        if (value == null) return "null";
+        if (value instanceof CharSequence || value instanceof Number || value instanceof Boolean || value instanceof Character || value instanceof UUID || value instanceof java.time.Duration || value instanceof Enum<?>) return value.getClass().getName() + ':' + value;
+        if (value instanceof List<?> list) return list.stream().map(this::stableValue).toList().toString();
+        if (value instanceof Set<?> set) return set.stream().map(this::stableValue).sorted().toList().toString();
+        if (value instanceof Map<?, ?> map) return map.entrySet().stream().map(entry -> stableValue(entry.getKey()) + "=" + stableValue(entry.getValue())).sorted().toList().toString();
+        if (value.getClass().isArray()) {
+            int length = java.lang.reflect.Array.getLength(value);
+            List<String> values = new ArrayList<>(length);
+            for (int i = 0; i < length; i++) values.add(stableValue(java.lang.reflect.Array.get(value, i)));
+            return values.toString();
+        }
+        return value.getClass().getName() + ':' + String.valueOf(value);
+    }
+
+    private String normalizedSourcePath(String path) {
+        if (path == null || path.isBlank() || path.indexOf('\0') >= 0 || path.startsWith("/") || path.startsWith("\\") || path.matches("^[A-Za-z]:.*")) return null;
+        String normalized = path.replace('\\', '/');
+        Deque<String> parts = new ArrayDeque<>();
+        for (String part : normalized.split("/")) {
+            if (part.isEmpty() || part.equals(".")) continue;
+            if (part.equals("..")) return null;
+            parts.addLast(part);
+        }
+        return parts.isEmpty() ? null : String.join("/", parts);
+    }
+
+    private record SourceBundle(String source, String filePath, String sourceHash) {}
     private record Compilation(CompiledModule module, List<Diagnostic> diagnostics, String sourceHash, String registryHash) {
         private static Compilation failure(List<Diagnostic> diagnostics) { return new Compilation(null, List.copyOf(diagnostics), null, null); }
     }

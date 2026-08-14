@@ -19,6 +19,8 @@ public sealed interface IrInstruction {
     record Compare(String operator) implements IrInstruction {}
     record Not() implements IrInstruction {}
     record IsNull() implements IrInstruction {}
+    record IsType(String typeName) implements IrInstruction {}
+    record LoadQualified(String namespace, String member) implements IrInstruction {}
     record Jump(int targetBlock) implements IrInstruction {}
     record JumpIfFalse(int targetBlock) implements IrInstruction {}
     record JumpIfTrue(int targetBlock) implements IrInstruction {}

@@ -34,10 +34,10 @@ public final class DefaultDebugService implements DebugService {
     public ProfilerSnapshot profiler(String scriptId) {
         ProfilerSnapshot base = profiler.snapshot(scriptId);
         var resources = scheduler.resources(scriptId);
-        return new ProfilerSnapshot(scriptId, base.tickTimeNanos(), scheduler.instructionsForScript(scriptId),
-                scheduler.apiCost(scriptId), resources.memoryUsed(), resources.fibers(), resources.tasks(),
-                resources.eventQueueSize(), base.droppedEvents(), base.apiCalls(), base.failures(),
-                base.cancellations(), base.coalescedEvents(), base.maxQueueDepth());
+        return new ProfilerSnapshot(scriptId, scheduler.tickTimeNanos(scriptId), scheduler.instructionsForScript(scriptId),
+                scheduler.totalApiCost(scriptId), resources.memoryUsed(), resources.fibers(), resources.tasks(),
+                resources.eventQueueSize() + base.eventQueueDepth(), base.droppedEvents(), scheduler.apiCalls(scriptId), scheduler.failures(scriptId),
+                scheduler.cancellations(scriptId), base.coalescedEvents(), base.maxQueueDepth());
     }
 
     @Override
@@ -54,7 +54,7 @@ public final class DefaultDebugService implements DebugService {
                 scriptId,
                 task.state().name(),
                 task.getClass().getSimpleName(),
-                System.nanoTime()
+                scheduler.nanoTime()
             ));
         }
         return result;

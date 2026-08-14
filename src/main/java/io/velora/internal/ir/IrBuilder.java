@@ -3,6 +3,8 @@ package io.velora.internal.ir;
 import io.velora.api.function.ApiRegistry;
 import io.velora.api.function.FunctionDescriptor;
 import io.velora.api.permission.PermissionSet;
+import io.velora.api.registry.ConstantRegistry;
+import io.velora.api.registry.TypeRegistry;
 import io.velora.api.setting.SettingDescriptor;
 import io.velora.api.type.VeloraType;
 import io.velora.api.type.VeloraTypes;
@@ -15,16 +17,30 @@ public final class IrBuilder {
 
     private final ResolvedScript resolved;
     private final ApiRegistry apiRegistry;
+    private final ConstantRegistry constantRegistry;
+    private final TypeRegistry typeRegistry;
+    private final String scriptId;
     private Map<String, Integer> localIndices;
     private final Map<String, Integer> settingIndexMap = new HashMap<>();
 
     public IrBuilder(ResolvedScript resolved) {
-        this(resolved, null);
+        this(resolved, null, null, null, null);
     }
 
     public IrBuilder(ResolvedScript resolved, ApiRegistry apiRegistry) {
-        this.resolved = resolved;
+        this(resolved, apiRegistry, null, null, null);
+    }
+
+    public IrBuilder(ResolvedScript resolved, ApiRegistry apiRegistry, ConstantRegistry constantRegistry, TypeRegistry typeRegistry) {
+        this(resolved, apiRegistry, constantRegistry, typeRegistry, null);
+    }
+
+    public IrBuilder(ResolvedScript resolved, ApiRegistry apiRegistry, ConstantRegistry constantRegistry, TypeRegistry typeRegistry, String scriptId) {
+        this.resolved = Objects.requireNonNull(resolved);
         this.apiRegistry = apiRegistry;
+        this.constantRegistry = constantRegistry;
+        this.typeRegistry = typeRegistry;
+        this.scriptId = scriptId != null ? scriptId : resolved.metadata().id();
         buildSettingIndexMap();
     }
 
@@ -64,21 +80,24 @@ public final class IrBuilder {
             }
         }
 
+        Map<Integer, IrFunction> functionsByIndex = new TreeMap<>();
         for (ResolvedScript.ResolvedFunction rf : resolved.functions().values()) {
-            functions.add(buildFunction(rf));
+            functionsByIndex.put(rf.functionIndex(), buildFunction(rf));
         }
         for (var entry : resolved.lifecycle().entrySet()) {
-            functions.add(buildFunction(entry.getValue()));
+            ResolvedScript.ResolvedFunction function = entry.getValue();
+            functionsByIndex.put(function.functionIndex(), buildFunction(function));
             lifecycleHooks.add(entry.getKey().name());
         }
         for (ResolvedScript.ResolvedEventHandler eh : resolved.eventHandlers()) {
-            functions.add(buildEventHandler(eh));
+            functionsByIndex.put(eh.functionIndex(), buildEventHandler(eh));
             eventHandlers.add(new IrModule.EventHandlerInfo(
                     eh.eventReference(), eh.functionName(), eh.functionIndex(), eh.suspending()));
         }
+        functions.addAll(functionsByIndex.values());
 
         return new IrModule(
-                resolved.metadata().id(),
+                scriptId,
                 resolved.metadata().name(),
                 resolved.metadata().version(),
                 resolved.languageVersion(),
@@ -125,12 +144,14 @@ public final class IrBuilder {
     }
 
     private IrFunction buildEventHandler(ResolvedScript.ResolvedEventHandler eh) {
-        List<IrFunction.IrParam> params = List.of(new IrFunction.IrParam(eh.parameterName(), eh.parameterType()));
+        List<IrFunction.IrParam> params = eh.parameterName() == null
+                ? List.of()
+                : List.of(new IrFunction.IrParam(eh.parameterName(), eh.parameterType()));
         localIndices = new HashMap<>();
-        localIndices.put(eh.parameterName(), 0);
+        if (eh.parameterName() != null) localIndices.put(eh.parameterName(), 0);
         List<IrInstruction> instrs = new ArrayList<>();
-        int localCount = 1;
-        int maxStack = 1;
+        int localCount = params.size();
+        int maxStack = params.isEmpty() ? 0 : 1;
 
         if (eh.body() != null) {
             int[] depth = buildBlock(eh.body(), instrs, localCount);
@@ -147,14 +168,20 @@ public final class IrBuilder {
     }
 
     private int[] buildBlock(BlockNode block, List<IrInstruction> instrs, int nextLocal) {
+        Map<String, Integer> previous = new HashMap<>(localIndices);
         int localCount = nextLocal;
         int maxStack = 0;
-        for (StatementNode stmt : block.statements()) {
-            int[] r = buildStatement(stmt, instrs, localCount);
-            localCount = r[0];
-            maxStack = Math.max(maxStack, r[1]);
+        try {
+            for (StatementNode stmt : block.statements()) {
+                int[] r = buildStatement(stmt, instrs, localCount);
+                localCount = r[0];
+                maxStack = Math.max(maxStack, r[1]);
+            }
+            return new int[]{localCount, maxStack};
+        } finally {
+            localIndices.clear();
+            localIndices.putAll(previous);
         }
-        return new int[]{localCount, maxStack};
     }
 
     private int[] buildStatement(StatementNode stmt, List<IrInstruction> instrs, int nextLocal) {
@@ -217,7 +244,7 @@ public final class IrBuilder {
             instrs.add(new IrInstruction.Const(new IrValue.IntVal(0)));
             instrs.add(new IrInstruction.StoreLocal(indexLocal, VeloraTypes.UNIT));
             int varLocal = localCount++;
-            localIndices.put(fs.variable(), varLocal);
+            Integer previousLoopLocal = localIndices.put(fs.variable(), varLocal);
             int loopStart = instrs.size();
             instrs.add(new IrInstruction.LoadLocal(indexLocal, VeloraTypes.UNIT));
             instrs.add(new IrInstruction.LoadLocal(iterLocal, VeloraTypes.UNIT));
@@ -239,7 +266,43 @@ public final class IrBuilder {
             instrs.add(new IrInstruction.Jump(loopStart));
             int endIdx = instrs.size();
             instrs.set(jumpToEndIdx, new IrInstruction.JumpIfFalse(endIdx));
+            if (previousLoopLocal == null) localIndices.remove(fs.variable());
+            else localIndices.put(fs.variable(), previousLoopLocal);
             maxStack = Math.max(maxStack, 3);
+        } else if (stmt instanceof WhenStatementNode when) {
+            int[] subjectDepth = buildExpression(when.subject(), instrs);
+            maxStack = Math.max(maxStack, subjectDepth[1]);
+            int subjectLocal = localCount++;
+            instrs.add(new IrInstruction.StoreLocal(subjectLocal, VeloraTypes.UNIT));
+            List<Integer> endJumps = new ArrayList<>();
+            for (WhenStatementNode.Case c : when.cases()) {
+                List<Integer> caseJumps = new ArrayList<>();
+                for (ExpressionNode condition : c.conditions()) {
+                    instrs.add(new IrInstruction.LoadLocal(subjectLocal, VeloraTypes.UNIT));
+                    int[] conditionDepth = buildExpression(condition, instrs);
+                    maxStack = Math.max(maxStack, Math.max(2, conditionDepth[1] + 1));
+                    instrs.add(new IrInstruction.Compare("=="));
+                    caseJumps.add(instrs.size());
+                    instrs.add(new IrInstruction.JumpIfTrue(0));
+                }
+                int skipCase = instrs.size();
+                instrs.add(new IrInstruction.Jump(0));
+                int caseStart = instrs.size();
+                for (int jump : caseJumps) instrs.set(jump, new IrInstruction.JumpIfTrue(caseStart));
+                int[] bodyDepth = buildBlock(c.body(), instrs, localCount);
+                localCount = bodyDepth[0];
+                maxStack = Math.max(maxStack, bodyDepth[1]);
+                endJumps.add(instrs.size());
+                instrs.add(new IrInstruction.Jump(0));
+                instrs.set(skipCase, new IrInstruction.Jump(instrs.size()));
+            }
+            if (when.elseBody() != null) {
+                int[] bodyDepth = buildBlock(when.elseBody(), instrs, localCount);
+                localCount = bodyDepth[0];
+                maxStack = Math.max(maxStack, bodyDepth[1]);
+            }
+            int end = instrs.size();
+            for (int jump : endJumps) instrs.set(jump, new IrInstruction.Jump(end));
         } else if (stmt instanceof ReturnStatementNode rs) {
             if (rs.value() != null) {
                 int[] r = buildExpression(rs.value(), instrs);
@@ -338,7 +401,9 @@ public final class IrBuilder {
                 maxStack = Math.max(maxStack, argCount);
             }
         } else if (expr instanceof MemberAccessExpressionNode mem) {
-            if (mem.target() instanceof IdentifierExpressionNode id && isApiNamespace(id.name())) {
+            if (mem.target() instanceof IdentifierExpressionNode id && isQualifiedHostValue(id.name(), mem.member())) {
+                instrs.add(new IrInstruction.LoadQualified(id.name(), mem.member()));
+            } else if (mem.target() instanceof IdentifierExpressionNode id && isApiNamespace(id.name())) {
                 FunctionDescriptor descriptor = resolveApiDescriptor(id.name(), mem.member());
                 int apiIdx = descriptor.index() >= 0 ? descriptor.index() : resolveApiIndex(id.name(), mem.member());
                 if (descriptor.suspending()) {
@@ -346,25 +411,40 @@ public final class IrBuilder {
                 } else {
                     instrs.add(new IrInstruction.CallApi(apiIdx, 0, descriptor.returnType()));
                 }
+            } else if (mem.isSafeAccess()) {
+                int[] targetDepth = buildExpression(mem.target(), instrs);
+                maxStack = Math.max(maxStack, Math.max(2, targetDepth[1] + 1));
+                instrs.add(new IrInstruction.Dup());
+                instrs.add(new IrInstruction.IsNull());
+                int memberJump = instrs.size();
+                instrs.add(new IrInstruction.JumpIfFalse(0));
+                int endJump = instrs.size();
+                instrs.add(new IrInstruction.Jump(0));
+                int memberStart = instrs.size();
+                instrs.set(memberJump, new IrInstruction.JumpIfFalse(memberStart));
+                instrs.add(new IrInstruction.GetMember(mem.member(), VeloraTypes.UNIT));
+                instrs.set(endJump, new IrInstruction.Jump(instrs.size()));
             } else {
-                buildExpression(mem.target(), instrs);
+                int[] targetDepth = buildExpression(mem.target(), instrs);
+                maxStack = Math.max(maxStack, targetDepth[1]);
                 instrs.add(new IrInstruction.GetMember(mem.member(), VeloraTypes.UNIT));
             }
         } else if (expr instanceof QualifiedExpressionNode q) {
-            instrs.add(new IrInstruction.Const(new IrValue.StringVal(q.qualifier() + "." + q.member())));
+            instrs.add(new IrInstruction.LoadQualified(q.qualifier(), q.member()));
         } else if (expr instanceof ElvisExpressionNode el) {
-            buildExpression(el.left(), instrs);
+            int[] left = buildExpression(el.left(), instrs);
             instrs.add(new IrInstruction.Dup());
             instrs.add(new IrInstruction.IsNull());
             int jumpIdx = instrs.size();
             instrs.add(new IrInstruction.JumpIfFalse(0));
             instrs.add(new IrInstruction.Pop());
-            buildExpression(el.right(), instrs);
+            int[] right = buildExpression(el.right(), instrs);
             int endIdx = instrs.size();
             instrs.set(jumpIdx, new IrInstruction.JumpIfFalse(endIdx));
+            maxStack = Math.max(maxStack, Math.max(left[1] + 1, right[1]));
         } else if (expr instanceof IsExpressionNode is) {
             buildExpression(is.operand(), instrs);
-            instrs.add(new IrInstruction.Compare("is"));
+            instrs.add(new IrInstruction.IsType(typeName(is.type())));
         } else if (expr instanceof ListLiteralExpressionNode list) {
             int elemMax = 0;
             for (ExpressionNode e : list.elements()) {
@@ -520,11 +600,13 @@ public final class IrBuilder {
             }
             maxStack = Math.max(maxStack, 1);
         } else if (expr instanceof SpawnExpressionNode spawn) {
-            int funcIdx = resolveFunctionIndex(spawn.callee());
-            for (ExpressionNode a : spawn.arguments()) {
-                buildExpression(a, instrs);
-            }
-            instrs.add(new IrInstruction.Spawn(funcIdx, spawn.arguments().size()));
+            if (!(spawn.callee() instanceof IdentifierExpressionNode id)) throw new IllegalStateException("spawn requires a script function");
+            ResolvedScript.ResolvedFunction function = resolved.functions().get(id.name());
+            if (function == null) throw new IllegalStateException("Unresolved function: " + id.name());
+            List<ExpressionNode> bound = bindArguments(spawn.arguments(), function.parameters().stream().map(ResolvedScript.ResolvedParam::name).toList());
+            int stack = emitBoundArguments(bound, function.parameters().stream().map(ResolvedScript.ResolvedParam::defaultValue).toList(), instrs);
+            maxStack = Math.max(maxStack, Math.max(stack, function.parameters().size()));
+            instrs.add(new IrInstruction.Spawn(function.functionIndex(), function.parameters().size()));
         }
 
         return new int[]{0, maxStack};
@@ -622,6 +704,13 @@ public final class IrBuilder {
         return reg != null && reg.namespaces().contains(name);
     }
 
+    private boolean isQualifiedHostValue(String namespace, String member) {
+        if (constantRegistry != null && constantRegistry.find(namespace, member) != null) return true;
+        if (typeRegistry == null) return false;
+        VeloraType type = typeRegistry.find(namespace);
+        return type instanceof io.velora.api.type.EnumType enumType && enumType.hasConstant(member);
+    }
+
     private IrValue literalToValue(LiteralExpressionNode lit) {
         return switch (lit.kind()) {
             case INTEGER -> new IrValue.IntVal((Integer) lit.value());
@@ -637,6 +726,24 @@ public final class IrBuilder {
     private boolean isComparison(String op) {
         return op.equals("==") || op.equals("!=") || op.equals("<") || op.equals("<=")
                 || op.equals(">") || op.equals(">=") || op.equals("is");
+    }
+
+    private String typeName(TypeNode type) {
+        String base = switch (type.typeName()) {
+            case "int" -> "Int";
+            case "long" -> "Long";
+            case "float" -> "Float";
+            case "double" -> "Double";
+            case "boolean", "bool" -> "Boolean";
+            case "byte" -> "Byte";
+            case "char" -> "Char";
+            case "void" -> "Unit";
+            default -> type.typeName();
+        };
+        if (!type.typeArguments().isEmpty()) {
+            base += "<" + String.join(",", type.typeArguments().stream().map(this::typeName).toList()) + ">";
+        }
+        return type.nullable() ? base + "?" : base;
     }
 
     private VeloraType resolveType(TypeNode typeNode) {
@@ -683,12 +790,15 @@ public final class IrBuilder {
 
     private IrValue objectToValue(Object value) {
         if (value == null) return new IrValue.NullVal();
+        if (value instanceof Short s) return new IrValue.IntVal(s.intValue());
         if (value instanceof Integer i) return new IrValue.IntVal(i);
         if (value instanceof Long l) return new IrValue.LongVal(l);
         if (value instanceof Float f) return new IrValue.FloatVal(f);
         if (value instanceof Double d) return new IrValue.DoubleVal(d);
         if (value instanceof Boolean b) return new IrValue.BooleanVal(b);
         if (value instanceof String s) return new IrValue.StringVal(s);
-        return new IrValue.NullVal();
+        if (value instanceof java.time.Duration duration) return new IrValue.DurationVal(duration.toNanos());
+        if (value instanceof java.util.UUID uuid) return new IrValue.StringVal(uuid.toString());
+        throw new IllegalArgumentException("Unsupported bytecode constant: " + value.getClass().getTypeName());
     }
 }

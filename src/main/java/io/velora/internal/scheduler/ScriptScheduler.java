@@ -2,8 +2,15 @@ package io.velora.internal.scheduler;
 
 import io.velora.api.VeloraLimits;
 import io.velora.api.function.ApiRegistry;
+import io.velora.api.function.FunctionContext;
+import io.velora.api.function.FunctionDescriptor;
 import io.velora.api.setting.SettingDescriptor;
+import io.velora.api.registry.ConstantRegistry;
+import io.velora.api.registry.TypeRegistry;
+import io.velora.api.type.EnumType;
+import io.velora.api.task.TaskFactory;
 import io.velora.api.task.TaskState;
+import io.velora.api.task.VeloraTaskSource;
 import io.velora.api.task.VeloraTask;
 import io.velora.api.type.VeloraType;
 import io.velora.internal.bytecode.CompiledFunction;
@@ -11,9 +18,13 @@ import io.velora.internal.bytecode.CompiledModule;
 import io.velora.internal.debug.RuntimeErrorStore;
 import io.velora.internal.security.ResourceCounter;
 import io.velora.internal.security.ResourceLimitViolation;
+import io.velora.host.WorkerExecutor;
 import io.velora.internal.vm.*;
 
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 
 public final class ScriptScheduler implements VmHost {
 
@@ -31,6 +42,7 @@ public final class ScriptScheduler implements VmHost {
 
     private final Map<Long, ScriptFiber> fibersById = new HashMap<>();
     private final Map<Long, Long> awaitingFibers = new HashMap<>();
+    private final Map<Long, BufferedCompletion> bufferedCompletions = new HashMap<>();
 
     private final Map<String, Map<Integer, ScriptValue>> scriptInstanceFields = new HashMap<>();
     private final Map<String, Map<Integer, ScriptValue>> scriptStaticFields = new HashMap<>();
@@ -39,20 +51,45 @@ public final class ScriptScheduler implements VmHost {
     private final Map<String, Map<Long, VeloraTask<?>>> tasksByScript = new HashMap<>();
     private final Map<String, ResourceCounter> resourcesByScript = new HashMap<>();
     private final Map<String, Integer> apiCostByScript = new HashMap<>();
+    private final Map<String, Long> totalApiCostByScript = new HashMap<>();
+    private final Map<String, Long> apiCallsByScript = new HashMap<>();
+    private final Map<String, Long> failuresByScript = new HashMap<>();
+    private final Map<String, Long> cancellationsByScript = new HashMap<>();
+    private final Map<String, Long> tickTimeByScript = new HashMap<>();
     private final Map<String, Long> instructionsByScript = new HashMap<>();
     private final Map<String, io.velora.internal.setting.SettingStore> settingStores = new HashMap<>();
     private final RuntimeErrorStore errorStore;
+    private final WorkerExecutor workerExecutor;
+    private final ConstantRegistry constantRegistry;
+    private final TypeRegistry typeRegistry;
+    private final LongSupplier nanoTime;
     private long currentFiberId;
     private long currentTickNanos;
 
     public ScriptScheduler(VeloraLimits limits, ApiRegistry apiRegistry) {
-        this(limits, apiRegistry, new RuntimeErrorStore(100));
+        this(limits, apiRegistry, new RuntimeErrorStore(100), null, null, null);
     }
 
     public ScriptScheduler(VeloraLimits limits, ApiRegistry apiRegistry, RuntimeErrorStore errorStore) {
+        this(limits, apiRegistry, errorStore, null, null, null);
+    }
+
+    public ScriptScheduler(VeloraLimits limits, ApiRegistry apiRegistry, RuntimeErrorStore errorStore, WorkerExecutor workerExecutor) {
+        this(limits, apiRegistry, errorStore, workerExecutor, null, null);
+    }
+
+    public ScriptScheduler(VeloraLimits limits, ApiRegistry apiRegistry, RuntimeErrorStore errorStore, WorkerExecutor workerExecutor, ConstantRegistry constantRegistry, TypeRegistry typeRegistry) {
+        this(limits, apiRegistry, errorStore, workerExecutor, constantRegistry, typeRegistry, System::nanoTime);
+    }
+
+    public ScriptScheduler(VeloraLimits limits, ApiRegistry apiRegistry, RuntimeErrorStore errorStore, WorkerExecutor workerExecutor, ConstantRegistry constantRegistry, TypeRegistry typeRegistry, LongSupplier nanoTime) {
         this.limits = limits;
         this.apiRegistry = apiRegistry;
         this.errorStore = errorStore;
+        this.workerExecutor = workerExecutor;
+        this.constantRegistry = constantRegistry;
+        this.typeRegistry = typeRegistry;
+        this.nanoTime = Objects.requireNonNull(nanoTime);
         this.budget = new SchedulerBudget(limits);
     }
 
@@ -61,7 +98,13 @@ public final class ScriptScheduler implements VmHost {
     }
 
     public ScriptFiber spawnEventFiber(String scriptId, int functionIndex, ScriptValue[] args) {
-        return spawnInternal(scriptId, functionIndex, args, -1, false, true);
+        return spawnEventFiber(scriptId, functionIndex, args, 0);
+    }
+
+    public ScriptFiber spawnEventFiber(String scriptId, int functionIndex, ScriptValue[] args, int eventCost) {
+        ScriptFiber fiber = spawnInternal(scriptId, functionIndex, args, -1, false, true);
+        if (fiber != null) fiber.pendingApiCost(eventCost);
+        return fiber;
     }
 
     private ScriptFiber spawnInternal(String scriptId, int functionIndex, ScriptValue[] args, long parentId, boolean pending, boolean eventFiber) {
@@ -72,7 +115,7 @@ public final class ScriptScheduler implements VmHost {
         try { memory = estimateValues(args) + 256L; }
         catch (ResourceLimitViolation ignored) { return null; }
         if (limits.memoryPerScript() > 0 && counter.memoryUsed() + memory > limits.memoryPerScript()) return null;
-        ScriptFiber fiber = new ScriptFiber(nextFiberId++, scriptId, functionIndex, args);
+        ScriptFiber fiber = new ScriptFiber(nextFiberId++, scriptId, functionIndex, args, nanoTime.getAsLong());
         fiber.parentId(parentId);
         fiber.eventFiber(eventFiber);
         fiber.reservedMemory(memory);
@@ -92,7 +135,7 @@ public final class ScriptScheduler implements VmHost {
         ScriptFiber fiber = spawnFiber(scriptId, functionIndex, args);
         if (fiber == null) return;
         while (fiber.state() != FiberState.COMPLETED && fiber.state() != FiberState.FAILED && fiber.state() != FiberState.CANCELLED) {
-            tick(System.nanoTime(), modules, settings);
+            tick(nanoTime.getAsLong(), modules, settings);
         }
     }
 
@@ -116,13 +159,16 @@ public final class ScriptScheduler implements VmHost {
     }
 
     @Override
+    public long nanoTime() {
+        return nanoTime.getAsLong();
+    }
+
+    @Override
     public void sleepFiber(long fiberId, long wakeupNanos) {
-        // Adjust wakeup time to use scheduler's clock, not System.nanoTime()
-        long duration = wakeupNanos - System.nanoTime();
-        long adjustedWakeup = currentTickNanos + Math.max(duration, 0);
+        long duration = Math.max(0, wakeupNanos - nanoTime.getAsLong());
         ScriptFiber fiber = fibersById.get(fiberId);
         if (fiber != null) {
-            fiber.sleepUntilNanos(adjustedWakeup);
+            fiber.sleepUntilNanos(currentTickNanos + duration);
             fiber.state(FiberState.SLEEPING);
         }
     }
@@ -130,11 +176,15 @@ public final class ScriptScheduler implements VmHost {
     @Override
     public void awaitFiber(long fiberId, long taskId) {
         ScriptFiber fiber = fibersById.get(fiberId);
-        if (fiber != null) {
-            fiber.awaitTaskId(taskId);
-            fiber.state(FiberState.WAITING_TASK);
-        }
+        if (fiber == null) return;
+        fiber.awaitTaskId(taskId);
+        fiber.state(FiberState.WAITING_TASK);
         awaitingFibers.put(taskId, fiberId);
+        BufferedCompletion buffered = bufferedCompletions.remove(taskId);
+        if (buffered != null && buffered.parentFiberId() == fiberId) {
+            CompletionQueue.CompletionRecord record = buffered.record();
+            completionQueue.offer(record.taskId(), record.success(), record.result(), record.error());
+        }
     }
 
     @Override
@@ -166,12 +216,76 @@ public final class ScriptScheduler implements VmHost {
     }
 
     @Override
+    public long watchWorkerCall(long fiberId, FunctionDescriptor descriptor, FunctionContext context) {
+        if (workerExecutor == null) return 0;
+        VeloraTaskSource<Object> source = TaskFactory.create();
+        long taskId = watchTask(fiberId, source.task(), descriptor.returnType());
+        if (taskId == 0) return 0;
+        AtomicBoolean cancelled = new AtomicBoolean();
+        AtomicReference<VeloraTask<?>> nested = new AtomicReference<>();
+        source.onCancel(() -> {
+            cancelled.set(true);
+            VeloraTask<?> task = nested.get();
+            if (task != null) task.cancel();
+        });
+        try {
+            workerExecutor.execute(() -> {
+                if (cancelled.get()) return;
+                try {
+                    Object result = descriptor.invoker().invoke(context);
+                    if (result instanceof VeloraTask<?> task) {
+                        nested.set(task);
+                        if (cancelled.get()) {
+                            task.cancel();
+                            return;
+                        }
+                        task.onComplete(completed -> {
+                            switch (completed.state()) {
+                                case SUCCEEDED -> source.succeed(completed.result());
+                                case FAILED -> source.fail(completed.failure());
+                                case CANCELLED -> source.cancel();
+                                default -> {}
+                            }
+                        });
+                    } else {
+                        source.succeed(result);
+                    }
+                } catch (Throwable error) {
+                    source.fail(error);
+                }
+            });
+        } catch (Throwable error) {
+            source.fail(error);
+        }
+        return taskId;
+    }
+
+    @Override
+    public ScriptValue loadQualified(String namespace, String member) {
+        if (constantRegistry != null) {
+            ConstantRegistry.Constant constant = constantRegistry.find(namespace, member);
+            if (constant != null) return VirtualMachine.javaToValue(constant.type(), constant.value());
+        }
+        if (typeRegistry != null && typeRegistry.find(namespace) instanceof EnumType enumType) {
+            EnumType.Constant constant = enumType.constant(member);
+            if (constant != null) return VirtualMachine.javaToValue(enumType, constant.value());
+        }
+        return null;
+    }
+
+    @Override
     public boolean consumeApiCost(long fiberId, int cost) {
         ScriptFiber fiber = fibersById.get(fiberId);
-        if (fiber == null) return false;
-        int used = apiCostByScript.getOrDefault(fiber.scriptId(), 0);
+        if (fiber == null || !consumeApiCost(fiber.scriptId(), cost)) return false;
+        apiCallsByScript.merge(fiber.scriptId(), 1L, Long::sum);
+        return true;
+    }
+
+    private boolean consumeApiCost(String scriptId, int cost) {
+        int used = apiCostByScript.getOrDefault(scriptId, 0);
         if (limits.apiCostPerScriptTick() > 0 && used + cost > limits.apiCostPerScriptTick()) return false;
-        apiCostByScript.put(fiber.scriptId(), used + cost);
+        apiCostByScript.put(scriptId, used + cost);
+        totalApiCostByScript.merge(scriptId, (long) cost, Long::sum);
         return true;
     }
 
@@ -184,7 +298,7 @@ public final class ScriptScheduler implements VmHost {
         }
     }
 
-    public void cleanupScript(String scriptId) {
+    public void stopScript(String scriptId) {
         cancelScriptTasks(scriptId);
         Set<Long> ids = new HashSet<>(fibersByScript.getOrDefault(scriptId, Set.of()));
         for (Long id : ids) {
@@ -194,13 +308,18 @@ public final class ScriptScheduler implements VmHost {
                 retireFiber(fiber);
             }
         }
+        bufferedCompletions.entrySet().removeIf(entry -> entry.getValue().scriptId().equals(scriptId));
+    }
+
+    public void cleanupScript(String scriptId) {
+        stopScript(scriptId);
         scriptInstanceFields.remove(scriptId);
         scriptStaticFields.remove(scriptId);
         initializedScripts.remove(scriptId);
         settingStores.remove(scriptId);
         resourcesByScript.remove(scriptId);
         apiCostByScript.remove(scriptId);
-        instructionsByScript.remove(scriptId);
+        tickTimeByScript.remove(scriptId);
     }
 
     public List<VeloraTask<?>> tasksForScript(String scriptId) {
@@ -277,9 +396,11 @@ public final class ScriptScheduler implements VmHost {
     }
 
     public void tick(long nowNanos, Map<String, CompiledModule> modules, Map<String, List<SettingDescriptor>> scriptSettings) {
+        long wallStartNanos = System.nanoTime();
         this.currentTickNanos = nowNanos;
-        budget.resetTick(nowNanos);
+        budget.resetTick();
         apiCostByScript.clear();
+        tickTimeByScript.clear();
         List<ScriptFiber> terminalFibers = new ArrayList<>();
         for (ScriptFiber fiber : fibersById.values()) fiber.instructionsThisTick(0);
 
@@ -327,12 +448,27 @@ public final class ScriptScheduler implements VmHost {
                 drainCompletions();
                 continue;
             }
+            if (fiber.pendingApiCost() > 0) {
+                if (!consumeApiCost(fiber.scriptId(), fiber.pendingApiCost())) {
+                    fiber.error(new RuntimeException("API cost limit exceeded"));
+                    fiber.state(FiberState.FAILED);
+                    completionQueue.offer(fiber.id(), false, PrimitiveValue.nullValue(), fiber.error());
+                    terminalFibers.add(fiber);
+                    drainCompletions();
+                    continue;
+                }
+                fiber.pendingApiCost(0);
+            }
 
             CompiledModule module = modules.get(fiber.scriptId());
             if (module == null) {
                 fiber.error(new IllegalStateException("Compiled module not found"));
                 fiber.state(FiberState.FAILED);
                 completionQueue.offer(fiber.id(), false, PrimitiveValue.nullValue(), fiber.error());
+                errorStore.record(fiber.scriptId(), new io.velora.api.debug.RuntimeError(
+                        fiber.scriptId(), fiber.id(), fiber.functionName(),
+                        io.velora.api.compiler.DiagnosticCode.RUNTIME_API_ERROR.name(),
+                        fiber.error().getMessage(), "", nanoTime.getAsLong()));
                 terminalFibers.add(fiber);
                 drainCompletions();
                 continue;
@@ -401,6 +537,7 @@ public final class ScriptScheduler implements VmHost {
             }
 
             VmExecutionResult result = vm.execute(module, fiber.id(), this, stack, callStack, startInstructions);
+            tickTimeByScript.merge(fiber.scriptId(), result.wallTimeNanos(), Long::sum);
 
             if (result.isSuspended()) {
                 fiber.savedStack(stack);
@@ -437,7 +574,7 @@ public final class ScriptScheduler implements VmHost {
                             errorStore.record(fiber.scriptId(), new io.velora.api.debug.RuntimeError(
                                     fiber.scriptId(), fiber.id(), funcName,
                                     io.velora.api.compiler.DiagnosticCode.RUNTIME_RESOURCE_LIMIT.name(),
-                                    "Runaway script: instruction limit exceeded 5 consecutive times", "", System.nanoTime()
+                                    "Runaway script: instruction limit exceeded 5 consecutive times", "", nanoTime.getAsLong()
                             ));
                         } else {
                             fiber.state(FiberState.READY);
@@ -456,7 +593,7 @@ public final class ScriptScheduler implements VmHost {
                 // Record error to debug store
                 String funcName = module.function(fiber.functionIndex()) != null ? module.function(fiber.functionIndex()).name() : "unknown";
                 errorStore.record(fiber.scriptId(), new io.velora.api.debug.RuntimeError(
-                        fiber.scriptId(), fiber.id(), funcName, result.error().code().name(), result.error().message(), "", System.nanoTime()
+                        fiber.scriptId(), fiber.id(), funcName, result.error().code().name(), result.error().message(), "", nanoTime.getAsLong()
                 ));
             }
 
@@ -473,7 +610,7 @@ public final class ScriptScheduler implements VmHost {
 
         drainCompletions();
         for (ScriptFiber fiber : new LinkedHashSet<>(terminalFibers)) retireFiber(fiber);
-        long wallTime = System.nanoTime() - nowNanos;
+        long wallTime = System.nanoTime() - wallStartNanos;
         metrics.recordTick(fibersExecuted, totalInstructions, wallTime);
     }
 
@@ -481,7 +618,13 @@ public final class ScriptScheduler implements VmHost {
         while (!completionQueue.isEmpty()) {
             CompletionQueue.CompletionRecord record = completionQueue.poll();
             Long awaitingFiberId = awaitingFibers.remove(record.taskId());
-            if (awaitingFiberId == null) continue;
+            if (awaitingFiberId == null) {
+                ScriptFiber completed = fibersById.get(record.taskId());
+                if (completed != null && completed.parentId() >= 0) {
+                    bufferedCompletions.put(record.taskId(), new BufferedCompletion(completed.scriptId(), completed.parentId(), record));
+                }
+                continue;
+            }
             ScriptFiber awaiting = fibersById.get(awaitingFiberId);
             if (awaiting == null) continue;
             if (record.taskId() < -1) releaseExternalTask(awaiting.scriptId(), record.taskId());
@@ -526,6 +669,8 @@ public final class ScriptScheduler implements VmHost {
 
     private void retireFiber(ScriptFiber fiber) {
         if (fibersById.remove(fiber.id()) == null) return;
+        if (fiber.state() == FiberState.FAILED) failuresByScript.merge(fiber.scriptId(), 1L, Long::sum);
+        else if (fiber.state() == FiberState.CANCELLED) cancellationsByScript.merge(fiber.scriptId(), 1L, Long::sum);
         Set<Long> ids = fibersByScript.get(fiber.scriptId());
         if (ids != null) {
             ids.remove(fiber.id());
@@ -545,6 +690,7 @@ public final class ScriptScheduler implements VmHost {
             }
         }
         cancellationTree.remove(fiber.id(), fiber.parentId());
+        bufferedCompletions.entrySet().removeIf(entry -> entry.getValue().parentFiberId() == fiber.id());
         ResourceCounter counter = resourcesByScript.get(fiber.scriptId());
         if (counter != null) {
             counter.releaseFiber();
@@ -623,6 +769,11 @@ public final class ScriptScheduler implements VmHost {
     }
 
     public int apiCost(String scriptId) { return apiCostByScript.getOrDefault(scriptId, 0); }
+    public long totalApiCost(String scriptId) { return totalApiCostByScript.getOrDefault(scriptId, 0L); }
+    public long apiCalls(String scriptId) { return apiCallsByScript.getOrDefault(scriptId, 0L); }
+    public long failures(String scriptId) { return failuresByScript.getOrDefault(scriptId, 0L); }
+    public long cancellations(String scriptId) { return cancellationsByScript.getOrDefault(scriptId, 0L); }
+    public long tickTimeNanos(String scriptId) { return tickTimeByScript.getOrDefault(scriptId, 0L); }
     public long instructionsForScript(String scriptId) { return instructionsByScript.getOrDefault(scriptId, 0L); }
 
     public SchedulerMetrics metrics() { return metrics; }
@@ -632,4 +783,6 @@ public final class ScriptScheduler implements VmHost {
     public CancellationTree cancellationTree() { return cancellationTree; }
     public ScriptFiber fiber(long id) { return fibersById.get(id); }
     public RuntimeErrorStore errorStore() { return errorStore; }
+    private record BufferedCompletion(String scriptId, long parentFiberId, CompletionQueue.CompletionRecord record) {}
+
 }

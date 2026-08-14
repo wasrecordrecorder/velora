@@ -54,6 +54,10 @@ public interface NamespaceBuilder {
      */
     NamespaceBuilder categoryId(String categoryId);
 
+    NamespaceBuilder thread(ScriptThread thread);
+
+    NamespaceBuilder cost(int cost);
+
     /**
      * Register a suspending function with parameters.
      */

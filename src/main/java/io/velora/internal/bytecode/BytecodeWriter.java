@@ -128,6 +128,8 @@ public final class BytecodeWriter {
             case IrInstruction.Compare c -> code.add(compareOpcode(c.operator()));
             case IrInstruction.Not n -> code.add(Opcode.NOT.ordinal());
             case IrInstruction.IsNull i -> code.add(Opcode.IS_NULL.ordinal());
+            case IrInstruction.IsType i -> { code.add(Opcode.IS_TYPE.ordinal()); code.add(pool.addString(i.typeName())); }
+            case IrInstruction.LoadQualified q -> { code.add(Opcode.LOAD_QUALIFIED.ordinal()); code.add(pool.addString(q.namespace())); code.add(pool.addString(q.member())); }
             case IrInstruction.Jump j -> { code.add(Opcode.JUMP.ordinal()); code.add(j.targetBlock()); }
             case IrInstruction.JumpIfFalse j -> { code.add(Opcode.JUMP_IF_FALSE.ordinal()); code.add(j.targetBlock()); }
             case IrInstruction.JumpIfTrue j -> { code.add(Opcode.JUMP_IF_TRUE.ordinal()); code.add(j.targetBlock()); }

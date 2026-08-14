@@ -20,5 +20,7 @@ public interface ScriptHandle {
 
     io.velora.api.setting.SettingSchema settings();
 
+    java.util.Map<String, io.velora.api.setting.SettingValue> settingValues();
+
     io.velora.api.debug.DebugSnapshot debug();
 }

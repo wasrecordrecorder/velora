@@ -80,15 +80,11 @@ public final class Parser {
 
     private String parsePackageDecl() {
         context.skipTrivia();
-        if (!context.check(TokenType.KW_PACKAGE)) {
-            return null;
-        }
-        context.advance();
+        if (!context.check(TokenType.KW_PACKAGE)) return null;
+        Token start = context.advance();
         StringBuilder sb = new StringBuilder();
-        while (context.check(TokenType.IDENTIFIER) || context.check(TokenType.DOT)) {
-            Token token = context.advance();
-            sb.append(token.text());
-        }
+        while (context.check(TokenType.IDENTIFIER) || context.check(TokenType.DOT)) sb.append(context.advance().text());
+        context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Package declarations are not supported in Velora V2", start);
         return sb.toString();
     }
 
@@ -96,13 +92,11 @@ public final class Parser {
         List<String> imports = new ArrayList<>();
         context.skipTrivia();
         while (context.check(TokenType.KW_IMPORT)) {
-            context.advance();
+            Token start = context.advance();
             StringBuilder sb = new StringBuilder();
-            while (context.check(TokenType.IDENTIFIER) || context.check(TokenType.DOT) || context.check(TokenType.STAR)) {
-                Token token = context.advance();
-                sb.append(token.text());
-            }
+            while (context.check(TokenType.IDENTIFIER) || context.check(TokenType.DOT) || context.check(TokenType.STAR)) sb.append(context.advance().text());
             imports.add(sb.toString());
+            context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Import declarations are not supported in Velora V2", start);
             context.skipTrivia();
         }
         return imports;
@@ -153,13 +147,14 @@ public final class Parser {
                 Token nameToken = context.advance();
                 context.advance(); // EQ
                 context.skipTrivia();
+                boolean explicitNull = isExplicitNull();
                 Object value = parseAnnotationValue();
-                namedArgs.put(nameToken.text(), value);
+                if (namedArgs.containsKey(nameToken.text())) context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Duplicate named argument: " + nameToken.text(), nameToken);
+                else if (value != null || explicitNull) namedArgs.put(nameToken.text(), value);
             } else {
+                boolean explicitNull = isExplicitNull();
                 Object value = parseAnnotationValue();
-                if (value != null) {
-                    positionalArgs.add(value);
-                }
+                if (value != null || explicitNull) positionalArgs.add(value);
             }
             context.skipTrivia();
         }
@@ -168,32 +163,36 @@ public final class Parser {
     private Object parseAnnotationValue() {
         context.skipTrivia();
         Token token = context.peek();
-
-        // Handle range: NUMBER .. NUMBER
-        if (token.is(TokenType.INTEGER) || token.is(TokenType.DOUBLE_LITERAL) || token.is(TokenType.FLOAT_LITERAL) || token.is(TokenType.LONG_LITERAL)) {
-            Object left = parseNumberValue(token);
-            context.advance();
+        if (isNumberStart(token)) {
+            Number left = parseSignedNumberValue();
+            if (left == null) return null;
             context.skipTrivia();
             if (context.check(TokenType.RANGE)) {
                 context.advance();
                 context.skipTrivia();
-                Token rightToken = context.peek();
-                Object right = parseNumberValue(rightToken);
-                context.advance();
-                return new RangeValue((Number) left, (Number) right);
+                Number right = parseSignedNumberValue();
+                if (right == null) {
+                    context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Expected number after '..'", context.peek());
+                    return null;
+                }
+                return new RangeValue(left, right);
             }
             return left;
         }
-
-        if (token.is(TokenType.STRING) || token.is(TokenType.STRING_INTERP)) {
+        if (token.is(TokenType.STRING)) {
             context.advance();
-            return token.text().substring(1, token.text().length() - 1);
+            return unescapeString(token.text().substring(1, token.text().length() - 1));
         }
-        if (token.is(TokenType.KW_TRUE) || (token.is(TokenType.BOOLEAN) && token.text().equals("true"))) {
+        if (token.is(TokenType.STRING_INTERP)) {
+            context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "String interpolation is not allowed in annotation arguments", token);
+            context.advance();
+            return unescapeString(token.text().substring(1, token.text().length() - 1));
+        }
+        if (token.is(TokenType.KW_TRUE) || token.is(TokenType.BOOLEAN) && token.text().equals("true")) {
             context.advance();
             return true;
         }
-        if (token.is(TokenType.KW_FALSE) || (token.is(TokenType.BOOLEAN) && token.text().equals("false"))) {
+        if (token.is(TokenType.KW_FALSE) || token.is(TokenType.BOOLEAN) && token.text().equals("false")) {
             context.advance();
             return false;
         }
@@ -203,17 +202,16 @@ public final class Parser {
         }
         if (token.is(TokenType.IDENTIFIER)) {
             context.advance();
-            StringBuilder sb = new StringBuilder(token.text());
+            StringBuilder value = new StringBuilder(token.text());
             while (context.check(TokenType.DOT)) {
                 context.advance();
                 Token member = context.expect(TokenType.IDENTIFIER, "Expected identifier after '.'");
-                sb.append(".").append(member.text());
+                value.append('.').append(member.text());
             }
-            return sb.toString();
+            return value.toString();
         }
         if (token.is(TokenType.ANNOTATION)) {
             context.advance();
-            // @Number.Slider -> "Number.Slider"
             return token.text().substring(1);
         }
         if (token.is(TokenType.LBRACKET)) {
@@ -221,7 +219,9 @@ public final class Parser {
             List<Object> list = new ArrayList<>();
             context.skipTrivia();
             while (!context.check(TokenType.RBRACKET) && context.tokens().hasMore()) {
-                list.add(parseAnnotationValue());
+                boolean explicitNull = isExplicitNull();
+                Object value = parseAnnotationValue();
+                if (value != null || explicitNull) list.add(value);
                 context.skipTrivia();
                 if (!context.match(TokenType.COMMA)) break;
                 context.skipTrivia();
@@ -229,16 +229,62 @@ public final class Parser {
             context.expect(TokenType.RBRACKET, "Expected ']' after list");
             return list;
         }
+        context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Invalid annotation value: " + token.text(), token);
         context.advance();
         return null;
     }
 
-    private Object parseNumberValue(Token token) {
+    private boolean isExplicitNull() {
+        Token token = context.peek();
+        return token.is(TokenType.KW_NULL) || token.is(TokenType.NULL);
+    }
+
+    private boolean isNumberStart(Token token) {
+        return token.is(TokenType.INTEGER) || token.is(TokenType.DOUBLE_LITERAL) || token.is(TokenType.FLOAT_LITERAL) || token.is(TokenType.LONG_LITERAL) || token.is(TokenType.MINUS);
+    }
+
+    private Number parseSignedNumberValue() {
+        boolean negative = context.match(TokenType.MINUS);
+        Token token = context.peek();
+        Number value = parseNumberValue(token);
+        if (value == null) return null;
+        context.advance();
+        if (!negative) return value;
+        if (value instanceof Double d) return -d;
+        if (value instanceof Float f) return -f;
+        if (value instanceof Long l) return -l;
+        return -value.intValue();
+    }
+
+    private Number parseNumberValue(Token token) {
         if (token.is(TokenType.INTEGER)) return Integer.parseInt(token.text());
         if (token.is(TokenType.LONG_LITERAL)) return Long.parseLong(token.text().replaceAll("[lL]$", ""));
         if (token.is(TokenType.DOUBLE_LITERAL)) return Double.parseDouble(token.text().replaceAll("[dD]$", ""));
         if (token.is(TokenType.FLOAT_LITERAL)) return Float.parseFloat(token.text().replaceAll("[fF]$", ""));
-        return 0;
+        return null;
+    }
+
+    private String unescapeString(String value) {
+        StringBuilder result = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c != '\\' || i + 1 >= value.length()) {
+                result.append(c);
+                continue;
+            }
+            char escaped = value.charAt(++i);
+            result.append(switch (escaped) {
+                case 'n' -> '\n';
+                case 't' -> '\t';
+                case 'r' -> '\r';
+                case '\\' -> '\\';
+                case '"' -> '"';
+                case '\'' -> '\'';
+                case '$' -> '$';
+                default -> escaped;
+            });
+        }
+        return result.toString();
     }
 
     /** Represents a range value like 8..128 in setting declarations. */
@@ -346,11 +392,13 @@ public final class Parser {
         boolean isPrivate = false;
         boolean isPublic = false;
         if (context.check(TokenType.KW_PRIVATE)) {
-            context.advance();
+            Token modifier = context.advance();
             isPrivate = true;
+            context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Visibility modifiers are not supported in Velora V2", modifier);
         } else if (context.check(TokenType.KW_PUBLIC)) {
-            context.advance();
+            Token modifier = context.advance();
             isPublic = true;
+            context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Visibility modifiers are not supported in Velora V2", modifier);
         }
         context.skipTrivia();
 
@@ -428,6 +476,9 @@ public final class Parser {
 
     private StatementNode parseMethodDeclarationRest(List<AnnotationNode> annotations, boolean isPrivate,
                                                       boolean isAsync, TypeNode returnType, String name, Token nameToken) {
+        for (AnnotationNode annotation : annotations) {
+            context.error(DiagnosticCode.SEMANTIC_UNKNOWN_ANNOTATION, "Annotation @" + annotation.name() + " is not supported on functions", nameToken);
+        }
         context.expect(TokenType.LPAREN, "Expected '(' after method name");
         List<ParameterNode> parameters = new ArrayList<>();
         context.skipTrivia();
@@ -456,11 +507,18 @@ public final class Parser {
         boolean persistent = false;
         String persistentId = null;
         for (AnnotationNode ann : annotations) {
-            if (ann.name().equals("Persistent")) {
-                persistent = true;
-                if (!ann.positionalArgs().isEmpty()) {
-                    persistentId = String.valueOf(ann.positionalArg(0));
-                }
+            if (!ann.name().equals("Persistent")) {
+                context.error(DiagnosticCode.SEMANTIC_UNKNOWN_ANNOTATION, "Annotation @" + ann.name() + " is not supported on fields", nameToken);
+                continue;
+            }
+            persistent = true;
+            if (ann.positionalArgs().size() > 1 || !ann.namedArgs().isEmpty()) {
+                context.error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "@Persistent accepts at most one positional String id", nameToken);
+            }
+            if (!ann.positionalArgs().isEmpty()) {
+                Object id = ann.positionalArg(0);
+                if (id instanceof String stringId) persistentId = stringId;
+                else context.error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "@Persistent id must be String", nameToken);
             }
         }
 
@@ -470,6 +528,9 @@ public final class Parser {
 
     private StatementNode parseEntryDeclaration(List<AnnotationNode> annotations, boolean isAsync) {
         Token entryToken = context.expect(TokenType.KW_ENTRY);
+        for (AnnotationNode annotation : annotations) {
+            context.error(DiagnosticCode.SEMANTIC_UNKNOWN_ANNOTATION, "Annotation @" + annotation.name() + " is not supported on lifecycle entries", entryToken);
+        }
         Token nameToken = context.expect(TokenType.IDENTIFIER, "Expected entry name");
         String entryName = nameToken.text();
 
@@ -489,6 +550,7 @@ public final class Parser {
             }
         }
         context.expect(TokenType.RPAREN, "Expected ')' after entry parameters");
+        if (!parameters.isEmpty()) context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Lifecycle entries do not accept parameters", nameToken);
         BlockNode body = parseBlock();
 
         // Map entry name to lifecycle hook
@@ -511,26 +573,38 @@ public final class Parser {
         String handlerName = nameToken.text();
 
         context.expect(TokenType.LPAREN, "Expected '(' after event name");
-        // Parse single typed parameter: Type name
         context.skipTrivia();
-        TypeNode paramType = parseTypeNode();
-        context.skipTrivia();
-        Token paramNameToken = context.expect(TokenType.IDENTIFIER, "Expected event parameter name");
-        String paramName = paramNameToken.text();
+        TypeNode paramType = null;
+        String paramName = null;
+        if (!context.check(TokenType.RPAREN)) {
+            paramType = parseTypeNode();
+            context.skipTrivia();
+            Token paramNameToken = context.expect(TokenType.IDENTIFIER, "Expected event parameter name");
+            paramName = paramNameToken.text();
+        }
         context.expect(TokenType.RPAREN, "Expected ')' after event parameter");
         BlockNode body = parseBlock();
 
-        // Determine event reference from annotations
         String eventRef = handlerName;
+        boolean eventAnnotation = false;
         for (AnnotationNode ann : annotations) {
             String annName = ann.name();
-            if (annName.startsWith("Event.")) {
-                eventRef = annName;
-                break;
+            if (!annName.equals("Event") && !annName.startsWith("Event.")) {
+                context.error(DiagnosticCode.SEMANTIC_UNKNOWN_ANNOTATION, "Annotation @" + annName + " is not supported on event handlers", eventToken);
+                continue;
             }
-            if (annName.equals("Event") && !ann.positionalArgs().isEmpty()) {
-                eventRef = String.valueOf(ann.positionalArg(0));
-                break;
+            if (eventAnnotation) {
+                context.error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "Only one event annotation is allowed", eventToken);
+                continue;
+            }
+            eventAnnotation = true;
+            if (annName.startsWith("Event.")) {
+                if (!ann.positionalArgs().isEmpty() || !ann.namedArgs().isEmpty()) context.error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "@" + annName + " does not accept arguments", eventToken);
+                eventRef = annName;
+            } else {
+                if (ann.positionalArgs().size() != 1 || !(ann.positionalArg(0) instanceof String) || !ann.namedArgs().isEmpty()) {
+                    context.error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "@Event requires exactly one positional String event name", eventToken);
+                } else eventRef = (String) ann.positionalArg(0);
             }
         }
 
@@ -549,8 +623,8 @@ public final class Parser {
             } else {
                 context.skipTrivia();
                 if (context.check(TokenType.RBRACE)) break;
-                // Check for old @Slider syntax
-                Token t = context.peek();
+                Token token = context.peek();
+                context.error(DiagnosticCode.PARSER_INVALID_SETTING_DECL, "Expected a setting annotation, got '" + token.text() + "'", token);
                 context.advance();
             }
             context.skipTrivia();
@@ -605,15 +679,17 @@ public final class Parser {
                 Token nameToken = context.advance();
                 context.advance(); // EQ
                 context.skipTrivia();
+                boolean explicitNull = isExplicitNull();
                 Object value = parseAnnotationValue();
-                namedArgs.put(nameToken.text(), value);
+                if (namedArgs.containsKey(nameToken.text())) context.error(DiagnosticCode.PARSER_INVALID_SETTING_DECL, "Duplicate named setting argument: " + nameToken.text(), nameToken);
+                else if (value != null || explicitNull) namedArgs.put(nameToken.text(), value);
             } else {
+                boolean explicitNull = isExplicitNull();
                 Object value = parseAnnotationValue();
                 if (value instanceof RangeValue rv) {
-                    // Expand range into min and max
                     positionalArgs.add(rv.min());
                     positionalArgs.add(rv.max());
-                } else if (value != null) {
+                } else if (value != null || explicitNull) {
                     positionalArgs.add(value);
                 }
             }
@@ -667,41 +743,24 @@ public final class Parser {
         if (token.text().equals("await")) return false;
 
         Token next = peekAhead(1);
-        // Type name pattern
         if (next.is(TokenType.IDENTIFIER)) return true;
+        if (next.is(TokenType.QUESTION)) return peekAhead(2).is(TokenType.IDENTIFIER);
+        if (!next.is(TokenType.LT)) return false;
 
-        // Generic type: Type<...> name
-        if (next.is(TokenType.LT)) {
-            // Scan ahead past the generic args to see if an IDENTIFIER follows
-            int depth = 0;
-            int idx = 2; // skip current and LT
-            List<Token> sig = context.tokens().significant();
-            int pos = context.tokens().position();
-            int count = 0;
-            for (int i = pos; i < sig.size(); i++) {
-                Token t = sig.get(i);
-                if (t.type() == TokenType.NEWLINE) continue;
-                count++;
-                if (count == 1) continue; // current token (type name)
-                if (count == 2) { depth = 1; continue; } // LT
-                if (depth > 0) {
-                    if (t.is(TokenType.LT)) depth++;
-                    else if (t.is(TokenType.GT)) depth--;
-                    if (depth == 0) {
-                        // Check next non-trivia token
-                        for (int j = i + 1; j < sig.size(); j++) {
-                            Token after = sig.get(j);
-                            if (after.type() == TokenType.NEWLINE) continue;
-                            return after.is(TokenType.IDENTIFIER);
-                        }
-                        return false;
-                    }
+        int depth = 0;
+        for (int offset = 1; ; offset++) {
+            Token current = peekAhead(offset);
+            if (current.is(TokenType.EOF)) return false;
+            if (current.is(TokenType.LT)) depth++;
+            else if (current.is(TokenType.GT)) {
+                depth--;
+                if (depth == 0) {
+                    Token after = peekAhead(offset + 1);
+                    if (after.is(TokenType.QUESTION)) after = peekAhead(offset + 2);
+                    return after.is(TokenType.IDENTIFIER);
                 }
             }
-            return false;
         }
-
-        return false;
     }
 
     private StatementNode parseStatement() {
@@ -815,7 +874,7 @@ public final class Parser {
         context.expect(TokenType.RPAREN, "Expected ')' after for iterable");
         BlockNode body = parseBlock();
         return new ForStatementNode(context.filePath(), forToken.line(), forToken.column(),
-                varToken.text(), iterable, body);
+                type, varToken.text(), iterable, body);
     }
 
     private StatementNode parseWhenStatement() {

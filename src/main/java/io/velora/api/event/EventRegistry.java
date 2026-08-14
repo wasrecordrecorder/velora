@@ -20,6 +20,9 @@ public interface EventRegistry {
     /** Find a descriptor by event id. */
     EventDescriptor find(String id);
 
+    /** Find a descriptor by its script-facing name. */
+    EventDescriptor findByScriptName(String scriptName);
+
     /** Find a descriptor by its assigned index (after freeze). */
     EventDescriptor findByIndex(int index);
 

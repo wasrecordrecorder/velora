@@ -141,11 +141,10 @@ public final class BytecodeVerifier {
             case CREATE_LIST, CREATE_MAP -> {
                 if (operands[0] < 0 || operands[0] > 1_000_000) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Invalid collection size in " + function.name() + " at " + instruction.offset());
             }
-            case GET_MEMBER, SET_MEMBER -> {
-                range(operands[0], module.constantPool().size(), "Member constant", function, instruction, diagnostics);
-                if (operands[0] >= 0 && operands[0] < module.constantPool().size() && module.constantPool().tag(operands[0]) != ConstantPool.Tag.STRING) {
-                    error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Member name must be a string constant in " + function.name() + " at " + instruction.offset());
-                }
+            case GET_MEMBER, SET_MEMBER, IS_TYPE -> validateStringOperand(operands[0], module, function, instruction, diagnostics);
+            case LOAD_QUALIFIED -> {
+                validateStringOperand(operands[0], module, function, instruction, diagnostics);
+                validateStringOperand(operands[1], module, function, instruction, diagnostics);
             }
             case LINE -> {
                 if (operands[0] < 0) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Negative line number in " + function.name() + " at " + instruction.offset());
@@ -155,6 +154,13 @@ public final class BytecodeVerifier {
         if (opcode == Opcode.SET_MEMBER) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "SET_MEMBER is not valid for immutable script values in " + function.name());
     }
 
+    private void validateStringOperand(int index, CompiledModule module, CompiledFunction function, Instruction instruction, List<Diagnostic> diagnostics) {
+        range(index, module.constantPool().size(), "String constant", function, instruction, diagnostics);
+        if (index >= 0 && index < module.constantPool().size() && module.constantPool().tag(index) != ConstantPool.Tag.STRING) {
+            error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "String operand must be a string constant in " + function.name() + " at " + instruction.offset());
+        }
+    }
+
     private void range(int index, int size, String label, CompiledFunction function, Instruction instruction, List<Diagnostic> diagnostics) {
         if (index < 0 || index >= size) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, label + " index " + index + " out of range in " + function.name() + " at " + instruction.offset());
     }
@@ -162,7 +168,7 @@ public final class BytecodeVerifier {
     private int requiredStack(Instruction instruction) {
         Opcode opcode = instruction.opcode();
         return switch (opcode) {
-            case STORE_LOCAL, STORE_FIELD, STORE_STATIC, POP, DUP, NEGATE, NOT, IS_NULL, JUMP_IF_FALSE, JUMP_IF_TRUE, GET_MEMBER, AWAIT, DELAY -> 1;
+            case STORE_LOCAL, STORE_FIELD, STORE_STATIC, POP, DUP, NEGATE, NOT, IS_NULL, IS_TYPE, JUMP_IF_FALSE, JUMP_IF_TRUE, GET_MEMBER, AWAIT, DELAY -> 1;
             case ADD, SUB, MUL, DIV, MOD, EQUAL, NOT_EQUAL, LESS, LESS_EQUAL, GREATER, GREATER_EQUAL, GET_INDEX, SET_MEMBER -> 2;
             case CALL, CALL_API, CALL_SUSPEND, SPAWN -> instruction.operands()[1];
             case CREATE_LIST -> instruction.operands()[0];
@@ -174,7 +180,7 @@ public final class BytecodeVerifier {
     private int stackDelta(Instruction instruction) {
         Opcode opcode = instruction.opcode();
         return switch (opcode) {
-            case CONST, NULL, TRUE, FALSE, LOAD_LOCAL, LOAD_FIELD, LOAD_SETTING, LOAD_STATIC, DUP -> 1;
+            case CONST, NULL, TRUE, FALSE, LOAD_LOCAL, LOAD_FIELD, LOAD_SETTING, LOAD_STATIC, LOAD_QUALIFIED, DUP -> 1;
             case STORE_LOCAL, STORE_FIELD, STORE_STATIC, POP, DELAY, JUMP_IF_FALSE, JUMP_IF_TRUE -> -1;
             case ADD, SUB, MUL, DIV, MOD, EQUAL, NOT_EQUAL, LESS, LESS_EQUAL, GREATER, GREATER_EQUAL, GET_INDEX -> -1;
             case SET_MEMBER -> -2;

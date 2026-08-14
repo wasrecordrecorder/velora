@@ -39,7 +39,7 @@ public final class DefinitionEngine {
         int zeroColumn = column - 1;
         for (Token token : tokens) {
             if (token.line() != line || token.length() == 0) continue;
-            if (zeroColumn >= token.column() && zeroColumn <= token.column() + token.length()) return token;
+            if (zeroColumn >= token.column() && zeroColumn < token.column() + token.length()) return token;
         }
         return null;
     }

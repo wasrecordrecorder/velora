@@ -30,6 +30,7 @@ import io.velora.internal.setting.DefaultSettingRegistry;
 import io.velora.internal.security.*;
 import io.velora.internal.persistence.EnabledScriptsStore;
 import io.velora.internal.vm.ScriptValue;
+import io.velora.internal.vm.VirtualMachine;
 
 import java.util.*;
 
@@ -57,7 +58,10 @@ public final class DefaultVeloraEngine implements VeloraEngine {
     private final EnabledScriptsStore enabledScriptsStore;
     private final LogRateLimiter logRateLimiter = new LogRateLimiter(100);
     private final Map<EventHandlerKey, Long> runningEventHandlers = new HashMap<>();
+    private final Map<String, Long> runningTickHandlers = new HashMap<>();
+    private final Set<String> tickScheduleFailures = new HashSet<>();
     private final Map<EventHandlerKey, Deque<ScriptValue[]>> pendingEventHandlers = new HashMap<>();
+    private final Map<String, Integer> pendingEventCountsByScript = new HashMap<>();
     private VeloraState state = VeloraState.CREATED;
 
     private DefaultVeloraEngine(VeloraEngineBuilder builder) {
@@ -103,13 +107,13 @@ public final class DefaultVeloraEngine implements VeloraEngine {
             ns.function("debug", VeloraTypes.UNIT, p -> p.required("message", VeloraTypes.STRING), ctx -> { writeLog(ctx, ScriptLogEntry.Level.DEBUG, String.valueOf(ctx.argument(0)), hostLogger); return null; }).description("Logs a debug message").categoryId("log");
         });
         permissionRegistry.register(io.velora.api.permission.ScriptPermission.of("LOCAL_STORAGE", "Local storage", "Allows reading and writing script-local persistent storage"));
-        for (FunctionDescriptor fd : apiRegistry.all()) apiRegistry.markBuiltIn(fd.namespace(), fd.name());
     }
 
     private void writeLog(io.velora.api.function.FunctionContext ctx, ScriptLogEntry.Level level, String message, io.velora.host.VeloraLogger hostLogger) {
         if (!logRateLimiter.canLog(ctx.scriptId())) return;
         logRateLimiter.recordLog(ctx.scriptId());
-        logStore.log(ctx.scriptId(), new ScriptLogEntry(ctx.scriptId(), ctx.fiberId(), level, message, System.nanoTime()));
+        logStore.log(ctx.scriptId(), new ScriptLogEntry(ctx.scriptId(), ctx.fiberId(), level, message, builder.host().clock().nanoTime()));
+        if (scriptManager != null) scriptManager.fireServiceEvent(io.velora.api.script.ScriptServiceEvents.Type.LOG_ADDED, ctx.scriptId());
         switch (level) {
             case DEBUG -> hostLogger.debug(message);
             case INFO -> hostLogger.info(message);
@@ -201,7 +205,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
     public ScriptCompiler compiler() {
         if (compiler == null) {
             compiler = new DefaultScriptCompiler(typeRegistry, settingRegistry, apiRegistry,
-                    constantRegistry, permissionRegistry);
+                    constantRegistry, permissionRegistry, eventRegistry);
         }
         return compiler;
     }
@@ -210,14 +214,14 @@ public final class DefaultVeloraEngine implements VeloraEngine {
     public ScriptManager scripts() {
         if (scriptManager == null) {
             if (scheduler == null) {
-                scheduler = new ScriptScheduler(builder.limits(), apiRegistry, errorStore);
+                scheduler = new ScriptScheduler(builder.limits(), apiRegistry, errorStore, builder.host().workers(), constantRegistry, typeRegistry, builder.host().clock()::nanoTime);
             }
             if (compiler == null) {
                 compiler = new DefaultScriptCompiler(typeRegistry, settingRegistry, apiRegistry,
-                        constantRegistry, permissionRegistry);
+                        constantRegistry, permissionRegistry, eventRegistry);
             }
             if (debugService == null) debugService = new DefaultDebugService(logStore, errorStore, profiler, scheduler);
-            scriptManager = new DefaultScriptManager(scheduler, compiler, builder.host(), permissionController, enabledScriptsStore, debugService, permissionRegistry);
+            scriptManager = new DefaultScriptManager(scheduler, compiler, builder.host(), permissionController, enabledScriptsStore, debugService, permissionRegistry, templateRegistry);
             enabledScriptsStore.load();
             eventRegistry.setDispatcher(this::dispatchEvent);
             eventRegistry.setOverflowHandler(this::failScriptsForEvent);
@@ -228,7 +232,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
     @Override
     public LanguageService language() {
         if (languageService == null) {
-            languageService = new DefaultLanguageService();
+            languageService = new DefaultLanguageService(apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry);
         }
         return languageService;
     }
@@ -237,7 +241,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
     public DebugService debug() {
         if (debugService == null) {
             if (scheduler == null) {
-                scheduler = new ScriptScheduler(builder.limits(), apiRegistry, errorStore);
+                scheduler = new ScriptScheduler(builder.limits(), apiRegistry, errorStore, builder.host().workers(), constantRegistry, typeRegistry, builder.host().clock()::nanoTime);
             }
             debugService = new DefaultDebugService(logStore, errorStore, profiler, scheduler);
         }
@@ -264,6 +268,10 @@ public final class DefaultVeloraEngine implements VeloraEngine {
             int catSnapshot = categoryRegistry.all().size();
             int permSnapshot = permissionRegistry.all().size();
             int eventSnapshot = eventRegistry.all().size();
+            int typeSnapshot = typeRegistry.all().size();
+            int settingSnapshot = settingRegistry.all().size();
+            int constantSnapshot = constantRegistry.all().size();
+            int templateSnapshot = templateRegistry.all().size();
             try {
                 ext.register(ctx);
             } catch (Throwable t) {
@@ -271,9 +279,14 @@ public final class DefaultVeloraEngine implements VeloraEngine {
                 categoryRegistry.rollbackTo(catSnapshot);
                 permissionRegistry.rollbackTo(permSnapshot);
                 eventRegistry.rollbackTo(eventSnapshot);
+                typeRegistry.rollbackTo(typeSnapshot);
+                settingRegistry.rollbackTo(settingSnapshot);
+                constantRegistry.rollbackTo(constantSnapshot);
+                templateRegistry.rollbackTo(templateSnapshot);
                 throw t;
             }
         }
+        validatePermissionReferences();
         typeRegistry.freeze();
         settingRegistry.freeze();
         permissionRegistry.freeze();
@@ -285,10 +298,24 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         categoryRegistry.freeze();
         if (compiler == null) {
             compiler = new DefaultScriptCompiler(typeRegistry, settingRegistry, apiRegistry,
-                    constantRegistry, permissionRegistry);
+                    constantRegistry, permissionRegistry, eventRegistry);
         }
         compiler.freeze();
         state = VeloraState.FROZEN;
+    }
+
+
+    private void validatePermissionReferences() {
+        for (var function : apiRegistry.all()) {
+            if (function.permission() != null && permissionRegistry.find(function.permission().id()) == null) {
+                throw new IllegalStateException("API " + function.qualifiedName() + " references unregistered permission: " + function.permission().id());
+            }
+        }
+        for (var event : eventRegistry.all()) {
+            if (event.permission() != null && permissionRegistry.find(event.permission().id()) == null) {
+                throw new IllegalStateException("Event " + event.id() + " references unregistered permission: " + event.permission().id());
+            }
+        }
     }
 
     @Override
@@ -304,11 +331,11 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         }
 
         if (scheduler == null) {
-            scheduler = new ScriptScheduler(builder.limits(), apiRegistry, errorStore);
+            scheduler = new ScriptScheduler(builder.limits(), apiRegistry, errorStore, builder.host().workers(), constantRegistry, typeRegistry, builder.host().clock()::nanoTime);
         }
 
         logRateLimiter.resetTick();
-        long now = System.nanoTime();
+        long now = builder.host().clock().nanoTime();
         Map<String, io.velora.internal.bytecode.CompiledModule> modules = new HashMap<>();
         Map<String, List<io.velora.api.setting.SettingDescriptor>> scriptSettings = new HashMap<>();
 
@@ -327,41 +354,60 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         // Dispatch pending events to script handlers before running fibers
         eventRegistry.dispatchPending();
 
-        // Dispatch ON_TICK lifecycle hook to enabled scripts
         if (scriptManager != null) {
             for (var inst : scriptManager.repository().all()) {
-                if (!inst.enabled()) continue;
+                String scriptId = inst.scriptId();
+                Long runningId = runningTickHandlers.get(scriptId);
+                if (runningId != null && scheduler.fiber(runningId) == null) {
+                    runningTickHandlers.remove(scriptId);
+                    runningId = null;
+                }
+                if (!inst.enabled()) {
+                    runningTickHandlers.remove(scriptId);
+                    tickScheduleFailures.remove(scriptId);
+                    continue;
+                }
                 var module = inst.compiledModule();
-                if (module == null) continue;
-                if (module.lifecycleHooks().contains("ON_TICK")) {
-                    int fnIdx = findFunctionIndex(module, "ON_TICK");
-                    if (fnIdx >= 0) {
-                        scheduler.spawnFiber(inst.scriptId(), fnIdx, new ScriptValue[0]);
-                    }
+                if (module == null || !module.lifecycleHooks().contains("ON_TICK") || runningId != null) continue;
+                int fnIdx = findFunctionIndex(module, "ON_TICK");
+                if (fnIdx < 0) continue;
+                var fiber = scheduler.spawnFiber(scriptId, fnIdx, new ScriptValue[0]);
+                if (fiber != null) {
+                    runningTickHandlers.put(scriptId, fiber.id());
+                    tickScheduleFailures.remove(scriptId);
+                } else if (tickScheduleFailures.add(scriptId)) {
+                    errorStore.record(scriptId, new io.velora.api.debug.RuntimeError(
+                            scriptId, -1, "ON_TICK", io.velora.api.compiler.DiagnosticCode.RUNTIME_RESOURCE_LIMIT.name(),
+                            "Unable to schedule ON_TICK: runtime resource limit", "", now));
                 }
             }
         }
 
-        // Record event queue depth metrics to profiler
-        profiler.recordMaxQueueDepth(eventRegistry.maxQueueDepth());
-        profiler.setDroppedEvents(eventRegistry.droppedEvents());
-        profiler.setCoalescedEvents(eventRegistry.coalescedEvents());
-
         scheduler.tick(now, modules, scriptSettings);
         drainEventHandlers();
-        profiler.recordInstructions(scheduler.metrics().lastTickInstructions());
     }
 
     private void dispatchEvent(String eventId, Object payload) {
         EventDescriptor descriptor = eventRegistry.find(eventId);
         if (descriptor == null || scriptManager == null) return;
         String scriptName = descriptor.scriptName();
+        ScriptValue eventPayload;
+        try {
+            eventPayload = VirtualMachine.javaToValue(descriptor.payloadType(), payload);
+        } catch (RuntimeException error) {
+            eventRegistry.fireDiagnostic(descriptor.id(), EventRegistry.EventDiagnostic.Type.DROPPED);
+            builder.host().logger().error("Invalid payload for event " + descriptor.id(), error);
+            return;
+        }
         for (ScriptInstance instance : scriptManager.repository().all()) {
             if (!instance.enabled() || instance.compiledModule() == null) continue;
             if (descriptor.permission() != null && !scriptManager.hasPermissionGrant(instance.scriptId(), io.velora.api.permission.PermissionSet.of(descriptor.permission()))) continue;
             for (var handler : instance.compiledModule().eventHandlers()) {
                 if (!matchesEvent(handler.eventReference(), scriptName, eventId)) continue;
-                scheduleEventHandler(descriptor, instance.scriptId(), handler.functionIndex(), new ScriptValue[]{ScriptValue.fromJava(payload)});
+                var function = instance.compiledModule().function(handler.functionIndex());
+                if (function == null) continue;
+                ScriptValue[] args = function.parameterCount() == 0 ? new ScriptValue[0] : new ScriptValue[]{eventPayload};
+                scheduleEventHandler(descriptor, instance.scriptId(), handler.functionIndex(), args);
             }
         }
     }
@@ -374,19 +420,23 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         switch (descriptor.defaultConcurrency()) {
             case PARALLEL -> spawnEvent(descriptor, key, args, false);
             case DROP -> {
-                if (running) eventRegistry.fireDiagnostic(descriptor.id(), EventRegistry.EventDiagnostic.Type.DROPPED);
-                else spawnEvent(descriptor, key, args, true);
+                if (running) {
+                    profiler.recordDropped(scriptId);
+                    eventRegistry.fireDiagnostic(descriptor.id(), EventRegistry.EventDiagnostic.Type.DROPPED);
+                } else spawnEvent(descriptor, key, args, true);
             }
             case RESTART -> {
                 if (running) scheduler.cancelFiber(runningId);
-                pendingEventHandlers.remove(key);
+                removePending(key);
                 spawnEvent(descriptor, key, args, true);
             }
             case LATEST -> {
                 if (running) {
                     Deque<ScriptValue[]> queue = pendingEventHandlers.computeIfAbsent(key, ignored -> new ArrayDeque<>());
+                    if (queue.isEmpty()) incrementPending(key.scriptId);
                     queue.clear();
                     queue.addLast(args);
+                    profiler.recordCoalesced(scriptId);
                     eventRegistry.fireDiagnostic(descriptor.id(), EventRegistry.EventDiagnostic.Type.COALESCED);
                 } else spawnEvent(descriptor, key, args, true);
             }
@@ -399,35 +449,65 @@ public final class DefaultVeloraEngine implements VeloraEngine {
 
     private void enqueueEvent(EventDescriptor descriptor, EventHandlerKey key, ScriptValue[] args) {
         Deque<ScriptValue[]> queue = pendingEventHandlers.computeIfAbsent(key, ignored -> new ArrayDeque<>());
-        int globalDepth = pendingEventHandlers.entrySet().stream().filter(entry -> entry.getKey().scriptId.equals(key.scriptId)).mapToInt(entry -> entry.getValue().size()).sum();
+        int globalDepth = pendingEventCountsByScript.getOrDefault(key.scriptId, 0);
         if (queue.size() < descriptor.queueLimit() && globalDepth < builder.limits().maxEventQueuePerScript()) {
             queue.addLast(args);
+            incrementPending(key.scriptId);
             return;
         }
         switch (descriptor.overflowPolicy()) {
-            case DROP_NEWEST -> eventRegistry.fireDiagnostic(descriptor.id(), EventRegistry.EventDiagnostic.Type.DROPPED);
+            case DROP_NEWEST -> {
+                profiler.recordDropped(key.scriptId);
+                eventRegistry.fireDiagnostic(descriptor.id(), EventRegistry.EventDiagnostic.Type.DROPPED);
+            }
             case DROP_OLDEST -> {
-                queue.pollFirst();
+                if (queue.pollFirst() == null) incrementPending(key.scriptId);
                 queue.addLast(args);
+                profiler.recordDropped(key.scriptId);
                 eventRegistry.fireDiagnostic(descriptor.id(), EventRegistry.EventDiagnostic.Type.DROPPED);
             }
             case KEEP_LATEST -> {
+                int removed = queue.size();
+                if (removed == 0) incrementPending(key.scriptId);
+                else if (removed > 1) reducePending(key.scriptId, removed - 1);
                 queue.clear();
                 queue.addLast(args);
+                profiler.recordDropped(key.scriptId, removed);
+                profiler.recordCoalesced(key.scriptId);
                 eventRegistry.fireDiagnostic(descriptor.id(), EventRegistry.EventDiagnostic.Type.COALESCED);
             }
             case COALESCE -> {
-                queue.pollLast();
-                queue.addLast(args);
+                ScriptValue[] previous = queue.pollLast();
+                if (previous == null) {
+                    incrementPending(key.scriptId);
+                    queue.addLast(args);
+                } else {
+                    try {
+                        Object left = previous.length == 0 ? null : previous[0].boxed();
+                        Object right = args.length == 0 ? null : args[0].boxed();
+                        Object merged = descriptor.coalescer().apply(left, right);
+                        queue.addLast(descriptor.payloadType().equals(VeloraTypes.UNIT)
+                                ? args
+                                : new ScriptValue[]{VirtualMachine.javaToValue(descriptor.payloadType(), merged)});
+                    } catch (RuntimeException error) {
+                        failScript(key.scriptId, "Event coalescer failed for " + descriptor.id() + ": " + error.getMessage());
+                        return;
+                    }
+                }
+                profiler.recordCoalesced(key.scriptId);
                 eventRegistry.fireDiagnostic(descriptor.id(), EventRegistry.EventDiagnostic.Type.COALESCED);
             }
-            case FAIL_SCRIPT -> failScript(key.scriptId, "Event queue overflow: " + descriptor.id());
+            case FAIL_SCRIPT -> {
+                profiler.recordDropped(key.scriptId);
+                failScript(key.scriptId, "Event queue overflow: " + descriptor.id());
+            }
         }
     }
 
     private void spawnEvent(EventDescriptor descriptor, EventHandlerKey key, ScriptValue[] args, boolean track) {
-        var fiber = scheduler.spawnEventFiber(key.scriptId, key.functionIndex, args);
+        var fiber = scheduler.spawnEventFiber(key.scriptId, key.functionIndex, args, descriptor.cost());
         if (fiber == null) {
+            profiler.recordDropped(key.scriptId);
             eventRegistry.fireDiagnostic(descriptor.id(), EventRegistry.EventDiagnostic.Type.DROPPED);
             return;
         }
@@ -442,16 +522,17 @@ public final class DefaultVeloraEngine implements VeloraEngine {
             runningEventHandlers.remove(key);
             Deque<ScriptValue[]> queue = pendingEventHandlers.get(key);
             if (queue == null || queue.isEmpty()) {
-                pendingEventHandlers.remove(key);
+                removePending(key);
                 continue;
             }
             ScriptInstance instance = scriptManager.repository().get(key.scriptId);
             EventDescriptor descriptor = eventRegistry.find(key.eventId);
             if (instance == null || !instance.enabled() || descriptor == null) {
-                pendingEventHandlers.remove(key);
+                removePending(key);
                 continue;
             }
             ScriptValue[] args = queue.pollFirst();
+            decrementPending(key.scriptId);
             if (queue.isEmpty()) pendingEventHandlers.remove(key);
             spawnEvent(descriptor, key, args, true);
         }
@@ -463,6 +544,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         if (descriptor == null) return;
         for (ScriptInstance instance : new ArrayList<>(scriptManager.repository().all())) {
             if (instance.enabled() && instance.compiledModule() != null && instance.compiledModule().eventHandlers().stream().anyMatch(handler -> matchesEvent(handler.eventReference(), descriptor.scriptName(), eventId))) {
+                profiler.recordDropped(instance.scriptId());
                 failScript(instance.scriptId(), "Event queue overflow: " + eventId);
             }
         }
@@ -472,6 +554,46 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         scriptManager.failRuntime(scriptId, message);
         runningEventHandlers.keySet().removeIf(key -> key.scriptId.equals(scriptId));
         pendingEventHandlers.keySet().removeIf(key -> key.scriptId.equals(scriptId));
+        pendingEventCountsByScript.remove(scriptId);
+        runningTickHandlers.remove(scriptId);
+        tickScheduleFailures.remove(scriptId);
+        profiler.recordQueueDepth(scriptId, 0);
+    }
+
+    private void incrementPending(String scriptId) {
+        int count = pendingEventCountsByScript.merge(scriptId, 1, Integer::sum);
+        profiler.recordQueueDepth(scriptId, count);
+    }
+
+    private void reducePending(String scriptId, int amount) {
+        int count = Math.max(0, pendingEventCountsByScript.getOrDefault(scriptId, 0) - Math.max(0, amount));
+        if (count == 0) pendingEventCountsByScript.remove(scriptId);
+        else pendingEventCountsByScript.put(scriptId, count);
+        profiler.recordQueueDepth(scriptId, count);
+    }
+
+    private void decrementPending(String scriptId) {
+        int count = pendingEventCountsByScript.getOrDefault(scriptId, 0);
+        if (count <= 1) {
+            pendingEventCountsByScript.remove(scriptId);
+            profiler.recordQueueDepth(scriptId, 0);
+        } else {
+            pendingEventCountsByScript.put(scriptId, count - 1);
+            profiler.recordQueueDepth(scriptId, count - 1);
+        }
+    }
+
+    private void removePending(EventHandlerKey key) {
+        Deque<ScriptValue[]> removed = pendingEventHandlers.remove(key);
+        if (removed == null || removed.isEmpty()) return;
+        int count = pendingEventCountsByScript.getOrDefault(key.scriptId, 0) - removed.size();
+        if (count <= 0) {
+            pendingEventCountsByScript.remove(key.scriptId);
+            profiler.recordQueueDepth(key.scriptId, 0);
+        } else {
+            pendingEventCountsByScript.put(key.scriptId, count);
+            profiler.recordQueueDepth(key.scriptId, count);
+        }
     }
 
     private static boolean matchesEvent(String reference, String scriptName, String eventId) {

@@ -34,6 +34,8 @@ public interface ScriptServiceEvents {
 
     enum Type {
         DISCOVERED,
+        CREATED,
+        DELETED,
         SOURCE_CHANGED,
         COMPILE_STARTED,
         COMPILE_FINISHED,
@@ -45,7 +47,6 @@ public interface ScriptServiceEvents {
         SETTINGS_CHANGED,
         PERMISSIONS_CHANGED,
         RUNTIME_ERROR,
-        LOG_ADDED,
-        PROFILER_UPDATED
+        LOG_ADDED
     }
 }

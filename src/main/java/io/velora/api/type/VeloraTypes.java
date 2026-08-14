@@ -54,7 +54,7 @@ public final class VeloraTypes {
 
     public static boolean isCompatible(VeloraType source, VeloraType target) {
         if (source == null || target == null) return false;
-        if (source == target || isWidening(source, target)) return true;
-        return target.isNullable() && source.nonNull().name().equals(target.nonNull().name());
+        if (source.equals(target) || isWidening(source, target)) return true;
+        return target.isNullable() && source.nonNull().equals(target.nonNull());
     }
 }

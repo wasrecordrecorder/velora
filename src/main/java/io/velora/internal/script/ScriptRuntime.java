@@ -20,25 +20,25 @@ public final class ScriptRuntime {
 
     public ScriptInstance instance() { return instance; }
 
-    public void start() {
+    public boolean start() {
         CompiledModule module = instance.compiledModule();
-        if (module == null) return;
+        if (module == null) return false;
         for (String hook : module.lifecycleHooks()) {
             if (hook.equals("ON_RUN")) {
                 int fnIdx = findFunctionIndex(module, "ON_RUN");
                 if (fnIdx >= 0) {
                     ScriptFiber fiber = scheduler.spawnFiber(instance.scriptId(), fnIdx, new ScriptValue[0]);
+                    if (fiber == null) return false;
                     rootFiberId = fiber.id();
                 }
             }
         }
+        return true;
     }
 
     public void stop() {
-        if (rootFiberId >= 0) {
-            scheduler.cancelFiber(rootFiberId);
-        }
-        scheduler.cancelScriptTasks(instance.scriptId());
+        scheduler.stopScript(instance.scriptId());
+        rootFiberId = -1;
     }
 
     private int findFunctionIndex(CompiledModule module, String name) {

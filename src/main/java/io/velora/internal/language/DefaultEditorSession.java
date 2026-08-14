@@ -2,6 +2,11 @@ package io.velora.internal.language;
 
 import io.velora.api.language.*;
 import io.velora.api.compiler.Diagnostic;
+import io.velora.api.event.EventRegistry;
+import io.velora.api.function.ApiRegistry;
+import io.velora.api.registry.ConstantRegistry;
+import io.velora.api.registry.SettingRegistry;
+import io.velora.api.registry.TypeRegistry;
 import io.velora.internal.lexer.Lexer;
 import io.velora.internal.lexer.LexerResult;
 import io.velora.internal.parser.Parser;
@@ -13,14 +18,29 @@ public final class DefaultEditorSession implements EditorSession {
 
     private final String scriptId;
     private final String filePath;
+    private final ApiRegistry apiRegistry;
+    private final TypeRegistry typeRegistry;
+    private final EventRegistry eventRegistry;
+    private final SettingRegistry settingRegistry;
+    private final ConstantRegistry constantRegistry;
     private String content = "";
     private long revisionToken = 0;
     private boolean closed = false;
     private EditorSnapshot cachedSnapshot;
 
     public DefaultEditorSession(String scriptId, String filePath) {
+        this(scriptId, filePath, null, null, null, null, null);
+    }
+
+    public DefaultEditorSession(String scriptId, String filePath, ApiRegistry apiRegistry, TypeRegistry typeRegistry,
+                                EventRegistry eventRegistry, SettingRegistry settingRegistry, ConstantRegistry constantRegistry) {
         this.scriptId = scriptId;
         this.filePath = filePath;
+        this.apiRegistry = apiRegistry;
+        this.typeRegistry = typeRegistry;
+        this.eventRegistry = eventRegistry;
+        this.settingRegistry = settingRegistry;
+        this.constantRegistry = constantRegistry;
     }
 
     @Override public String scriptId() { return scriptId; }
@@ -55,19 +75,19 @@ public final class DefaultEditorSession implements EditorSession {
     @Override
     public List<CompletionItem> completions(int line, int column) {
         ensureOpen();
-        return CompletionEngine.getCompletions(content, line, column);
+        return CompletionEngine.getCompletions(content, line, column, apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry);
     }
 
     @Override
     public Optional<HoverInfo> hover(int line, int column) {
         ensureOpen();
-        return HoverEngine.getHover(content, line, column, filePath);
+        return HoverEngine.getHover(content, line, column, filePath, apiRegistry, typeRegistry, constantRegistry);
     }
 
     @Override
     public Optional<SignatureHelp> signatureHelp(int line, int column) {
         ensureOpen();
-        return SignatureHelpEngine.getSignatureHelp(content, line, column);
+        return SignatureHelpEngine.getSignatureHelp(content, line, column, apiRegistry);
     }
 
     @Override

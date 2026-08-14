@@ -13,9 +13,8 @@ public final class DefaultPermissionRegistry implements PermissionRegistry {
     @Override
     public void register(ScriptPermission permission) {
         checkFrozen();
-        if (byId.containsKey(permission.id())) {
-            return;
-        }
+        Objects.requireNonNull(permission, "permission");
+        if (byId.containsKey(permission.id())) throw new IllegalStateException("Permission already registered: " + permission.id());
         byId.put(permission.id(), permission);
     }
 

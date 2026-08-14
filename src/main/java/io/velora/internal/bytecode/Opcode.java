@@ -72,7 +72,9 @@ public enum Opcode {
 
     // Debug
     LINE(1),           // LINE lineNumber
-    BREAKPOINT(0);
+    BREAKPOINT(0),
+    IS_TYPE(1),
+    LOAD_QUALIFIED(2);
 
     private final int operandWords;
 

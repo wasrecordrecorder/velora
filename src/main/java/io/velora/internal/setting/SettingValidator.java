@@ -65,10 +65,19 @@ public final class SettingValidator {
             case MIN -> validateRange(value, constraint.min(), null);
             case MAX -> validateRange(value, null, constraint.max());
             case STEP -> validateStep(descriptor, value, constraint.extra());
+            case MIN_LENGTH -> {
+                if (!(value instanceof String string)) yield SettingValidationResult.invalid("MIN_LENGTH requires a String setting");
+                int min = ((Number) constraint.min()).intValue();
+                yield string.length() >= min ? SettingValidationResult.ok() : SettingValidationResult.invalid("String length " + string.length() + " is below min " + min);
+            }
             case MAX_LENGTH -> {
                 if (!(value instanceof String string)) yield SettingValidationResult.invalid("MAX_LENGTH requires a String setting");
                 int max = ((Number) constraint.max()).intValue();
                 yield string.length() <= max ? SettingValidationResult.ok() : SettingValidationResult.invalid("String length " + string.length() + " exceeds max " + max);
+            }
+            case VALUES -> {
+                if (!(constraint.extra() instanceof java.util.Collection<?> values)) yield SettingValidationResult.invalid("VALUES requires a collection");
+                yield values.contains(value) ? SettingValidationResult.ok() : SettingValidationResult.invalid("Value is not one of the allowed values");
             }
             case PATTERN -> {
                 if (!(value instanceof String string)) yield SettingValidationResult.invalid("PATTERN requires a String setting");

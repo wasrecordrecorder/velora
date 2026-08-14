@@ -65,7 +65,7 @@ class HardeningV2Test {
         ResolvedScript resolved = analyzer.analyze(parse.scriptNode());
         assertTrue(analyzer.diagnostics().isEmpty(), "Semantic errors: " + analyzer.diagnostics());
         IrModule ir = new IrBuilder(resolved, api).build();
-        assertTrue(new IrVerifier().verify(ir).isEmpty());
+        assertTrue(new IrVerifier().verify(ir).isEmpty(), "IR errors: " + new IrVerifier().verify(ir));
         CompiledModule module = new BytecodeWriter().write(ir);
         assertTrue(new BytecodeVerifier().verify(module).stream().noneMatch(Diagnostic::isError));
         return module;
@@ -201,6 +201,22 @@ class HardeningV2Test {
         assertTrue(hit.success());
         assertFalse(miss.success());
         assertTrue(miss.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.COMPILER_CACHE_MISS));
+    }
+
+    @Test
+    void compilerUsesRequestScriptIdAndKeepsMultifileFunctionIndicesStable() {
+        DefaultScriptCompiler compiler = compiler();
+        CompileRequest request = CompileRequest.builder("folder-id")
+                .source("main.vls", "@Script(name=\"Display Name\", version=\"1\")\nscript SourceName { int run() { return helper() } entry onRun() { run() } }")
+                .source("helper.vls", "int helper() { return 42 }")
+                .build();
+        CompileResult result = compiler.compile(request);
+        assertTrue(result.success(), "Diagnostics: " + result.diagnostics());
+        CompiledModule module = compiler.compileToModule(request);
+        assertEquals("folder-id", module.scriptId());
+        assertEquals("Display Name", module.scriptName());
+        assertEquals(42, ((Number) new VirtualMachine(api, List.of(), 100_000)
+                .execute(module, module.functionByName("run").index(), new ScriptValue[0]).returnValue().boxed()).intValue());
     }
 
     @Test
@@ -403,6 +419,329 @@ class HardeningV2Test {
         editor.updateText(source);
         assertTrue(editor.format().isEmpty());
         editor.close();
+    }
+
+
+    @Test
+    void lexicalScopesWhenSafeAccessAndStringIndexExecuteCorrectly() {
+        CompiledModule scopes = compile("@Script(name=\"T\", version=\"1\")\nscript T { int answer() { int x = 1\n if (true) { int x = 42 }\n when (2) { 1 -> { return 0 } 2 -> { } else -> { return 0 } }\n return x } }");
+        VmExecutionResult scopeResult = execute(scopes);
+        assertTrue(scopeResult.success());
+        assertEquals(1, ((Number) scopeResult.returnValue().boxed()).intValue());
+        CompiledModule stringIndex = compile("@Script(name=\"T2\", version=\"1\")\nscript T2 { char answer() { return \"abc\"[1] } }");
+        VmExecutionResult stringResult = execute(stringIndex);
+        assertTrue(stringResult.success());
+        assertEquals('b', stringResult.returnValue().boxed());
+        CompiledModule safe = compile("@Script(name=\"T3\", version=\"1\")\nscript T3 { int? answer() { String? value = null\n return value?.length } }");
+        assertTrue(execute(safe).returnValue().isNull());
+        CompiledModule safeElvis = compiler().compileToModule(CompileRequest.builder("T4").source("main.vls",
+                "@Script(name=\"T4\", version=\"1\")\nscript T4 { int answer() { String? value = null\n return value?.length ?: 0 } }").build());
+        assertNotNull(safeElvis);
+        assertEquals(0, ((Number) new VirtualMachine(api, List.of(), 100_000)
+                .execute(safeElvis, safeElvis.functionByName("answer").index(), new ScriptValue[0]).returnValue().boxed()).intValue());
+    }
+
+    @Test
+    void nullableUnsafeAccessAndForTypeMismatchAreCompileErrors() {
+        List<Diagnostic> nullable = semanticDiagnostics("@Script(name=\"T\", version=\"1\")\nscript T { int answer() { String? value = null\n return value.length } }");
+        assertTrue(nullable.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_TYPE_MISMATCH));
+        List<Diagnostic> loop = semanticDiagnostics("@Script(name=\"T2\", version=\"1\")\nscript T2 { int answer() { List<int> values = [1]\n for (String value in values) { }\n return 1 } }");
+        assertTrue(loop.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_TYPE_MISMATCH));
+    }
+
+    @Test
+    void indexErrorsAndIntegerOverflowUseDedicatedRuntimeCodes() {
+        CompiledModule index = compile("@Script(name=\"T\", version=\"1\")\nscript T { int answer() { List<int> values = [1]\n return values[2] } }");
+        VmExecutionResult indexResult = execute(index);
+        assertFalse(indexResult.success());
+        assertEquals(DiagnosticCode.RUNTIME_INDEX_OUT_OF_BOUNDS, indexResult.error().code());
+        CompiledModule overflow = compile("@Script(name=\"T2\", version=\"1\")\nscript T2 { int answer() { int value = 2147483647\n return value + 1 } }");
+        VmExecutionResult overflowResult = execute(overflow);
+        assertFalse(overflowResult.success());
+        assertEquals(DiagnosticCode.RUNTIME_ARITHMETIC_OVERFLOW, overflowResult.error().code());
+    }
+
+    @Test
+    void qualifiedHostConstantsAndEnumsPreserveTypedValues() {
+        enum Mode { FIRST, SECOND }
+        constants.register("Answers", "VALUE", VeloraTypes.INT, 42);
+        var modeType = types.enumType("Mode", Mode.class, List.of(
+                new io.velora.api.type.EnumType.Constant("FIRST", Mode.FIRST),
+                new io.velora.api.type.EnumType.Constant("SECOND", Mode.SECOND)));
+        DefaultScriptCompiler compiler = compiler();
+        CompileRequest numberRequest = CompileRequest.builder("ConstT")
+                .source("main.vls", "@Script(name=\"ConstT\", version=\"1\")\nscript ConstT { int answer() { return Answers.VALUE } }").build();
+        CompileRequest modeRequest = CompileRequest.builder("EnumT")
+                .source("main.vls", "@Script(name=\"EnumT\", version=\"1\")\nscript EnumT { Mode answer() { return Mode.SECOND } }").build();
+        CompileResult numberResult = compiler.compile(numberRequest);
+        CompileResult modeResult = compiler.compile(modeRequest);
+        assertTrue(numberResult.success(), "Diagnostics: " + numberResult.diagnostics());
+        assertTrue(modeResult.success(), "Diagnostics: " + modeResult.diagnostics());
+        CompiledModule number = compiler.compileToModule(numberRequest);
+        CompiledModule mode = compiler.compileToModule(modeRequest);
+        ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), api, new RuntimeErrorStore(10), null, constants, types);
+        ScriptFiber numberFiber = scheduler.spawnFiber("ConstT", number.functionByName("answer").index(), new ScriptValue[0]);
+        scheduler.tick(System.nanoTime(), Map.of("ConstT", number), Map.of("ConstT", List.of()));
+        assertEquals(42, ((Number) numberFiber.result().boxed()).intValue());
+        ScriptFiber enumFiber = scheduler.spawnFiber("EnumT", mode.functionByName("answer").index(), new ScriptValue[0]);
+        scheduler.tick(System.nanoTime(), Map.of("EnumT", mode), Map.of("EnumT", List.of()));
+        assertEquals(Mode.SECOND, enumFiber.result().boxed());
+        assertEquals(modeType.name(), "Mode");
+    }
+
+    @Test
+    void annotatedBindingRegistrationIsAtomicAndProgrammaticThreadCostAreExposed() {
+        api.namespace("atomic", ns -> ns.function("a", VeloraTypes.INT, ctx -> 1));
+        @VeloraNamespace("atomic")
+        class Binding {
+            @VeloraFunction(name = "a") public int a() { return 1; }
+            @VeloraFunction(name = "b") public int b() { return 2; }
+        }
+        assertThrows(IllegalStateException.class, () -> api.registerAnnotated(new Binding()));
+        assertNull(api.find("atomic", "b"));
+        api.namespace("worker", ns -> ns.suspendFunction("value", VeloraTypes.INT, p -> {}, ctx -> 42)
+                .thread(io.velora.api.function.ScriptThread.WORKER).cost(7));
+        assertEquals(io.velora.api.function.ScriptThread.WORKER, api.find("worker", "value").thread());
+        assertEquals(7, api.find("worker", "value").cost());
+    }
+
+    @Test
+    void workerBindingsActuallyExecuteThroughWorkerExecutor() {
+        int[] executions = {0};
+        api.namespace("worker", ns -> ns.suspendFunction("value", VeloraTypes.INT, p -> {}, ctx -> 42)
+                .thread(io.velora.api.function.ScriptThread.WORKER));
+        api.freeze();
+        CompiledModule module = compile("@Script(name=\"WorkerT\", version=\"1\")\nscript WorkerT { async int answer() { return worker.value() } }");
+        WorkerExecutor workers = new WorkerExecutor() {
+            @Override public void execute(Runnable action) { executions[0]++; action.run(); }
+            @Override public void shutdown() {}
+        };
+        ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), api, new RuntimeErrorStore(10), workers);
+        ScriptFiber fiber = scheduler.spawnFiber("WorkerT", module.functionByName("answer").index(), new ScriptValue[0]);
+        scheduler.tick(System.nanoTime(), Map.of("WorkerT", module), Map.of("WorkerT", List.of()));
+        assertEquals(1, executions[0]);
+        assertEquals(42, ((Number) fiber.result().boxed()).intValue());
+    }
+
+    @Test
+    void eventDescriptorsAreValidatedAtCompileTimeAndContributePermissions() {
+        List<String> output = new ArrayList<>();
+        var events = new io.velora.internal.event.DefaultEventRegistry(host(output));
+        var permission = io.velora.api.permission.ScriptPermission.of("client.events.tick", "Tick", "Tick events");
+        permissions.register(permission);
+        events.register(io.velora.api.event.EventDescriptor.builder("client.tick")
+                .scriptName("ClientTick").payloadType(VeloraTypes.INT).permission(permission).build());
+        DefaultScriptCompiler compiler = new DefaultScriptCompiler(types, settings, api, constants, permissions, events);
+        CompileResult good = compiler.compile(CompileRequest.builder("EventT").source("main.vls",
+                "@Script(name=\"EventT\", version=\"1\")\nscript EventT { event ClientTick(int value) { } }").build());
+        assertTrue(good.success(), "Diagnostics: " + good.diagnostics());
+        CompiledModule module = compiler.compileToModule(CompileRequest.builder("EventT").source("main.vls",
+                "@Script(name=\"EventT\", version=\"1\")\nscript EventT { event ClientTick(int value) { } }").build());
+        assertTrue(module.requiredPermissions().contains(permission));
+        CompileResult bad = compiler.compile(CompileRequest.builder("BadEventT").source("main.vls",
+                "@Script(name=\"BadEventT\", version=\"1\")\nscript BadEventT { event ClientTick(String value) { } }").build());
+        assertFalse(bad.success());
+        assertTrue(bad.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_TYPE_MISMATCH));
+    }
+
+    @Test
+    void languageServiceCompletesAndDescribesRegisteredBindings() {
+        api.namespace("client", ns -> ns.function("move", VeloraTypes.INT, p -> p.required("distance", VeloraTypes.INT), ctx -> 1)
+                .description("Moves the client").categoryId("client"));
+        var language = new io.velora.internal.language.DefaultLanguageService(api, types, null, settings, constants);
+        var editor = language.openEditor("T", "main.vls");
+        editor.updateText("script T { int answer() { return client.mo } }");
+        assertTrue(editor.completions(1, 43).stream().anyMatch(item -> item.label().equals("move")));
+        editor.updateText("script T { int answer() { return client.move(1) } }");
+        assertTrue(editor.signatureHelp(1, 47).orElseThrow().parameters().stream().anyMatch(parameter -> parameter.name().equals("distance")));
+        assertTrue(editor.hover(1, 41).orElseThrow().content().contains("Moves the client"));
+        language.close();
+    }
+
+    @Test
+    void compilerRejectsUnsafeAndDuplicatePathsAndHashesSourcesDeterministically() {
+        DefaultScriptCompiler compiler = compiler();
+        String main = "@Script(name=\"Multi\", version=\"1\")\nscript Multi { int answer() { return helper() } }";
+        String helper = "int helper() { return 42 }";
+        CompileResult traversal = compiler.compile(CompileRequest.builder("Multi").source("../main.vls", main).build());
+        assertFalse(traversal.success());
+        assertTrue(traversal.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.COMPILER_PATH_TRAVERSAL));
+        CompileResult duplicate = compiler.compile(CompileRequest.builder("Multi").source("src/main.vls", main).source("src/./main.vls", helper).build());
+        assertFalse(duplicate.success());
+        CompileResult first = compiler.compile(CompileRequest.builder("MultiA").source("z/helper.vls", helper).source("a/main.vls", main).build());
+        CompileResult second = compiler.compile(CompileRequest.builder("MultiB").source("a/main.vls", main).source("z/helper.vls", helper).build());
+        assertTrue(first.success());
+        assertTrue(second.success());
+        assertEquals(first.sourceHash(), second.sourceHash());
+    }
+
+    @Test
+    void invalidAnnotationPlacementAndMetadataAreRejected() {
+        ParseResult misplaced = Parser.parse("@Script(name=\"T\", version=\"1\")\nscript T { @Unknown int answer() { return 1 } }", "main.vls");
+        assertTrue(misplaced.diagnostics().stream().anyMatch(Diagnostic::isError));
+        List<Diagnostic> metadata = semanticDiagnostics("@Script(name=\"T\", version=\"1\", unknown=\"x\")\nscript T { int answer() { return 1 } }");
+        assertTrue(metadata.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_INVALID_ARGUMENT));
+    }
+
+    @Test
+    void elvisTypingAndUnknownMembersAreValidated() {
+        CompiledModule module = compile("@Script(name=\"ElvisT\", version=\"1\")\nscript ElvisT { int answer() { String? value = null\n return (value ?: \"ok\").length } }");
+        VmExecutionResult result = execute(module);
+        assertTrue(result.success());
+        assertEquals(2, ((Number) result.returnValue().boxed()).intValue());
+        List<Diagnostic> incompatible = semanticDiagnostics("@Script(name=\"BadElvis\", version=\"1\")\nscript BadElvis { int answer() { String? value = null\n return value ?: 1 } }");
+        assertTrue(incompatible.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_TYPE_MISMATCH));
+        List<Diagnostic> member = semanticDiagnostics("@Script(name=\"BadMember\", version=\"1\")\nscript BadMember { int answer() { String value = \"x\"\n return value.lenght } }");
+        assertTrue(member.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL));
+    }
+
+    @Test
+    void bindingContextConvertsNumericWrappersAndNamedTypedArguments() {
+        @VeloraNamespace("numbers")
+        class Binding {
+            @VeloraFunction(name = "echo") public Long echo(Long value) { return value; }
+        }
+        api.registerAnnotated(new Binding());
+        CompiledModule module = compile("@Script(name=\"NumberBinding\", version=\"1\")\nscript NumberBinding { long answer() { return numbers.echo(42) } }");
+        VmExecutionResult result = execute(module);
+        assertTrue(result.success(), String.valueOf(result.error()));
+        assertEquals(42L, ((Number) result.returnValue().boxed()).longValue());
+        api.namespace("named", ns -> ns.function("read", VeloraTypes.LONG, p -> p.required("value", VeloraTypes.LONG), ctx -> ctx.argument("value", Long.class)));
+        CompiledModule named = compile("@Script(name=\"NamedBinding\", version=\"1\")\nscript NamedBinding { long answer() { return named.read(42) } }");
+        VmExecutionResult namedResult = execute(named);
+        assertTrue(namedResult.success(), String.valueOf(namedResult.error()));
+        assertEquals(42L, ((Number) namedResult.returnValue().boxed()).longValue());
+    }
+
+    @Test
+    void hostDefaultsAreTypedValidatedAndExecutable() {
+        UUID id = UUID.fromString("123e4567-e89b-12d3-a456-426614174000");
+        api.namespace("defaults", ns -> ns
+                .function("duration", VeloraTypes.LONG, p -> p.optional("value", VeloraTypes.DURATION, Duration.ofSeconds(2)), ctx -> ctx.argument("value", Duration.class).toNanos())
+                .function("uuid", VeloraTypes.STRING, p -> p.optional("value", VeloraTypes.UUID, id), ctx -> ctx.argument("value", UUID.class).toString()));
+        CompiledModule duration = compile("@Script(name=\"DefaultsDuration\", version=\"1\")\nscript DefaultsDuration { long answer() { return defaults.duration() } }");
+        VmExecutionResult durationResult = execute(duration);
+        assertTrue(durationResult.success(), String.valueOf(durationResult.error()));
+        assertEquals(Duration.ofSeconds(2).toNanos(), ((Number) durationResult.returnValue().boxed()).longValue());
+        CompiledModule uuid = compile("@Script(name=\"DefaultsUuid\", version=\"1\")\nscript DefaultsUuid { String answer() { return defaults.uuid() } }");
+        VmExecutionResult uuidResult = execute(uuid);
+        assertTrue(uuidResult.success(), String.valueOf(uuidResult.error()));
+        assertEquals(id.toString(), uuidResult.returnValue().boxed());
+        assertThrows(IllegalArgumentException.class, () -> api.namespace("invalidDefaults", ns -> ns.function("bad", VeloraTypes.INT,
+                p -> p.optional("optional", VeloraTypes.INT, 1).required("required", VeloraTypes.INT), ctx -> 0)));
+        assertThrows(IllegalArgumentException.class, () -> api.namespace("invalidCharDefault", ns -> ns.function("bad", VeloraTypes.CHAR,
+                p -> p.optional("value", VeloraTypes.CHAR, 'x'), ctx -> ctx.argument(0))));
+    }
+
+    @Test
+    void failedExtensionsRollbackEveryMutableRegistry() {
+        VeloraEngine engine = Velora.builder().host(host(new ArrayList<>())).build();
+        engine.extensions().register(new io.velora.api.VeloraExtension() {
+            @Override public String id() { return "broken"; }
+            @Override public String version() { return "1"; }
+            @Override public void register(io.velora.api.VeloraExtensionContext context) {
+                context.types().handle("TemporaryType", Object.class);
+                context.settings().register(io.velora.api.setting.SettingKind.named("TemporarySetting").resultType(VeloraTypes.INT).build());
+                context.constants().register("Temporary", "VALUE", VeloraTypes.INT, 1);
+                context.permissions().register(io.velora.api.permission.ScriptPermission.of("temporary.permission", "Temporary", "Temporary"));
+                context.api().namespace("temporary", ns -> ns.function("value", VeloraTypes.INT, ctx -> 1));
+                context.events().register(io.velora.api.event.EventDescriptor.builder("temporary.event").scriptName("TemporaryEvent").payloadType(VeloraTypes.UNIT).build());
+                throw new IllegalStateException("boom");
+            }
+        });
+        assertThrows(IllegalStateException.class, engine::freeze);
+        assertNull(engine.types().find("TemporaryType"));
+        assertNull(engine.settings().find("TemporarySetting"));
+        assertNull(engine.constants().find("Temporary", "VALUE"));
+        assertNull(engine.permissions().find("temporary.permission"));
+        assertNull(engine.api().find("temporary", "value"));
+        assertNull(engine.events().find("temporary.event"));
+    }
+
+    @Test
+    void registriesAndTypeBuildersRejectAmbiguousDuplicateEntries() {
+        constants.register("Answers", "VALUE", VeloraTypes.INT, 1);
+        assertThrows(IllegalStateException.class, () -> constants.register("Answers", "VALUE", VeloraTypes.INT, 2));
+        assertEquals(1, constants.all().size());
+        var kind = io.velora.api.setting.SettingKind.named("SingleKind").resultType(VeloraTypes.INT).build();
+        settings.register(kind);
+        assertThrows(IllegalStateException.class, () -> settings.register(kind));
+        var permission = io.velora.api.permission.ScriptPermission.of("single.permission", "Single", "Single");
+        permissions.register(permission);
+        assertThrows(IllegalStateException.class, () -> permissions.register(permission));
+        assertThrows(IllegalArgumentException.class, () -> types.handle("bad.type", Object.class));
+        assertThrows(IllegalArgumentException.class, () -> types.struct("BrokenStruct", Object.class, b -> b
+                .property("value", VeloraTypes.INT, ignored -> 1)
+                .property("value", VeloraTypes.INT, ignored -> 2)));
+        assertThrows(IllegalArgumentException.class, () -> types.enumType("BrokenEnum", String.class, List.of(
+                new io.velora.api.type.EnumType.Constant("A", "a"),
+                new io.velora.api.type.EnumType.Constant("A", "b"))));
+    }
+
+    @Test
+    void payloadlessEventsNeedNoFakeParameterAndCannotReturnIgnoredValues() {
+        var events = new io.velora.internal.event.DefaultEventRegistry(host(new ArrayList<>()));
+        events.register(io.velora.api.event.EventDescriptor.builder("client.tick").scriptName("ClientTick").payloadType(VeloraTypes.UNIT).build());
+        events.register(io.velora.api.event.EventDescriptor.builder("client.value").scriptName("ClientValue").payloadType(VeloraTypes.INT).build());
+        DefaultScriptCompiler compiler = new DefaultScriptCompiler(types, settings, api, constants, permissions, events);
+        CompileResult good = compiler.compile(CompileRequest.builder("TickScript").source("main.vls",
+                "@Script(name=\"TickScript\", version=\"1\")\nscript TickScript { event ClientTick() { } }").build());
+        assertTrue(good.success(), "Diagnostics: " + good.diagnostics());
+        CompileResult ignoredReturn = compiler.compile(CompileRequest.builder("BadTickScript").source("main.vls",
+                "@Script(name=\"BadTickScript\", version=\"1\")\nscript BadTickScript { event ClientTick() { return false } }").build());
+        assertFalse(ignoredReturn.success());
+        assertTrue(ignoredReturn.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_VOID_RETURN_VALUE));
+        CompileResult missingPayload = compiler.compile(CompileRequest.builder("BadValueScript").source("main.vls",
+                "@Script(name=\"BadValueScript\", version=\"1\")\nscript BadValueScript { event ClientValue() { } }").build());
+        assertFalse(missingPayload.success());
+        assertTrue(missingPayload.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_WRONG_ARITY));
+    }
+
+    @Test
+    void scriptMetadataCannotAdvertiseUnsupportedOrConflictingRuntimeContracts() {
+        DefaultScriptCompiler compiler = compiler();
+        CompileResult language = compiler.compile(CompileRequest.builder("Meta").source("main.vls",
+                "@Script(name=\"Meta\", version=\"1\", languageVersion=2)\nscript Meta { int answer() { return 1 } }").build());
+        assertFalse(language.success());
+        assertTrue(language.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.COMPILER_UNSUPPORTED_VERSION));
+
+        CompileResult engine = compiler.compile(CompileRequest.builder("Meta").source("main.vls",
+                "@Script(name=\"Meta\", version=\"1\", minEngineVersion=\"99.0.0\")\nscript Meta { int answer() { return 1 } }").build());
+        assertFalse(engine.success());
+        assertTrue(engine.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.COMPILER_UNSUPPORTED_VERSION));
+
+        CompileResult id = compiler.compile(CompileRequest.builder("folder-id").source("main.vls",
+                "@Script(id=\"other-id\", name=\"Meta\", version=\"1\")\nscript Meta { int answer() { return 1 } }").build());
+        assertFalse(id.success());
+        assertTrue(id.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_INVALID_ARGUMENT));
+
+        CompileResult website = compiler.compile(CompileRequest.builder("Meta").source("main.vls",
+                "@Script(name=\"Meta\", version=\"1\", website=\"https://example.com\")\nscript Meta { int answer() { return 1 } }").build());
+        assertFalse(website.success());
+        assertTrue(website.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_INVALID_ARGUMENT));
+    }
+
+    @Test
+    void annotatedBindingsCanDisambiguateBuiltInVectorAndColorTypes() {
+        @VeloraNamespace("typed")
+        class Binding {
+            @VeloraFunction(name = "vec3", returnType = "Vec3")
+            public double[] vec3() { return new double[]{3.0, 4.0, 5.0}; }
+
+            @VeloraProperty(name = "color", returnType = "Color")
+            public int[] color() { return new int[]{10, 20, 30, 40}; }
+
+            @VeloraFunction(name = "sum")
+            public int sum(@io.velora.binding.annotation.VeloraParam(value = "point", type = "Vec3") double[] point,
+                           @io.velora.binding.annotation.VeloraParam(value = "color", type = "Color") int[] color) {
+                return (int) (point[0] + point[1] + point[2]) + color[0] + color[3];
+            }
+        }
+        api.registerAnnotated(new Binding());
+        CompiledModule module = compile("@Script(name=\"TypedBinding\", version=\"1\")\nscript TypedBinding { int answer() { Vec3 point = typed.vec3()\n Color color = typed.color\n return typed.sum(point, color) } }");
+        VmExecutionResult result = execute(module);
+        assertTrue(result.success(), String.valueOf(result.error()));
+        assertEquals(62, ((Number) result.returnValue().boxed()).intValue());
     }
 
     private CompiledModule withFunction(CompiledModule base, CompiledFunction function) {

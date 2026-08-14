@@ -117,7 +117,22 @@ public final class SettingKind {
 
         public SettingKind build() {
             Objects.requireNonNull(name, "name");
+            if (!isIdentifier(name)) throw new IllegalArgumentException("Setting kind name must be a script identifier: " + name);
+            if ((resultType == null) == (resultTypeResolver == null)) throw new IllegalStateException("SettingKind " + name + " must declare exactly one result type or resolver");
+            java.util.Set<String> names = new java.util.HashSet<>();
+            for (Parameter parameter : parameterSchema) {
+                if (!names.add(parameter.name())) throw new IllegalArgumentException("Duplicate setting parameter: " + parameter.name());
+            }
             return new SettingKind(this);
+        }
+
+        private boolean isIdentifier(String value) {
+            if (value.isEmpty() || !(Character.isLetter(value.charAt(0)) || value.charAt(0) == '_')) return false;
+            for (int i = 1; i < value.length(); i++) {
+                char c = value.charAt(i);
+                if (!Character.isLetterOrDigit(c) && c != '_') return false;
+            }
+            return true;
         }
     }
 }

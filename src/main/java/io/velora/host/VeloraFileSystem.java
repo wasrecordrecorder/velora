@@ -1,8 +1,13 @@
 package io.velora.host;
 
+import java.nio.file.Path;
 import java.util.List;
 
 public interface VeloraFileSystem {
+    static VeloraFileSystem local(Path root) {
+        return new LocalVeloraFileSystem(root);
+    }
+
     List<ScriptFileEntry> listScripts();
 
     SourceSnapshot readSource(String scriptId, String relativePath);

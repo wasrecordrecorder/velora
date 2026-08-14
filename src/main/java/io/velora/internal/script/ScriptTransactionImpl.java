@@ -5,26 +5,44 @@ import io.velora.api.compiler.CompileRequest;
 import io.velora.api.compiler.CompileResult;
 import io.velora.api.compiler.ScriptCompiler;
 import io.velora.api.compiler.SourceFile;
-import io.velora.api.script.*;
+import io.velora.api.script.ScriptOperationResult;
+import io.velora.api.script.ScriptServiceEvents;
+import io.velora.api.script.ScriptTransaction;
+import io.velora.api.script.ScriptTransactionResult;
 import io.velora.api.setting.SettingDescriptor;
 import io.velora.api.setting.SettingSchema;
 import io.velora.api.setting.SettingValue;
-import io.velora.api.type.VeloraType;
-import io.velora.api.type.VeloraTypes;
-import io.velora.host.VeloraHost;
-import io.velora.host.SourceSnapshot;
 import io.velora.host.FileRevision;
 import io.velora.host.FileTransaction;
+import io.velora.host.SourceSnapshot;
+import io.velora.host.VeloraFileSystem;
+import io.velora.host.VeloraHost;
+import io.velora.internal.persistence.SettingsFileCodec;
+import io.velora.internal.setting.SettingStore;
+import io.velora.internal.setting.SettingValidator;
 
-import java.util.*;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 public final class ScriptTransactionImpl implements ScriptTransaction {
     private final String scriptId;
     private final ScriptCompiler compiler;
     private final VeloraHost host;
     private final SettingSchema settingSchema;
-    private final java.util.function.Consumer<ScriptServiceEvents.ScriptServiceEvent> eventFireCallback;
-    private final io.velora.internal.setting.SettingStore settingStore;
+    private final Consumer<ScriptServiceEvents.ScriptServiceEvent> eventFireCallback;
+    private final SettingStore settingStore;
+    private final long baseRevision;
+    private final Runnable sourceRefresh;
+    private final Supplier<ScriptOperationResult> reloadCallback;
     private long expectedRevision = -1;
     private final Map<String, String> writes = new LinkedHashMap<>();
     private final Map<String, String> expectedRevisions = new LinkedHashMap<>();
@@ -32,248 +50,294 @@ public final class ScriptTransactionImpl implements ScriptTransaction {
     private final Set<String> deletes = new LinkedHashSet<>();
 
     public ScriptTransactionImpl(String scriptId, ScriptCompiler compiler) {
-        this(scriptId, compiler, null, null, null, null);
+        this(scriptId, compiler, null, null, null, null, -1, null, null);
     }
 
     public ScriptTransactionImpl(String scriptId, ScriptCompiler compiler, VeloraHost host) {
-        this(scriptId, compiler, host, null, null, null);
+        this(scriptId, compiler, host, null, null, null, -1, null, null);
     }
 
     public ScriptTransactionImpl(String scriptId, ScriptCompiler compiler, VeloraHost host,
-                                  SettingSchema settingSchema, java.util.function.Consumer<ScriptServiceEvents.ScriptServiceEvent> eventFireCallback) {
-        this(scriptId, compiler, host, settingSchema, eventFireCallback, null);
+                                 SettingSchema settingSchema, Consumer<ScriptServiceEvents.ScriptServiceEvent> eventFireCallback) {
+        this(scriptId, compiler, host, settingSchema, eventFireCallback, null, -1, null, null);
     }
 
     public ScriptTransactionImpl(String scriptId, ScriptCompiler compiler, VeloraHost host,
-                                  SettingSchema settingSchema, java.util.function.Consumer<ScriptServiceEvents.ScriptServiceEvent> eventFireCallback,
-                                  io.velora.internal.setting.SettingStore settingStore) {
-        this.scriptId = scriptId;
-        this.compiler = compiler;
+                                 SettingSchema settingSchema, Consumer<ScriptServiceEvents.ScriptServiceEvent> eventFireCallback,
+                                 SettingStore settingStore) {
+        this(scriptId, compiler, host, settingSchema, eventFireCallback, settingStore, -1, null, null);
+    }
+
+    public ScriptTransactionImpl(String scriptId, ScriptCompiler compiler, VeloraHost host,
+                                 SettingSchema settingSchema, Consumer<ScriptServiceEvents.ScriptServiceEvent> eventFireCallback,
+                                 SettingStore settingStore, long baseRevision, Runnable sourceRefresh,
+                                 Supplier<ScriptOperationResult> reloadCallback) {
+        this.scriptId = Objects.requireNonNull(scriptId);
+        this.compiler = Objects.requireNonNull(compiler);
         this.host = host;
         this.settingSchema = settingSchema;
         this.eventFireCallback = eventFireCallback;
         this.settingStore = settingStore;
+        this.baseRevision = baseRevision;
+        this.sourceRefresh = sourceRefresh;
+        this.reloadCallback = reloadCallback;
     }
 
     @Override
     public ScriptTransaction expectRevision(long revisionNumber) {
-        this.expectedRevision = revisionNumber;
+        if (revisionNumber < 0) throw new IllegalArgumentException("Revision must be non-negative");
+        expectedRevision = revisionNumber;
         return this;
     }
 
     @Override
     public ScriptTransaction write(String relativePath, String content, String expectedFileRevision) {
-        writes.put(relativePath, content);
-        if (expectedFileRevision != null) {
-            expectedRevisions.put(relativePath, expectedFileRevision);
-        }
+        String path = normalizePath(relativePath);
+        Objects.requireNonNull(content, "content");
+        writes.put(path, content);
+        deletes.remove(path);
+        if (expectedFileRevision != null) expectedRevisions.put(path, expectedFileRevision);
+        else expectedRevisions.remove(path);
         return this;
     }
 
     @Override
     public ScriptTransaction updateSetting(String settingId, SettingValue value) {
-        settingUpdates.put(settingId, value);
+        settingUpdates.put(Objects.requireNonNull(settingId), Objects.requireNonNull(value));
         return this;
     }
 
     @Override
     public ScriptTransaction delete(String relativePath) {
-        deletes.add(relativePath);
+        String path = normalizePath(relativePath);
+        deletes.add(path);
+        writes.remove(path);
+        expectedRevisions.remove(path);
         return this;
     }
 
     @Override
     public ScriptTransactionResult validateAndCommit(CommitMode mode) {
-        if (mode == CommitMode.VALIDATE_ONLY) {
-            for (Map.Entry<String, String> entry : writes.entrySet()) {
-                CompileResult result = compileEntry(entry.getKey(), entry.getValue());
-                if (!result.success()) {
-                    return ScriptTransactionResult.failure(scriptId, result.diagnostics().toString());
+        Objects.requireNonNull(mode, "mode");
+        VeloraFileSystem fs = host != null ? host.fileSystem() : null;
+
+        ScriptTransactionResult revisionCheck = validateRevisions(fs);
+        if (revisionCheck != null) return revisionCheck;
+
+        CompileResult compilation = validateSources(fs);
+        if (compilation != null && !compilation.success()) {
+            return ScriptTransactionResult.conflict(scriptId, ConflictReason.COMPILE_ERROR, compilation.diagnostics().toString());
+        }
+        if (!validateSettings()) {
+            return ScriptTransactionResult.conflict(scriptId, ConflictReason.SETTING_MIGRATION_CONFLICT, "Setting validation failed");
+        }
+        if (mode == CommitMode.VALIDATE_ONLY) return ScriptTransactionResult.success(scriptId);
+        if ((!writes.isEmpty() || !deletes.isEmpty()) && fs == null) {
+            return ScriptTransactionResult.failure(scriptId, "File system is unavailable");
+        }
+
+        Map<String, SourceSnapshot> sourceSnapshot = fs != null ? snapshotSources(fs) : Map.of();
+        Map<String, SettingValue> settingsSnapshot = settingStore != null ? settingStore.snapshot() : Map.of();
+
+        try {
+            if (fs != null && (!writes.isEmpty() || !deletes.isEmpty())) {
+                ScriptTransactionResult commitResult = commitSources(fs);
+                if (commitResult != null) return commitResult;
+                refreshSources();
+            }
+            applySettings();
+            persistSettings();
+
+            if (mode == CommitMode.RELOAD_IF_VALID && reloadCallback != null) {
+                ScriptOperationResult reload = reloadCallback.get();
+                if (reload == null || !reload.success()) {
+                    restore(fs, sourceSnapshot, settingsSnapshot);
+                    fire(ScriptServiceEvents.Type.ROLLED_BACK, reload != null ? reload.message() : "Reload failed");
+                    return ScriptTransactionResult.conflict(scriptId, ConflictReason.ACTIVATION_ERROR,
+                            reload != null ? reload.message() : "Reload failed");
                 }
             }
-            if (!validateSettings()) {
-                return ScriptTransactionResult.failure(scriptId, "Setting validation failed");
-            }
+
+            if (!writes.isEmpty() || !deletes.isEmpty()) fire(ScriptServiceEvents.Type.SOURCE_CHANGED, null);
+            if (!settingUpdates.isEmpty()) fire(ScriptServiceEvents.Type.SETTINGS_CHANGED, null);
             return ScriptTransactionResult.success(scriptId);
+        } catch (Throwable t) {
+            restore(fs, sourceSnapshot, settingsSnapshot);
+            fire(ScriptServiceEvents.Type.ROLLED_BACK, t.getMessage());
+            return ScriptTransactionResult.failure(scriptId, message(t));
         }
+    }
 
-        if (mode == CommitMode.RELOAD_IF_VALID) {
-            return reloadIfValid();
+    private ScriptTransactionResult validateRevisions(VeloraFileSystem fs) {
+        if (expectedRevision >= 0 && baseRevision >= 0 && expectedRevision != baseRevision) {
+            return ScriptTransactionResult.conflict(scriptId, ConflictReason.SOURCE_REVISION_CONFLICT,
+                    "Expected script revision " + expectedRevision + ", current revision is " + baseRevision);
         }
-
-        // COMMIT_WITHOUT_RELOAD and VALIDATE_AND_COMMIT
-        if (host == null || host.fileSystem() == null) {
-            for (Map.Entry<String, String> entry : writes.entrySet()) {
-                CompileResult result = compileEntry(entry.getKey(), entry.getValue());
-                if (!result.success()) {
-                    return ScriptTransactionResult.failure(scriptId, result.diagnostics().toString());
-                }
-            }
-            if (!validateSettings()) {
-                return ScriptTransactionResult.failure(scriptId, "Setting validation failed");
-            }
-            try {
-                fireSettingsChangedIfNeeded();
-            } catch (Throwable t) {
-                return ScriptTransactionResult.failure(scriptId, t.getMessage());
-            }
-            return ScriptTransactionResult.success(scriptId);
-        }
-
-        var fs = host.fileSystem();
-
+        if (fs == null) return null;
         for (Map.Entry<String, String> entry : expectedRevisions.entrySet()) {
             SourceSnapshot current = fs.readSource(scriptId, entry.getKey());
-            if (current != null && !current.revision().revisionHash().equals(entry.getValue())) {
-                return ScriptTransactionResult.failure(scriptId, "Stale revision for " + entry.getKey());
+            if (current == null || !Objects.equals(current.revision().revisionHash(), entry.getValue())) {
+                return ScriptTransactionResult.conflict(scriptId, ConflictReason.SOURCE_REVISION_CONFLICT,
+                        "Stale revision for " + entry.getKey());
             }
         }
-
-        for (Map.Entry<String, String> entry : writes.entrySet()) {
-            CompileResult result = compileEntry(entry.getKey(), entry.getValue());
-            if (!result.success()) {
-                return ScriptTransactionResult.failure(scriptId, result.diagnostics().toString());
-            }
-        }
-
-        if (!validateSettings()) {
-            return ScriptTransactionResult.failure(scriptId, "Setting validation failed");
-        }
-
-        FileTransaction fileTx = fs.beginTransaction(scriptId);
-        try {
-            for (Map.Entry<String, String> entry : writes.entrySet()) {
-                SourceSnapshot current = fs.readSource(scriptId, entry.getKey());
-                FileRevision expected = current != null ? current.revision() : null;
-                fileTx.write(entry.getKey(), entry.getValue(), expected);
-            }
-            for (String path : deletes) {
-                fileTx.delete(path);
-            }
-            if (!fileTx.commit()) {
-                fileTx.rollback();
-                return ScriptTransactionResult.failure(scriptId, "Commit failed");
-            }
-        } catch (Throwable t) {
-            fileTx.rollback();
-            return ScriptTransactionResult.failure(scriptId, t.getMessage());
-        }
-
-        try {
-            fireSettingsChangedIfNeeded();
-        } catch (Throwable t) {
-            return ScriptTransactionResult.failure(scriptId, t.getMessage());
-        }
-        return ScriptTransactionResult.success(scriptId);
+        return null;
     }
 
-    private ScriptTransactionResult reloadIfValid() {
-        var fs = host != null ? host.fileSystem() : null;
-
-        // Check stale revision
+    private CompileResult validateSources(VeloraFileSystem fs) {
+        if (writes.isEmpty() && deletes.isEmpty()) return null;
+        Map<String, String> candidate = new LinkedHashMap<>();
         if (fs != null) {
-            for (Map.Entry<String, String> entry : expectedRevisions.entrySet()) {
-                SourceSnapshot current = fs.readSource(scriptId, entry.getKey());
-                if (current != null && !current.revision().revisionHash().equals(entry.getValue())) {
-                    if (expectedRevision >= 0) {
-                        // expectRevision() was called — hard stale check, don't apply write
-                        return ScriptTransactionResult.failure(scriptId, "Stale revision for " + entry.getKey());
-                    } else {
-                        // expectRevision() NOT called — soft stale check, apply write anyway
-                        applyWrites(fs);
-                        return ScriptTransactionResult.failure(scriptId, "Stale revision for " + entry.getKey());
-                    }
-                }
+            for (var entry : fs.listScripts()) {
+                if (!scriptId.equals(entry.scriptId())) continue;
+                SourceSnapshot snapshot = fs.readSource(scriptId, entry.relativePath());
+                if (snapshot != null) candidate.put(normalizePath(entry.relativePath()), snapshot.content());
             }
         }
+        for (String path : deletes) candidate.remove(path);
+        candidate.putAll(writes);
 
-        // Validate settings
-        if (!validateSettings()) {
-            return ScriptTransactionResult.failure(scriptId, "Setting validation failed");
+        List<SourceFile> sources = candidate.entrySet().stream()
+                .filter(entry -> entry.getKey().endsWith(".vls"))
+                .sorted(Map.Entry.comparingByKey())
+                .map(entry -> new SourceFile(entry.getKey(), entry.getValue(), null))
+                .toList();
+        if (sources.isEmpty()) {
+            return compiler.compile(CompileRequest.builder(scriptId)
+                    .source("main.vls", "")
+                    .mode(CompileMode.FULL)
+                    .build());
         }
-
-        // Validate source — if invalid, DON'T apply write, return failure
-        for (Map.Entry<String, String> entry : writes.entrySet()) {
-            CompileResult result = compileEntry(entry.getKey(), entry.getValue());
-            if (!result.success()) {
-                return ScriptTransactionResult.failure(scriptId, result.diagnostics().toString());
-            }
-        }
-
-        // All valid — apply write
-        applyWrites(fs);
-        fireSettingsChangedIfNeeded();
-        return ScriptTransactionResult.success(scriptId);
+        return compiler.compile(CompileRequest.builder(scriptId).sources(sources).mode(CompileMode.FULL).build());
     }
 
-    private void applyWrites(io.velora.host.VeloraFileSystem fs) {
-        if (fs == null) return;
-        FileTransaction fileTx = fs.beginTransaction(scriptId);
+    private ScriptTransactionResult commitSources(VeloraFileSystem fs) {
+        FileTransaction tx = fs.beginTransaction(scriptId);
         try {
             for (Map.Entry<String, String> entry : writes.entrySet()) {
                 SourceSnapshot current = fs.readSource(scriptId, entry.getKey());
-                FileRevision expected = current != null ? current.revision() : null;
-                fileTx.write(entry.getKey(), entry.getValue(), expected);
+                tx.write(entry.getKey(), entry.getValue(), current != null ? current.revision() : null);
             }
             for (String path : deletes) {
-                fileTx.delete(path);
+                SourceSnapshot current = fs.readSource(scriptId, path);
+                if (current != null) tx.validateExpectedRevision(path, current.revision());
+                tx.delete(path);
             }
-            fileTx.commit();
+            if (!tx.commit()) {
+                tx.rollback();
+                return ScriptTransactionResult.failure(scriptId, "File transaction commit failed");
+            }
+            return null;
         } catch (Throwable t) {
-            fileTx.rollback();
+            tx.rollback();
+            return ScriptTransactionResult.failure(scriptId, message(t));
         }
     }
 
-    private void fireSettingsChangedIfNeeded() {
-        if (settingUpdates.isEmpty()) return;
-        if (settingStore != null) {
-            for (Map.Entry<String, SettingValue> entry : settingUpdates.entrySet()) {
-                settingStore.set(entry.getKey(), entry.getValue());
+    private Map<String, SourceSnapshot> snapshotSources(VeloraFileSystem fs) {
+        Map<String, SourceSnapshot> result = new LinkedHashMap<>();
+        for (var entry : fs.listScripts()) {
+            if (!scriptId.equals(entry.scriptId())) continue;
+            SourceSnapshot snapshot = fs.readSource(scriptId, entry.relativePath());
+            if (snapshot != null) result.put(normalizePath(entry.relativePath()), snapshot);
+        }
+        return result;
+    }
+
+    private void restore(VeloraFileSystem fs, Map<String, SourceSnapshot> sources, Map<String, SettingValue> settings) {
+        if (settingStore != null) settingStore.applySnapshot(settings);
+        if (fs != null && (!writes.isEmpty() || !deletes.isEmpty())) restoreSources(fs, sources);
+        try {
+            persistSettings();
+        } catch (Throwable t) {
+            logRollbackFailure("settings", t);
+        }
+        refreshSources();
+    }
+
+    private void restoreSources(VeloraFileSystem fs, Map<String, SourceSnapshot> sources) {
+        FileTransaction tx = fs.beginTransaction(scriptId);
+        try {
+            Map<String, SourceSnapshot> current = snapshotSources(fs);
+            for (Map.Entry<String, SourceSnapshot> entry : current.entrySet()) {
+                if (sources.containsKey(entry.getKey())) continue;
+                tx.validateExpectedRevision(entry.getKey(), entry.getValue().revision());
+                tx.delete(entry.getKey());
             }
+            for (Map.Entry<String, SourceSnapshot> entry : sources.entrySet()) {
+                SourceSnapshot now = current.get(entry.getKey());
+                tx.write(entry.getKey(), entry.getValue().content(), now != null ? now.revision() : null);
+            }
+            if (!tx.commit()) {
+                tx.rollback();
+                throw new IllegalStateException("Rollback file transaction failed");
+            }
+        } catch (Throwable t) {
+            tx.rollback();
+            logRollbackFailure("sources", t);
         }
-        persistSettings();
-        if (eventFireCallback != null) {
-            eventFireCallback.accept(ScriptServiceEvents.ScriptServiceEvent.of(
-                    ScriptServiceEvents.Type.SETTINGS_CHANGED, scriptId));
-        }
+    }
+
+    private void applySettings() {
+        if (settingUpdates.isEmpty()) return;
+        if (settingStore == null) throw new IllegalStateException("Setting store is unavailable");
+        for (Map.Entry<String, SettingValue> entry : settingUpdates.entrySet()) settingStore.set(entry.getKey(), entry.getValue());
     }
 
     private void persistSettings() {
-        if (host == null || host.fileSystem() == null || settingStore == null) return;
-        try {
-            var snapshot = settingStore.snapshot();
-            String encoded = io.velora.internal.persistence.SettingsFileCodec.encode(snapshot);
-            var fs = host.fileSystem();
-            fs.writeDataAtomic(scriptId, "settings.velora", encoded.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        } catch (Throwable t) {
-            if (host != null && host.logger() != null) {
-                host.logger().error("Failed to persist settings for " + scriptId + ": " + t.getMessage(), t);
-            }
-            throw new IllegalStateException("Settings persistence failed: " + t.getMessage(), t);
-        }
-    }
-
-    private CompileResult compileEntry(String path, String content) {
-        CompileRequest request = CompileRequest.builder(scriptId)
-                .source(path, content)
-                .mode(CompileMode.FULL)
-                .build();
-        return compiler.compile(request);
+        if (settingUpdates.isEmpty() || host == null || host.fileSystem() == null || settingStore == null) return;
+        String encoded = SettingsFileCodec.encode(settingStore.snapshot());
+        host.fileSystem().writeDataAtomic(scriptId, "settings.velora", encoded.getBytes(StandardCharsets.UTF_8));
     }
 
     private boolean validateSettings() {
         if (settingUpdates.isEmpty()) return true;
-        if (settingSchema == null) return false;
+        if (settingSchema == null || settingStore == null) return false;
         for (Map.Entry<String, SettingValue> entry : settingUpdates.entrySet()) {
             Optional<SettingDescriptor> descriptor = settingSchema.find(entry.getKey());
-            if (descriptor.isEmpty() || !io.velora.internal.setting.SettingValidator.validate(descriptor.get(), entry.getValue()).isValid()) return false;
+            if (descriptor.isEmpty() || !SettingValidator.validate(descriptor.get(), entry.getValue()).isValid()) return false;
         }
         return true;
     }
 
+    private void refreshSources() {
+        if (sourceRefresh != null) sourceRefresh.run();
+    }
+
+    private void fire(ScriptServiceEvents.Type type, String message) {
+        if (eventFireCallback == null) return;
+        eventFireCallback.accept(message == null
+                ? ScriptServiceEvents.ScriptServiceEvent.of(type, scriptId)
+                : ScriptServiceEvents.ScriptServiceEvent.of(type, scriptId, message));
+    }
+
+    private void logRollbackFailure(String target, Throwable t) {
+        if (host != null && host.logger() != null) host.logger().error("Failed to rollback " + target + " for " + scriptId + ": " + message(t), t);
+    }
+
+    private static String normalizePath(String path) {
+        Objects.requireNonNull(path, "relativePath");
+        String normalized = path.replace('\\', '/').trim();
+        if (normalized.isEmpty() || normalized.indexOf('\0') >= 0 || normalized.startsWith("/") || normalized.matches("^[A-Za-z]:.*")) {
+            throw new IllegalArgumentException("Invalid relative path: " + path);
+        }
+        List<String> parts = new ArrayList<>();
+        for (String part : normalized.split("/+")) {
+            if (part.isEmpty() || part.equals(".")) continue;
+            if (part.equals("..")) throw new IllegalArgumentException("Path traversal is not allowed: " + path);
+            parts.add(part);
+        }
+        if (parts.isEmpty()) throw new IllegalArgumentException("Invalid relative path: " + path);
+        return String.join("/", parts);
+    }
+
+    private static String message(Throwable t) {
+        return t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
+    }
+
     public String scriptId() { return scriptId; }
     public long expectedRevision() { return expectedRevision; }
-    public Map<String, String> writes() { return writes; }
-    public Map<String, SettingValue> settingUpdates() { return settingUpdates; }
-    public Set<String> deletes() { return deletes; }
+    public Map<String, String> writes() { return Map.copyOf(writes); }
+    public Map<String, SettingValue> settingUpdates() { return Map.copyOf(settingUpdates); }
+    public Set<String> deletes() { return Set.copyOf(deletes); }
 }

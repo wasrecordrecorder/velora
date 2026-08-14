@@ -34,18 +34,20 @@ public final class DefaultScriptManager implements ScriptManager {
     private final EnabledScriptsStore enabledScriptsStore;
     private final io.velora.api.debug.DebugService debugService;
     private final PermissionRegistry permissionRegistry;
+    private final ScriptTemplateRegistry templateRegistry;
 
     public DefaultScriptManager(ScriptScheduler scheduler, ScriptCompiler compiler) {
-        this(scheduler, compiler, null, null, null, null, null);
+        this(scheduler, compiler, null, null, null, null, null, null);
     }
 
     public DefaultScriptManager(ScriptScheduler scheduler, ScriptCompiler compiler, VeloraHost host) {
-        this(scheduler, compiler, host, null, null, null, null);
+        this(scheduler, compiler, host, null, null, null, null, null);
     }
 
     public DefaultScriptManager(ScriptScheduler scheduler, ScriptCompiler compiler, VeloraHost host,
                                 PermissionController permissionController, EnabledScriptsStore enabledScriptsStore,
-                                io.velora.api.debug.DebugService debugService, PermissionRegistry permissionRegistry) {
+                                io.velora.api.debug.DebugService debugService, PermissionRegistry permissionRegistry,
+                                ScriptTemplateRegistry templateRegistry) {
         this.scheduler = scheduler;
         this.compiler = compiler;
         this.host = host;
@@ -53,6 +55,7 @@ public final class DefaultScriptManager implements ScriptManager {
         this.enabledScriptsStore = enabledScriptsStore;
         this.debugService = debugService;
         this.permissionRegistry = permissionRegistry;
+        this.templateRegistry = templateRegistry;
     }
 
     @Override
@@ -65,6 +68,105 @@ public final class DefaultScriptManager implements ScriptManager {
         ScriptInstance instance = repository.get(scriptId);
         if (instance == null) return Optional.empty();
         return Optional.of(new ScriptHandleImpl(instance));
+    }
+
+    @Override
+    public ScriptOperationResult create(ScriptCreateRequest request) {
+        Objects.requireNonNull(request, "request");
+        String scriptId = request.scriptId();
+        if (host == null || host.fileSystem() == null) return ScriptOperationResult.failure(scriptId, "File system is unavailable");
+        if (repository.contains(scriptId) || host.fileSystem().scriptExists(scriptId)) return ScriptOperationResult.failure(scriptId, "Script already exists");
+
+        Map<String, String> files = new LinkedHashMap<>();
+        if (request.templateId() != null) {
+            if (templateRegistry == null) return ScriptOperationResult.failure(scriptId, "Script template registry is unavailable");
+            ScriptTemplate template = templateRegistry.find(request.templateId()).orElse(null);
+            if (template == null) return ScriptOperationResult.failure(scriptId, "Unknown script template: " + request.templateId());
+            files.putAll(template.files());
+        }
+        files.putAll(request.initialFiles());
+        if (files.isEmpty()) return ScriptOperationResult.failure(scriptId, "At least one .vls source file is required");
+
+        List<SourceFile> sources;
+        try {
+            sources = files.entrySet().stream().sorted(Map.Entry.comparingByKey()).map(entry -> new SourceFile(entry.getKey(), entry.getValue(), null)).toList();
+        } catch (RuntimeException error) {
+            return ScriptOperationResult.failure(scriptId, error.getMessage(), error);
+        }
+        CompileResult validation = compiler.compile(CompileRequest.builder(scriptId).sources(sources).mode(CompileMode.FULL).build());
+        if (!validation.success()) return ScriptOperationResult.failure(scriptId, validation.diagnostics().toString());
+
+        var fs = host.fileSystem();
+        var fileTx = fs.beginTransaction(scriptId);
+        try {
+            for (var entry : files.entrySet()) fileTx.write(entry.getKey(), entry.getValue(), null);
+            if (!fileTx.commit()) return ScriptOperationResult.failure(scriptId, "Failed to create script files");
+        } catch (Throwable error) {
+            fileTx.rollback();
+            return ScriptOperationResult.failure(scriptId, error.getMessage() != null ? error.getMessage() : error.getClass().getSimpleName(), error);
+        }
+
+        List<String> sourceFiles = files.keySet().stream().sorted().toList();
+        ScriptDescriptor descriptor = new ScriptDescriptor(scriptId, request.name(), "1.0.0", null, null, ScriptStatus.DISCOVERED, false,
+                sourceFiles, io.velora.api.permission.PermissionSet.empty(), null, 0, 0, 0);
+        ScriptInstance instance = ScriptInstanceFactory.create(scriptId, descriptor);
+        repository.register(instance);
+        loadGrants(scriptId);
+        compileInstance(instance);
+        if (instance.compiledModule() == null) {
+            repository.remove(scriptId);
+            fs.deleteScript(scriptId);
+            return ScriptOperationResult.failure(scriptId, "Compilation failed after script creation");
+        }
+
+        if (!request.initialSettings().isEmpty()) {
+            ScriptTransaction transaction = beginTransaction(scriptId);
+            for (var entry : request.initialSettings().entrySet()) {
+                SettingDescriptor setting = settings(scriptId).find(entry.getKey()).orElse(null);
+                if (setting == null) {
+                    repository.remove(scriptId);
+                    fs.deleteScript(scriptId);
+                    return ScriptOperationResult.failure(scriptId, "Unknown initial setting: " + entry.getKey());
+                }
+                transaction.updateSetting(entry.getKey(), io.velora.api.setting.SettingValue.of(setting.type(), entry.getValue()));
+            }
+            ScriptTransactionResult settingsResult = transaction.validateAndCommit(ScriptTransaction.CommitMode.COMMIT_WITHOUT_RELOAD);
+            if (!settingsResult.success()) {
+                repository.remove(scriptId);
+                fs.deleteScript(scriptId);
+                return ScriptOperationResult.failure(scriptId, settingsResult.message());
+            }
+        }
+
+        serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.CREATED, scriptId, instance.status()));
+        return ScriptOperationResult.success(scriptId, instance.status());
+    }
+
+    @Override
+    public ScriptOperationResult delete(String scriptId) {
+        Objects.requireNonNull(scriptId, "scriptId");
+        if (host == null || host.fileSystem() == null) return ScriptOperationResult.failure(scriptId, "File system is unavailable");
+        ScriptInstance instance = repository.get(scriptId);
+        boolean exists = instance != null || host.fileSystem().scriptExists(scriptId);
+        if (!exists) return ScriptOperationResult.failure(scriptId, "Script not found");
+
+        if (instance != null) {
+            if (instance.enabled()) {
+                ScriptOperationResult disabled = disable(scriptId);
+                if (!disabled.success()) return disabled;
+            }
+            ScriptOperationResult unloaded = unload(scriptId);
+            if (!unloaded.success()) return unloaded;
+        }
+        if (enabledScriptsStore != null) enabledScriptsStore.disable(scriptId);
+        grants.remove(scriptId);
+        try {
+            host.fileSystem().deleteScript(scriptId);
+        } catch (Throwable error) {
+            return ScriptOperationResult.failure(scriptId, error.getMessage() != null ? error.getMessage() : error.getClass().getSimpleName(), error);
+        }
+        serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.DELETED, scriptId, ScriptStatus.UNLOADED));
+        return ScriptOperationResult.success(scriptId, ScriptStatus.UNLOADED);
     }
 
     @Override
@@ -95,8 +197,8 @@ public final class DefaultScriptManager implements ScriptManager {
         serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.STATUS_CHANGED, scriptId, ScriptStatus.ENABLING));
         
         CompiledModule module = instance.compiledModule();
-        Map<String, CompiledModule> mods = Map.of(scriptId, module);
-        Map<String, List<io.velora.api.setting.SettingDescriptor>> sets = Map.of(scriptId, module.settings());
+        Map<String, CompiledModule> mods = schedulerModules();
+        Map<String, List<io.velora.api.setting.SettingDescriptor>> sets = schedulerSettings();
         if (instance.settingStore() != null) {
             scheduler.setSettingStore(scriptId, instance.settingStore());
         }
@@ -110,8 +212,17 @@ public final class DefaultScriptManager implements ScriptManager {
             }
         }
         
+        if (!runtime.start()) {
+            runtimes.remove(scriptId);
+            scheduler.stopScript(scriptId);
+            RuntimeException error = new RuntimeException("Unable to start script: runtime resource limit rejected ON_RUN");
+            instance.lastError(error);
+            instance.statusMachine().transition(ScriptStatus.FAILED);
+            if (enabledScriptsStore != null) enabledScriptsStore.disable(scriptId);
+            serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.RUNTIME_ERROR, scriptId, error.getMessage()));
+            return ScriptOperationResult.failure(scriptId, error.getMessage(), error);
+        }
         instance.statusMachine().transition(ScriptStatus.ENABLED);
-        runtime.start();
         if (enabledScriptsStore != null) enabledScriptsStore.enable(scriptId);
         serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.ENABLED, scriptId, ScriptStatus.ENABLED));
         return ScriptOperationResult.success(scriptId, ScriptStatus.ENABLED);
@@ -137,9 +248,7 @@ public final class DefaultScriptManager implements ScriptManager {
                 }
                 int fnIdx = findFunctionIndex(module, "ON_DISABLE");
                 if (fnIdx >= 0) {
-                    Map<String, CompiledModule> mods = Map.of(scriptId, module);
-                    Map<String, List<io.velora.api.setting.SettingDescriptor>> sets = Map.of(scriptId, module.settings());
-                    scheduler.spawnFiberAndAwait(instance.scriptId(), fnIdx, new ScriptValue[0], mods, sets);
+                    scheduler.spawnFiberAndAwait(instance.scriptId(), fnIdx, new ScriptValue[0], schedulerModules(), schedulerSettings());
                 }
             }
             runtime.stop();
@@ -166,56 +275,92 @@ public final class DefaultScriptManager implements ScriptManager {
     public ScriptOperationResult reload(String scriptId) {
         ScriptInstance instance = repository.get(scriptId);
         if (instance == null) return ScriptOperationResult.failure(scriptId, "Script not found");
+        CompiledModule candidate = compileModule(instance);
+        if (candidate == null) return ScriptOperationResult.failure(scriptId, "Compilation failed");
+
         boolean wasEnabled = instance.enabled();
-        if (wasEnabled) {
-            // Call ON_UNLOAD on the old module before disabling
-            CompiledModule oldModule = instance.compiledModule();
-            if (oldModule != null) {
-                int fnIdx = findFunctionIndex(oldModule, "ON_UNLOAD");
-                if (fnIdx >= 0) {
-                    Map<String, CompiledModule> mods = Map.of(scriptId, oldModule);
-                    Map<String, List<io.velora.api.setting.SettingDescriptor>> sets = Map.of(scriptId, oldModule.settings());
-                    if (instance.settingStore() != null) {
-                        scheduler.setSettingStore(scriptId, instance.settingStore());
-                    }
-                    scheduler.spawnFiberAndAwait(instance.scriptId(), fnIdx, new ScriptValue[0], mods, sets);
-                }
-            }
-            disable(scriptId);
+        if (wasEnabled && !hasPermissionGrant(scriptId, candidate.requiredPermissions())) {
+            return ScriptOperationResult.failure(scriptId, "Permission denied: reloaded script requires permissions that are not granted");
         }
-        
+
         CompiledModule oldModule = instance.compiledModule();
+        SettingStore oldSettings = instance.settingStore();
+        ScriptDescriptor oldDescriptor = instance.descriptor();
         long oldRevision = instance.revision();
-        ScriptRevision oldActiveRev = instance.descriptor().activeRevision();
-        
-        instance.statusMachine().transition(ScriptStatus.RELOADING);
-        compileInstance(instance);
-        
-        if (instance.compiledModule() == null || instance.compiledModule() == oldModule) {
-            instance.statusMachine().transition(ScriptStatus.LOADED);
-            if (wasEnabled && !instance.enabled()) enable(scriptId);
-            return ScriptOperationResult.failure(scriptId, "Compilation failed");
+
+        if (wasEnabled) {
+            ScriptOperationResult disabled = disable(scriptId);
+            if (!disabled.success()) {
+                if (!instance.enabled()) enable(scriptId);
+                return ScriptOperationResult.failure(scriptId, "Failed to disable current script before reload: " + disabled.message(), disabled.cause());
+            }
         }
-        
-        instance.revision(oldRevision + 1);
-        ScriptDescriptor d = instance.descriptor();
-        ScriptRevision rev = new ScriptRevision(scriptId, oldRevision + 1, instance.compiledModule().sourceHash(), System.nanoTime());
-        CompiledModule newModule = instance.compiledModule();
-        String name = newModule.scriptName() != null ? newModule.scriptName() : d.name();
-        String version = newModule.version() != null ? newModule.version() : d.version();
-        String author = newModule.author() != null ? newModule.author() : d.author();
-        String description = newModule.description() != null ? newModule.description() : d.description();
-        instance.descriptor(new ScriptDescriptor(
-            d.id(), name, version, author, description,
-            instance.status(), instance.enabled(),
-            d.sourceFiles(), d.permissions(), rev,
-            d.errorCount(), d.warningCount(), System.nanoTime()
-        ));
-        
+        if (oldModule != null) invokeLifecycle(instance, oldModule, "ON_UNLOAD");
+
+        instance.statusMachine().transition(ScriptStatus.RELOADING);
+        instance.compiledModule(candidate);
+        instance.settingStore(createSettingStore(candidate));
+        loadSettingsFromDisk(instance);
+        long newRevision = oldRevision + 1;
+        instance.revision(newRevision);
+        ScriptRevision revision = new ScriptRevision(scriptId, newRevision, candidate.sourceHash(), nanoTime());
+        instance.descriptor(descriptorForModule(oldDescriptor, candidate, revision, nanoTime()));
         instance.statusMachine().transition(ScriptStatus.LOADED);
-        if (wasEnabled && !instance.enabled()) enable(scriptId);
+
+        if (wasEnabled) {
+            ScriptOperationResult enabled = enable(scriptId);
+            if (!enabled.success()) {
+                instance.compiledModule(oldModule);
+                instance.settingStore(oldSettings);
+                instance.revision(oldRevision);
+                instance.descriptor(oldDescriptor);
+                instance.statusMachine().transition(ScriptStatus.LOADED);
+                ScriptOperationResult restored = enable(scriptId);
+                serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.ROLLED_BACK, scriptId, enabled.message()));
+                if (!restored.success()) return ScriptOperationResult.failure(scriptId, "Reload activation failed and previous runtime could not be restored: " + restored.message(), restored.cause());
+                return ScriptOperationResult.failure(scriptId, "Reload activation failed: " + enabled.message(), enabled.cause());
+            }
+        }
         serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.RELOADED, scriptId));
         return ScriptOperationResult.success(scriptId, instance.status());
+    }
+
+    private void invokeLifecycle(ScriptInstance instance, CompiledModule module, String hook) {
+        int functionIndex = findFunctionIndex(module, hook);
+        if (functionIndex < 0) return;
+        if (instance.settingStore() != null) scheduler.setSettingStore(instance.scriptId(), instance.settingStore());
+        scheduler.spawnFiberAndAwait(instance.scriptId(), functionIndex, new ScriptValue[0], schedulerModules(), schedulerSettings());
+    }
+
+    private Map<String, CompiledModule> schedulerModules() {
+        Map<String, CompiledModule> result = new HashMap<>();
+        for (ScriptInstance value : repository.all()) if (value.compiledModule() != null) result.put(value.scriptId(), value.compiledModule());
+        return result;
+    }
+
+    private Map<String, List<io.velora.api.setting.SettingDescriptor>> schedulerSettings() {
+        Map<String, List<io.velora.api.setting.SettingDescriptor>> result = new HashMap<>();
+        for (ScriptInstance value : repository.all()) if (value.compiledModule() != null) result.put(value.scriptId(), value.compiledModule().settings());
+        return result;
+    }
+
+    private SettingStore createSettingStore(CompiledModule module) {
+        List<SettingDescriptor> settingsList = new ArrayList<>(module.settings());
+        if (settingsList.isEmpty()) {
+            settingsList.add(new SettingDescriptor("enabled", "Enabled", VeloraTypes.BOOLEAN, Boolean.TRUE,
+                    null, "Whether the script is enabled", null, 0, false, false, false,
+                    null, List.of(), 0));
+        }
+        return new SettingStore(settingsList);
+    }
+
+    private ScriptDescriptor descriptorForModule(ScriptDescriptor current, CompiledModule module, ScriptRevision revision, long reloadTime) {
+        return new ScriptDescriptor(current.id(), module.scriptName() != null ? module.scriptName() : current.name(),
+                module.version() != null ? module.version() : current.version(),
+                module.author() != null ? module.author() : current.author(),
+                module.description() != null ? module.description() : current.description(),
+                ScriptStatus.LOADED, false, current.sourceFiles(), module.requiredPermissions(), revision,
+                current.errorCount(), current.warningCount(), reloadTime);
     }
 
     @Override
@@ -233,9 +378,7 @@ public final class DefaultScriptManager implements ScriptManager {
                 }
                 int fnIdx = findFunctionIndex(module, "ON_DISABLE");
                 if (fnIdx >= 0) {
-                    Map<String, CompiledModule> mods = Map.of(scriptId, module);
-                    Map<String, List<io.velora.api.setting.SettingDescriptor>> sets = Map.of(scriptId, module.settings());
-                    scheduler.spawnFiberAndAwait(instance.scriptId(), fnIdx, new ScriptValue[0], mods, sets);
+                    scheduler.spawnFiberAndAwait(instance.scriptId(), fnIdx, new ScriptValue[0], schedulerModules(), schedulerSettings());
                 }
             }
             runtime.stop();
@@ -248,11 +391,10 @@ public final class DefaultScriptManager implements ScriptManager {
             }
             int fnIdx = findFunctionIndex(module, "ON_UNLOAD");
             if (fnIdx >= 0) {
-                Map<String, CompiledModule> mods = Map.of(scriptId, module);
-                Map<String, List<io.velora.api.setting.SettingDescriptor>> sets = Map.of(scriptId, module.settings());
-                scheduler.spawnFiberAndAwait(instance.scriptId(), fnIdx, new ScriptValue[0], mods, sets);
+                scheduler.spawnFiberAndAwait(instance.scriptId(), fnIdx, new ScriptValue[0], schedulerModules(), schedulerSettings());
             }
         }
+        scheduler.cleanupScript(scriptId);
         instance.statusMachine().transition(ScriptStatus.UNLOADED);
         repository.remove(scriptId);
         runtimes.remove(scriptId);
@@ -284,11 +426,17 @@ public final class DefaultScriptManager implements ScriptManager {
     }
 
     @Override
+    public Map<String, io.velora.api.setting.SettingValue> settingValues(String scriptId) {
+        ScriptInstance instance = repository.get(scriptId);
+        return instance != null && instance.settingStore() != null ? Map.copyOf(instance.settingStore().snapshot()) : Map.of();
+    }
+
+    @Override
     public ScriptTransaction beginTransaction(String scriptId) {
         ScriptInstance instance = repository.get(scriptId);
-        SettingSchema schema = settings(scriptId);
-        io.velora.internal.setting.SettingStore store = instance != null ? instance.settingStore() : null;
-        return new ScriptTransactionImpl(scriptId, compiler, host, schema, serviceEvents::fire, store);
+        if (instance == null) throw new IllegalArgumentException("Script not found: " + scriptId);
+        return new ScriptTransactionImpl(scriptId, compiler, host, settings(scriptId), serviceEvents::fire,
+                instance.settingStore(), instance.revision(), () -> refreshSourceFiles(instance), () -> reload(scriptId));
     }
 
     @Override
@@ -300,50 +448,54 @@ public final class DefaultScriptManager implements ScriptManager {
     public void discover() {
         if (enabledScriptsStore != null) enabledScriptsStore.load();
         if (host == null || host.fileSystem() == null) return;
+        Map<String, List<ScriptFileEntry>> scripts = new LinkedHashMap<>();
         for (ScriptFileEntry entry : host.fileSystem().listScripts()) {
-            if (repository.get(entry.scriptId()) != null) continue;
-            ScriptDescriptor desc = new ScriptDescriptor(
-                    entry.scriptId(), entry.scriptId(), "1.0.0",
-                    null, null, ScriptStatus.DISCOVERED, false,
-                    List.of(entry.relativePath()),
-                    io.velora.api.permission.PermissionSet.empty(),
-                    null, 0, 0, 0
-            );
-            ScriptInstance instance = ScriptInstanceFactory.create(entry.scriptId(), desc);
+            scripts.computeIfAbsent(entry.scriptId(), ignored -> new ArrayList<>()).add(entry);
+        }
+        for (var entry : scripts.entrySet()) {
+            String scriptId = entry.getKey();
+            if (repository.get(scriptId) != null) continue;
+            List<String> sourceFiles = entry.getValue().stream().map(ScriptFileEntry::relativePath).distinct().sorted().toList();
+            ScriptDescriptor descriptor = new ScriptDescriptor(scriptId, scriptId, "1.0.0", null, null,
+                    ScriptStatus.DISCOVERED, false, sourceFiles, io.velora.api.permission.PermissionSet.empty(),
+                    null, 0, 0, 0);
+            ScriptInstance instance = ScriptInstanceFactory.create(scriptId, descriptor);
             repository.register(instance);
-            loadGrants(entry.scriptId());
-            serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.DISCOVERED, entry.scriptId()));
+            loadGrants(scriptId);
+            serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.DISCOVERED, scriptId));
             compileInstance(instance);
         }
     }
 
-    private void compileInstance(ScriptInstance instance) {
+    private void refreshSourceFiles(ScriptInstance instance) {
         if (host == null || host.fileSystem() == null) return;
-        if (!(compiler instanceof DefaultScriptCompiler)) return;
-        DefaultScriptCompiler defaultCompiler = (DefaultScriptCompiler) compiler;
-        var fs = host.fileSystem();
-        List<io.velora.api.compiler.SourceFile> sources = new ArrayList<>();
+        List<String> paths = host.fileSystem().listScripts().stream()
+                .filter(entry -> entry.scriptId().equals(instance.scriptId()))
+                .map(ScriptFileEntry::relativePath).distinct().sorted().toList();
+        ScriptDescriptor current = instance.descriptor();
+        instance.descriptor(new ScriptDescriptor(current.id(), current.name(), current.version(), current.author(), current.description(),
+                current.status(), current.enabled(), paths, current.permissions(), current.activeRevision(),
+                current.errorCount(), current.warningCount(), current.lastReloadTimeNanos()));
+    }
+
+    private CompiledModule compileModule(ScriptInstance instance) {
+        if (host == null || host.fileSystem() == null || !(compiler instanceof DefaultScriptCompiler defaultCompiler)) return null;
+        serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.COMPILE_STARTED, instance.scriptId()));
+        List<SourceFile> sources = new ArrayList<>();
         for (String path : instance.descriptor().sourceFiles()) {
-            SourceSnapshot snapshot = fs.readSource(instance.scriptId(), path);
-            if (snapshot != null) {
-                sources.add(new io.velora.api.compiler.SourceFile(path, snapshot.content(), snapshot.contentHash()));
-            }
+            SourceSnapshot snapshot = host.fileSystem().readSource(instance.scriptId(), path);
+            if (snapshot != null) sources.add(new SourceFile(path, snapshot.content(), snapshot.contentHash()));
         }
-        if (sources.isEmpty()) return;
-        CompileRequest request = CompileRequest.builder(instance.scriptId())
-                .sources(sources)
-                .mode(CompileMode.FULL)
-                .build();
-        CompiledModule module = defaultCompiler.compileToModule(request);
+        CompiledModule module = sources.isEmpty() ? null : defaultCompiler.compileToModule(CompileRequest.builder(instance.scriptId()).sources(sources).mode(CompileMode.FULL).build());
+        serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.COMPILE_FINISHED, instance.scriptId()));
+        return module;
+    }
+
+    private void compileInstance(ScriptInstance instance) {
+        CompiledModule module = compileModule(instance);
         if (module != null) {
             instance.compiledModule(module);
-            List<SettingDescriptor> settingsList = new ArrayList<>(module.settings());
-            if (settingsList.isEmpty()) {
-                settingsList.add(new SettingDescriptor("enabled", "Enabled", VeloraTypes.BOOLEAN, Boolean.TRUE,
-                    null, "Whether the script is enabled", null, 0, false, false, false,
-                    null, List.of(), 0));
-            }
-            instance.settingStore(new SettingStore(settingsList));
+            instance.settingStore(createSettingStore(module));
             instance.revision(1);
             loadSettingsFromDisk(instance);
             instance.statusMachine().transition(ScriptStatus.LOADED);
@@ -359,12 +511,6 @@ public final class DefaultScriptManager implements ScriptManager {
                 d.sourceFiles(), module.requiredPermissions(), rev,
                 d.errorCount(), d.warningCount(), d.lastReloadTimeNanos()
             ));
-            serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.COMPILE_FINISHED, instance.scriptId()));
-            if (module.lifecycleHooks().contains("ON_LOAD")
-                && !module.lifecycleHooks().contains("ON_ENABLE")
-                && instance.status() != ScriptStatus.RELOADING) {
-                enable(instance.scriptId());
-            }
         }
     }
 
@@ -492,6 +638,10 @@ public final class DefaultScriptManager implements ScriptManager {
         serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.RUNTIME_ERROR, scriptId, message));
     }
 
+    public void fireServiceEvent(ScriptServiceEvents.Type type, String scriptId) {
+        serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(type, scriptId));
+    }
+
     public ScriptRepository repository() { return repository; }
     public ScriptRevisionManager revisionManager() { return revisionManager; }
     public ScriptServiceEventBus eventBus() { return eventBus; }
@@ -504,6 +654,7 @@ public final class DefaultScriptManager implements ScriptManager {
         for (io.velora.api.permission.ScriptPermission p : set.all()) combined.add(p);
         grants.put(scriptId, io.velora.api.permission.PermissionSet.of(combined));
         persistGrants(scriptId);
+        serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.PERMISSIONS_CHANGED, scriptId));
     }
 
     @Override
@@ -515,6 +666,7 @@ public final class DefaultScriptManager implements ScriptManager {
         }
         grants.put(scriptId, io.velora.api.permission.PermissionSet.of(remaining));
         persistGrants(scriptId);
+        serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.PERMISSIONS_CHANGED, scriptId));
         // If script is enabled and no longer has required permissions, disable it
         ScriptInstance instance = repository.get(scriptId);
         if (instance != null && instance.enabled() && instance.compiledModule() != null) {
@@ -594,6 +746,7 @@ public final class DefaultScriptManager implements ScriptManager {
         @Override public ScriptOperationResult toggle() { return DefaultScriptManager.this.toggle(instance.scriptId()); }
         @Override public ScriptOperationResult reload() { return DefaultScriptManager.this.reload(instance.scriptId()); }
         @Override public SettingSchema settings() { return DefaultScriptManager.this.settings(instance.scriptId()); }
+        @Override public Map<String, io.velora.api.setting.SettingValue> settingValues() { return DefaultScriptManager.this.settingValues(instance.scriptId()); }
         @Override public io.velora.api.debug.DebugSnapshot debug() { return debugService != null ? debugService.snapshot(instance.scriptId()) : io.velora.api.debug.DebugSnapshot.empty(instance.scriptId()); }
     }
 
@@ -614,4 +767,6 @@ public final class DefaultScriptManager implements ScriptManager {
             for (var l : listeners) l.accept(event);
         }
     }
+    private long nanoTime() { return host != null && host.clock() != null ? host.clock().nanoTime() : System.nanoTime(); }
+
 }

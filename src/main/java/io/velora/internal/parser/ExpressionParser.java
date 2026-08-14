@@ -279,7 +279,7 @@ public final class ExpressionParser {
         if (token.is(TokenType.STRING)) {
             context.advance();
             String text = token.text();
-            String unquoted = text.substring(1, text.length() - 1);
+            String unquoted = unescapeString(text.substring(1, text.length() - 1));
             return new LiteralExpressionNode(context.filePath(), token.line(), token.column(),
                     unquoted, LiteralExpressionNode.LiteralKind.STRING);
         }
@@ -318,6 +318,29 @@ public final class ExpressionParser {
                 "Unexpected token: " + token.type() + " '" + token.text() + "'", token);
         context.advance();
         return new LiteralExpressionNode(context.filePath(), token.line(), token.column(), null, LiteralExpressionNode.LiteralKind.NULL);
+    }
+
+    private String unescapeString(String value) {
+        StringBuilder result = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c != '\\' || i + 1 >= value.length()) {
+                result.append(c);
+                continue;
+            }
+            char escaped = value.charAt(++i);
+            result.append(switch (escaped) {
+                case 'n' -> '\n';
+                case 't' -> '\t';
+                case 'r' -> '\r';
+                case '\\' -> '\\';
+                case '"' -> '"';
+                case '\'' -> '\'';
+                case '$' -> '$';
+                default -> escaped;
+            });
+        }
+        return result.toString();
     }
 
     private ExpressionNode parseInterpolation(Token token) {

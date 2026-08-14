@@ -8,6 +8,10 @@ public interface ScriptManager {
 
     Optional<ScriptHandle> find(String scriptId);
 
+    ScriptOperationResult create(ScriptCreateRequest request);
+
+    ScriptOperationResult delete(String scriptId);
+
     ScriptOperationResult enable(String scriptId);
 
     ScriptOperationResult disable(String scriptId);
@@ -23,6 +27,8 @@ public interface ScriptManager {
     ScriptStatus status(String scriptId);
 
     io.velora.api.setting.SettingSchema settings(String scriptId);
+
+    java.util.Map<String, io.velora.api.setting.SettingValue> settingValues(String scriptId);
 
     ScriptTransaction beginTransaction(String scriptId);
 

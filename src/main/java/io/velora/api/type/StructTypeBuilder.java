@@ -19,6 +19,10 @@ public final class StructTypeBuilder {
     }
 
     public StructTypeBuilder property(String name, VeloraType type, Function<Object, Object> accessor) {
+        Objects.requireNonNull(type, "type");
+        Objects.requireNonNull(accessor, "accessor");
+        if (!isIdentifier(name)) throw new IllegalArgumentException("Struct property name must be a script identifier: " + name);
+        if (properties.stream().anyMatch(property -> property.name().equals(name))) throw new IllegalArgumentException("Duplicate struct property: " + name);
         properties.add(new StructType.Property(name, type, accessor));
         return this;
     }
@@ -29,6 +33,16 @@ public final class StructTypeBuilder {
     }
 
     public StructType build() {
+        if (!isIdentifier(name)) throw new IllegalArgumentException("Struct type name must be a script identifier: " + name);
         return new StructType(name, javaClass, properties, valueEquality, false);
+    }
+
+    private static boolean isIdentifier(String value) {
+        if (value == null || value.isEmpty() || !(Character.isLetter(value.charAt(0)) || value.charAt(0) == '_')) return false;
+        for (int i = 1; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (!Character.isLetterOrDigit(c) && c != '_') return false;
+        }
+        return true;
     }
 }

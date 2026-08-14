@@ -39,6 +39,12 @@ public final class DefaultScriptTemplateRegistry implements ScriptTemplateRegist
         frozen = true;
     }
 
+    public void rollbackTo(int snapshotSize) {
+        if (templates.size() <= snapshotSize) return;
+        List<String> ids = new ArrayList<>(templates.keySet());
+        for (int i = ids.size() - 1; i >= snapshotSize; i--) templates.remove(ids.get(i));
+    }
+
     private void checkFrozen() {
         if (frozen) throw new IllegalStateException("ScriptTemplateRegistry is frozen");
     }

@@ -16,6 +16,7 @@ public record ParameterDescriptor(
     public ParameterDescriptor {
         java.util.Objects.requireNonNull(name);
         java.util.Objects.requireNonNull(type);
+        if (required == hasDefault) throw new IllegalArgumentException("Parameter must be either required or have a default: " + name);
     }
 
     public static ParameterDescriptor required(String name, VeloraType type) {

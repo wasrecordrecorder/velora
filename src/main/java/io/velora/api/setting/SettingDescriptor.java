@@ -71,18 +71,34 @@ public final class SettingDescriptor {
 
     /** A validation constraint on a setting value (range, pattern, max length, ...). */
     public record Constraint(Kind kind, Object min, Object max, Object extra) {
-        public enum Kind { RANGE, MIN, MAX, STEP, MAX_LENGTH, PATTERN, ALLOW_AIR, ALLOW_TAG, ALLOW_ALPHA, MODE }
+        public enum Kind { RANGE, MIN, MAX, STEP, MIN_LENGTH, MAX_LENGTH, PATTERN, VALUES, ALLOW_AIR, ALLOW_TAG, ALLOW_ALPHA, MODE }
 
         public static Constraint range(Object min, Object max) {
             return new Constraint(Kind.RANGE, min, max, null);
+        }
+
+        public static Constraint min(Object min) {
+            return new Constraint(Kind.MIN, min, null, null);
+        }
+
+        public static Constraint max(Object max) {
+            return new Constraint(Kind.MAX, null, max, null);
         }
 
         public static Constraint step(Object step) {
             return new Constraint(Kind.STEP, null, null, step);
         }
 
+        public static Constraint minLength(int min) {
+            return new Constraint(Kind.MIN_LENGTH, min, null, null);
+        }
+
         public static Constraint maxLength(int max) {
             return new Constraint(Kind.MAX_LENGTH, null, max, null);
+        }
+
+        public static Constraint values(java.util.Collection<?> values) {
+            return new Constraint(Kind.VALUES, null, null, java.util.List.copyOf(values));
         }
 
         public static Constraint pattern(String regex) {

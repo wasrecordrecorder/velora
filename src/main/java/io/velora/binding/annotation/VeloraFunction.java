@@ -23,4 +23,6 @@ public @interface VeloraFunction {
     String description() default "";
 
     String category() default "";
+
+    String returnType() default "";
 }

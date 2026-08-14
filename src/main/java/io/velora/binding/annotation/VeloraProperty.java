@@ -1,5 +1,7 @@
 package io.velora.binding.annotation;
 
+import io.velora.api.function.ScriptThread;
+
 import java.lang.annotation.ElementType;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
@@ -14,7 +16,11 @@ public @interface VeloraProperty {
 
     int cost() default 1;
 
+    ScriptThread thread() default ScriptThread.ANY;
+
     String description() default "";
 
     String category() default "";
+
+    String returnType() default "";
 }

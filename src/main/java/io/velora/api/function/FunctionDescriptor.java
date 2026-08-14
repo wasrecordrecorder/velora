@@ -117,14 +117,66 @@ public final class FunctionDescriptor {
             Objects.requireNonNull(namespace, "namespace");
             Objects.requireNonNull(name, "name");
             Objects.requireNonNull(returnType, "returnType");
+            if (!isIdentifier(namespace)) throw new IllegalArgumentException("Namespace must be a script identifier: " + namespace);
+            if (!isIdentifier(name)) throw new IllegalArgumentException("Function name must be a script identifier: " + name);
+            Objects.requireNonNull(thread, "thread");
             Objects.requireNonNull(invoker, "invoker");
-            if (cost <= 0) {
-                throw new IllegalArgumentException("Cost must be positive");
-            }
-            if (description != null && !description.isEmpty() && description.isBlank()) {
-                throw new IllegalArgumentException("Description cannot be blank");
+            if (cost <= 0) throw new IllegalArgumentException("Cost must be positive");
+            if (thread == ScriptThread.WORKER && !suspending) throw new IllegalArgumentException("WORKER functions must be suspending");
+            if (description != null && !description.isEmpty() && description.isBlank()) throw new IllegalArgumentException("Description cannot be blank");
+            Set<String> names = new HashSet<>();
+            boolean optionalSeen = false;
+            for (ParameterDescriptor parameter : parameters) {
+                if (!isIdentifier(parameter.name())) throw new IllegalArgumentException("Invalid parameter name: " + parameter.name());
+                if (!names.add(parameter.name())) throw new IllegalArgumentException("Duplicate parameter name: " + parameter.name());
+                if (parameter.hasDefault()) {
+                    optionalSeen = true;
+                    validateDefault(parameter);
+                } else if (optionalSeen) {
+                    throw new IllegalArgumentException("Required parameter cannot follow an optional parameter: " + parameter.name());
+                }
             }
             return new FunctionDescriptor(this);
+        }
+
+        private void validateDefault(ParameterDescriptor parameter) {
+            Object value = parameter.defaultValue();
+            VeloraType target = parameter.type();
+            if (value == null) {
+                if (!target.isNullable()) throw new IllegalArgumentException("Null default requires nullable parameter type: " + parameter.name());
+                return;
+            }
+            VeloraType source = defaultType(value);
+            if (source == null) throw new IllegalArgumentException("Unsupported host default value for parameter '" + parameter.name() + "': " + value.getClass().getTypeName());
+            if (!io.velora.api.type.VeloraTypes.isCompatible(source, target.nonNull())) {
+                throw new IllegalArgumentException("Default value type mismatch for parameter '" + parameter.name() + "': expected " + target.name() + ", got " + source.name());
+            }
+            if (source == io.velora.api.type.VeloraTypes.BYTE || source == io.velora.api.type.VeloraTypes.CHAR) {
+                throw new IllegalArgumentException("Byte and Char defaults are not supported in bytecode parameters: " + parameter.name());
+            }
+        }
+
+        private VeloraType defaultType(Object value) {
+            if (value instanceof Byte) return io.velora.api.type.VeloraTypes.BYTE;
+            if (value instanceof Short || value instanceof Integer) return io.velora.api.type.VeloraTypes.INT;
+            if (value instanceof Long) return io.velora.api.type.VeloraTypes.LONG;
+            if (value instanceof Float) return io.velora.api.type.VeloraTypes.FLOAT;
+            if (value instanceof Double) return io.velora.api.type.VeloraTypes.DOUBLE;
+            if (value instanceof Boolean) return io.velora.api.type.VeloraTypes.BOOLEAN;
+            if (value instanceof Character) return io.velora.api.type.VeloraTypes.CHAR;
+            if (value instanceof String) return io.velora.api.type.VeloraTypes.STRING;
+            if (value instanceof java.time.Duration) return io.velora.api.type.VeloraTypes.DURATION;
+            if (value instanceof java.util.UUID) return io.velora.api.type.VeloraTypes.UUID;
+            return null;
+        }
+
+        private boolean isIdentifier(String value) {
+            if (value == null || value.isEmpty() || !(Character.isLetter(value.charAt(0)) || value.charAt(0) == '_')) return false;
+            for (int i = 1; i < value.length(); i++) {
+                char c = value.charAt(i);
+                if (!Character.isLetterOrDigit(c) && c != '_') return false;
+            }
+            return true;
         }
 
         FunctionDescriptor buildWithIndex() {

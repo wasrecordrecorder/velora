@@ -12,7 +12,7 @@ public final class ScriptFiber {
     private final String scriptId;
     private final int functionIndex;
     private final ScriptValue[] args;
-    private final long createdAtNanos = System.nanoTime();
+    private final long createdAtNanos;
     private FiberState state = FiberState.READY;
     private int instructionsThisTick;
     private long sleepUntilNanos;
@@ -28,13 +28,19 @@ public final class ScriptFiber {
     private long instructionsExecuted;
     private long reservedMemory;
     private boolean eventFiber;
+    private int pendingApiCost;
     private String functionName;
 
     public ScriptFiber(long id, String scriptId, int functionIndex, ScriptValue[] args) {
+        this(id, scriptId, functionIndex, args, System.nanoTime());
+    }
+
+    public ScriptFiber(long id, String scriptId, int functionIndex, ScriptValue[] args, long createdAtNanos) {
         this.id = id;
         this.scriptId = scriptId;
         this.functionIndex = functionIndex;
         this.args = args;
+        this.createdAtNanos = createdAtNanos;
         this.parentId = -1;
         this.functionName = "fn" + functionIndex;
     }
@@ -65,6 +71,8 @@ public final class ScriptFiber {
     public void reservedMemory(long bytes) { reservedMemory = bytes; }
     public boolean eventFiber() { return eventFiber; }
     public void eventFiber(boolean value) { eventFiber = value; }
+    public int pendingApiCost() { return pendingApiCost; }
+    public void pendingApiCost(int value) { pendingApiCost = value; }
     public String functionName() { return functionName; }
     public void functionName(String value) { functionName = value; }
     public int instructionPointer() { return savedCallStack != null && !savedCallStack.isEmpty() ? savedCallStack.peek().ip() : 0; }

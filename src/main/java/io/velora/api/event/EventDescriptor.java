@@ -4,6 +4,7 @@ import io.velora.api.permission.ScriptPermission;
 import io.velora.api.type.VeloraType;
 
 import java.util.Objects;
+import java.util.function.BinaryOperator;
 
 /**
  * Immutable descriptor for a registered event.
@@ -23,6 +24,7 @@ public final class EventDescriptor {
     private final EventConcurrency defaultConcurrency;
     private final int queueLimit;
     private final EventOverflowPolicy overflowPolicy;
+    private final BinaryOperator<Object> coalescer;
     private final int cost;
     private final int index;
 
@@ -37,6 +39,7 @@ public final class EventDescriptor {
         this.defaultConcurrency = b.defaultConcurrency;
         this.queueLimit = b.queueLimit;
         this.overflowPolicy = b.overflowPolicy;
+        this.coalescer = b.coalescer;
         this.cost = b.cost;
         this.index = b.index;
     }
@@ -51,6 +54,7 @@ public final class EventDescriptor {
     public EventConcurrency defaultConcurrency() { return defaultConcurrency; }
     public int queueLimit() { return queueLimit; }
     public EventOverflowPolicy overflowPolicy() { return overflowPolicy; }
+    public BinaryOperator<Object> coalescer() { return coalescer; }
     public int cost() { return cost; }
     public int index() { return index; }
 
@@ -66,6 +70,7 @@ public final class EventDescriptor {
         b.defaultConcurrency = this.defaultConcurrency;
         b.queueLimit = this.queueLimit;
         b.overflowPolicy = this.overflowPolicy;
+        b.coalescer = this.coalescer;
         b.cost = this.cost;
         b.index = index;
         return b.build();
@@ -90,6 +95,7 @@ public final class EventDescriptor {
         private EventConcurrency defaultConcurrency = EventConcurrency.QUEUE;
         private int queueLimit = 256;
         private EventOverflowPolicy overflowPolicy = EventOverflowPolicy.DROP_OLDEST;
+        private BinaryOperator<Object> coalescer;
         private int cost = 1;
         private int index = -1;
 
@@ -103,16 +109,18 @@ public final class EventDescriptor {
         public Builder defaultConcurrency(EventConcurrency v) { this.defaultConcurrency = v; return this; }
         public Builder queueLimit(int v) { this.queueLimit = v; return this; }
         public Builder overflowPolicy(EventOverflowPolicy v) { this.overflowPolicy = v; return this; }
+        public Builder coalescer(BinaryOperator<Object> v) { this.coalescer = v; return this; }
         public Builder cost(int v) { this.cost = v; return this; }
 
         public EventDescriptor build() {
             Objects.requireNonNull(id, "id");
-            if (scriptName == null) {
-                scriptName = id;
-            }
-            if (payloadType == null) {
-                throw new IllegalStateException("payloadType required for event " + id);
-            }
+            if (id.isBlank()) throw new IllegalArgumentException("Event id cannot be blank");
+            if (scriptName == null) scriptName = id;
+            if (scriptName.isBlank()) throw new IllegalArgumentException("Event scriptName cannot be blank");
+            Objects.requireNonNull(defaultConcurrency, "defaultConcurrency");
+            Objects.requireNonNull(overflowPolicy, "overflowPolicy");
+            if (overflowPolicy == EventOverflowPolicy.COALESCE && coalescer == null) throw new IllegalStateException("COALESCE overflow policy requires a coalescer for event " + id);
+            if (payloadType == null) throw new IllegalStateException("payloadType required for event " + id);
             if (queueLimit <= 0) {
                 throw new IllegalArgumentException("queueLimit must be positive");
             }

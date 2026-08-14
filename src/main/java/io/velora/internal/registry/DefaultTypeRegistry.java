@@ -57,9 +57,10 @@ public final class DefaultTypeRegistry implements TypeRegistry {
     @Override
     public void register(VeloraType type) {
         checkFrozen();
-        if (byName.containsKey(type.name())) {
-            throw new IllegalStateException("Type already registered: " + type.name());
-        }
+        Objects.requireNonNull(type, "type");
+        if (type.isNullable()) throw new IllegalArgumentException("Registered type must be non-null: " + type.name());
+        if (!isIdentifier(type.name())) throw new IllegalArgumentException("Type name must be a script identifier: " + type.name());
+        if (byName.containsKey(type.name())) throw new IllegalStateException("Type already registered: " + type.name());
         byName.put(type.name(), type);
         all.add(type);
     }
@@ -92,6 +93,21 @@ public final class DefaultTypeRegistry implements TypeRegistry {
 
     public void freeze() {
         frozen = true;
+    }
+
+    public void rollbackTo(int snapshotSize) {
+        while (all.size() > snapshotSize) all.remove(all.size() - 1);
+        byName.clear();
+        for (VeloraType type : all) byName.put(type.name(), type);
+    }
+
+    private static boolean isIdentifier(String value) {
+        if (value == null || value.isEmpty() || !(Character.isLetter(value.charAt(0)) || value.charAt(0) == '_')) return false;
+        for (int i = 1; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (!Character.isLetterOrDigit(c) && c != '_') return false;
+        }
+        return true;
     }
 
     private void checkFrozen() {

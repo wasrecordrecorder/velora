@@ -15,9 +15,8 @@ public final class DefaultSettingRegistry implements SettingRegistry {
     @Override
     public void register(SettingKind kind) {
         checkFrozen();
-        if (byName.containsKey(kind.name())) {
-            return;
-        }
+        Objects.requireNonNull(kind, "kind");
+        if (byName.containsKey(kind.name())) throw new IllegalStateException("Setting kind already registered: " + kind.name());
         byName.put(kind.name(), kind);
     }
 
@@ -50,6 +49,12 @@ public final class DefaultSettingRegistry implements SettingRegistry {
 
     public void freeze() {
         frozen = true;
+    }
+
+    public void rollbackTo(int snapshotSize) {
+        if (byName.size() <= snapshotSize) return;
+        List<String> names = new ArrayList<>(byName.keySet());
+        for (int i = names.size() - 1; i >= snapshotSize; i--) byName.remove(names.get(i));
     }
 
     private void checkFrozen() {

@@ -15,8 +15,9 @@ public final class ScriptPermission {
 
     private ScriptPermission(String id, String displayName, String description, String categoryId, String extensionId) {
         this.id = Objects.requireNonNull(id);
-        this.displayName = displayName;
-        this.description = description;
+        if (id.isBlank()) throw new IllegalArgumentException("Permission id cannot be blank");
+        this.displayName = displayName == null ? "" : displayName;
+        this.description = description == null ? "" : description;
         this.categoryId = categoryId;
         this.extensionId = extensionId;
     }

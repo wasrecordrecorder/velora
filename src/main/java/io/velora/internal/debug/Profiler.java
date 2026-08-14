@@ -2,64 +2,38 @@ package io.velora.internal.debug;
 
 import io.velora.api.debug.ProfilerSnapshot;
 
-import java.util.*;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.HashMap;
+import java.util.Map;
 
 public final class Profiler {
-    private final Map<String, FunctionProfile> profiles = new HashMap<>();
-    private long tickStartTime;
-    private long tickEndTime;
-    private final AtomicLong totalInstructions = new AtomicLong();
-    private final AtomicLong totalApiCalls = new AtomicLong();
-    private final AtomicLong totalFailures = new AtomicLong();
-    private final AtomicLong totalCancellations = new AtomicLong();
-    private final AtomicLong totalApiCost = new AtomicLong();
-    private volatile int maxQueueDepth;
-    private volatile int droppedEvents;
-    private volatile int coalescedEvents;
+    private final Map<String, Integer> droppedEvents = new HashMap<>();
+    private final Map<String, Long> coalescedEvents = new HashMap<>();
+    private final Map<String, Integer> currentQueueDepth = new HashMap<>();
+    private final Map<String, Integer> maxQueueDepth = new HashMap<>();
 
-    public record FunctionProfile(String name, long totalTimeNanos, int callCount) {}
-
-    public void startTick() { tickStartTime = System.nanoTime(); }
-    public void endTick() { tickEndTime = System.nanoTime(); }
-
-    public void recordFunction(String name, long timeNanos) {
-        FunctionProfile existing = profiles.get(name);
-        if (existing != null) {
-            profiles.put(name, new FunctionProfile(name, existing.totalTimeNanos() + timeNanos, existing.callCount() + 1));
-        } else {
-            profiles.put(name, new FunctionProfile(name, timeNanos, 1));
-        }
+    public void recordDropped(String scriptId) {
+        recordDropped(scriptId, 1);
     }
 
-    public void recordInstructions(int count) { totalInstructions.addAndGet(count); }
-    public void recordApiCall() { totalApiCalls.incrementAndGet(); }
-    public void recordApiCost(long cost) { totalApiCost.addAndGet(cost); }
-    public void recordFailure() { totalFailures.incrementAndGet(); }
-    public void recordCancellation() { totalCancellations.incrementAndGet(); }
-    public void recordMaxQueueDepth(int depth) { if (depth > maxQueueDepth) maxQueueDepth = depth; }
-    public void setDroppedEvents(int count) { droppedEvents = count; }
-    public void setCoalescedEvents(int count) { coalescedEvents = count; }
+    public void recordDropped(String scriptId, int count) {
+        if (count > 0) droppedEvents.merge(scriptId, count, Integer::sum);
+    }
+
+    public void recordCoalesced(String scriptId) {
+        coalescedEvents.merge(scriptId, 1L, Long::sum);
+    }
+
+    public void recordQueueDepth(String scriptId, int depth) {
+        int normalized = Math.max(0, depth);
+        if (normalized == 0) currentQueueDepth.remove(scriptId);
+        else currentQueueDepth.put(scriptId, normalized);
+        maxQueueDepth.merge(scriptId, normalized, Math::max);
+    }
 
     public ProfilerSnapshot snapshot(String scriptId) {
-        long tickTime = tickEndTime - tickStartTime;
-        return new ProfilerSnapshot(
-                scriptId,
-                tickTime,
-                totalInstructions.get(),
-                totalApiCost.get(),
-                0, // memoryUsedBytes
-                0, // activeFibers
-                0, // activeTasks
-                0, // eventQueueDepth (current)
-                droppedEvents,
-                totalApiCalls.get(),
-                totalFailures.get(),
-                totalCancellations.get(),
-                coalescedEvents,
-                maxQueueDepth
-        );
+        return new ProfilerSnapshot(scriptId, 0, 0, 0, 0, 0, 0, currentQueueDepth.getOrDefault(scriptId, 0),
+                droppedEvents.getOrDefault(scriptId, 0), 0, 0, 0,
+                coalescedEvents.getOrDefault(scriptId, 0L), maxQueueDepth.getOrDefault(scriptId, 0));
     }
 
-    public void reset() { profiles.clear(); totalInstructions.set(0); totalApiCalls.set(0); totalFailures.set(0); totalCancellations.set(0); totalApiCost.set(0); maxQueueDepth = 0; droppedEvents = 0; coalescedEvents = 0; }
 }

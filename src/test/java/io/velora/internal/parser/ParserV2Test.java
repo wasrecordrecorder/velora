@@ -440,4 +440,12 @@ class ParserV2Test {
         ParseResult r = parse("@Script(name=\"T\", version=\"1\")\nscript T {\n    suspend fun run() { }\n}");
         assertTrue(r.hasErrors(), "V1 'suspend' should produce parser error");
     }
+
+    @Test
+    void visibilityModifiersAreRejectedUntilTheyHaveRuntimeSemantics() {
+        ParseResult privateResult = parse("script T { private int value() { return 1 } }");
+        ParseResult publicResult = parse("script T { public int value() { return 1 } }");
+        assertTrue(privateResult.diagnostics().stream().anyMatch(d -> d.isError()));
+        assertTrue(publicResult.diagnostics().stream().anyMatch(d -> d.isError()));
+    }
 }
