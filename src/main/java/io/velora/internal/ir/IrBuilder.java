@@ -2,12 +2,12 @@ package io.velora.internal.ir;
 
 import io.velora.api.function.ApiRegistry;
 import io.velora.api.function.FunctionDescriptor;
-import io.velora.api.permission.PermissionSet;
 import io.velora.api.registry.ConstantRegistry;
 import io.velora.api.registry.TypeRegistry;
 import io.velora.api.setting.SettingDescriptor;
 import io.velora.api.type.VeloraType;
 import io.velora.api.type.VeloraTypes;
+import io.velora.internal.vm.ScriptValue;
 import io.velora.internal.ast.*;
 import io.velora.internal.semantic.ResolvedScript;
 
@@ -76,7 +76,7 @@ public final class IrBuilder {
             // Collect initializers for non-const fields (instance and static)
             if (!prop.isConst() && prop.constValue() != null) {
                 fieldInits.add(new IrModule.FieldInitializer(
-                        prop.fieldIndex(), prop.isStatic(), objectToValue(prop.constValue())));
+                        prop.fieldIndex(), prop.isStatic(), ScriptValue.fromJava(prop.constValue())));
             }
         }
 
@@ -86,8 +86,11 @@ public final class IrBuilder {
         }
         for (var entry : resolved.lifecycle().entrySet()) {
             ResolvedScript.ResolvedFunction function = entry.getValue();
-            functionsByIndex.put(function.functionIndex(), buildFunction(function));
-            lifecycleHooks.add(entry.getKey().name());
+            IrFunction built = buildFunction(function);
+            String hook = entry.getKey().name();
+            functionsByIndex.put(function.functionIndex(), new IrFunction(hook, built.index(), built.parameters(), built.returnType(),
+                    built.suspending(), true, built.blocks(), built.localCount(), built.maxStack()));
+            lifecycleHooks.add(hook);
         }
         for (ResolvedScript.ResolvedEventHandler eh : resolved.eventHandlers()) {
             functionsByIndex.put(eh.functionIndex(), buildEventHandler(eh));
@@ -107,8 +110,6 @@ public final class IrBuilder {
                 persistentFieldTypes,
                 persistentFieldIndices,
                 persistentFieldIsStatic,
-                resolved.requiredPermissions(),
-                resolved.maximumPermissions(),
                 lifecycleHooks,
                 eventHandlers,
                 fieldInits,
@@ -310,9 +311,22 @@ public final class IrBuilder {
             }
             instrs.add(new IrInstruction.Return());
         } else if (stmt instanceof ExpressionStatementNode es) {
-            int[] r = buildExpression(es.expression(), instrs);
-            maxStack = Math.max(maxStack, r[1]);
-            instrs.add(new IrInstruction.Pop());
+            if (es.expression() instanceof AssignmentExpressionNode assignment
+                    && "=".equals(assignment.operator())
+                    && assignment.target() instanceof IdentifierExpressionNode id
+                    && !localIndices.containsKey(id.name())
+                    && !resolved.properties().containsKey(id.name())
+                    && !settingIndexMap.containsKey(id.name())) {
+                int[] r = buildExpression(assignment.value(), instrs);
+                maxStack = Math.max(maxStack, r[1]);
+                int localIdx = localCount++;
+                localIndices.put(id.name(), localIdx);
+                instrs.add(new IrInstruction.StoreLocal(localIdx, VeloraTypes.UNIT));
+            } else {
+                int[] r = buildExpression(es.expression(), instrs);
+                maxStack = Math.max(maxStack, r[1]);
+                instrs.add(new IrInstruction.Pop());
+            }
         }
 
         return new int[]{localCount, maxStack};
@@ -445,6 +459,13 @@ public final class IrBuilder {
         } else if (expr instanceof IsExpressionNode is) {
             buildExpression(is.operand(), instrs);
             instrs.add(new IrInstruction.IsType(typeName(is.type())));
+        } else if (expr instanceof CollectionConstructorExpressionNode collection) {
+            switch (collection.kind()) {
+                case LIST -> instrs.add(new IrInstruction.CreateList(0, VeloraTypes.UNIT));
+                case SET -> instrs.add(new IrInstruction.CreateSet(0, VeloraTypes.UNIT));
+                case MAP -> instrs.add(new IrInstruction.CreateMap(0, VeloraTypes.UNIT, VeloraTypes.UNIT));
+            }
+            maxStack = Math.max(maxStack, 1);
         } else if (expr instanceof ListLiteralExpressionNode list) {
             int elemMax = 0;
             for (ExpressionNode e : list.elements()) {
@@ -630,6 +651,20 @@ public final class IrBuilder {
             if (descriptor.suspending()) instrs.add(new IrInstruction.CallSuspend(apiIdx, descriptor.parameters().size(), descriptor.returnType()));
             else instrs.add(new IrInstruction.CallApi(apiIdx, descriptor.parameters().size(), descriptor.returnType()));
             return Math.max(stack, descriptor.parameters().size());
+        }
+        if (callee instanceof MemberAccessExpressionNode mem) {
+            int[] receiver = buildExpression(mem.target(), instrs);
+            int max = receiver[1];
+            for (int i = 0; i < args.size(); i++) {
+                int[] result = buildExpression(args.get(i), instrs);
+                max = Math.max(max, result[1] + i + 1);
+            }
+            VeloraType resultType = switch (mem.member()) {
+                case "contains", "containsKey", "remove" -> VeloraTypes.BOOLEAN;
+                default -> VeloraTypes.UNIT;
+            };
+            instrs.add(new IrInstruction.CallMember(mem.member(), args.size(), resultType));
+            return Math.max(max, args.size() + 1);
         }
         throw new IllegalStateException("Unsupported callable expression: " + callee.nodeName());
     }

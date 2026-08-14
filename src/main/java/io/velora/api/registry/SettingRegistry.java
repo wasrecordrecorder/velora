@@ -8,7 +8,7 @@ import java.util.List;
 import java.util.function.Consumer;
 
 /**
- * Registry for setting kinds (the annotation-level types such as Slider, Toggle, ...).
+ * Registry for setting kinds selected by {@code @Setting(..., kind="Name")}.
  */
 public interface SettingRegistry {
 
@@ -22,7 +22,7 @@ public interface SettingRegistry {
         register(b.build());
     }
 
-    /** Find a setting kind by annotation name. */
+    /** Find a setting kind by its registered name. */
     SettingKind find(String name);
 
     /** All registered setting kinds. */

@@ -2,7 +2,6 @@ package io.velora;
 
 import io.velora.api.*;
 import io.velora.api.function.*;
-import io.velora.api.permission.*;
 import io.velora.api.setting.*;
 import io.velora.api.type.*;
 import io.velora.binding.annotation.*;
@@ -106,12 +105,6 @@ class EngineV2Test {
         assertTrue(engine.settings().all().size() > 0, "Should have built-in setting kinds");
     }
 
-    @Test
-    @DisplayName("Engine has permission registry")
-    void permissionRegistry() {
-        VeloraEngine engine = Velora.builder().host(simpleHost()).build();
-        assertNotNull(engine.permissions());
-    }
 
     @Test
     @DisplayName("Engine has constant registry")
@@ -174,13 +167,6 @@ class EngineV2Test {
             engine.api().namespace("dup", ns -> ns.function("value", VeloraTypes.INT, ctx -> 2)));
     }
 
-    @Test
-    @DisplayName("Register custom permission")
-    void registerPermission() {
-        VeloraEngine engine = Velora.builder().host(simpleHost()).build();
-        engine.permissions().register(ScriptPermission.of("CUSTOM", "Custom", "desc"));
-        assertNotNull(engine.permissions().find("CUSTOM"));
-    }
 
     @Test
     @DisplayName("Register custom setting kind")

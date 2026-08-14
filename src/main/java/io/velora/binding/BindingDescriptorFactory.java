@@ -3,7 +3,6 @@ package io.velora.binding;
 import io.velora.api.function.FunctionContext;
 import io.velora.api.function.FunctionDescriptor;
 import io.velora.api.function.ScriptThread;
-import io.velora.api.permission.ScriptPermission;
 import io.velora.api.registry.TypeRegistry;
 import io.velora.api.task.VeloraTask;
 import io.velora.api.type.VeloraType;
@@ -98,7 +97,6 @@ public final class BindingDescriptorFactory {
             builder.parameter(parameterName, parameterType);
             scriptArgIndex++;
         }
-        if (!annotation.permission().isEmpty()) builder.permission(ScriptPermission.of(annotation.permission(), annotation.permission(), ""));
         builder.invoker(context -> invoke(binding, method, extractArguments(method, context)));
         return builder.build();
     }
@@ -122,7 +120,6 @@ public final class BindingDescriptorFactory {
                 .returns(returnType)
                 .thread(annotation.thread())
                 .cost(annotation.cost());
-        if (!annotation.permission().isEmpty()) builder.permission(ScriptPermission.of(annotation.permission(), annotation.permission(), ""));
         builder.invoker(context -> invoke(binding, method, extractArguments(method, context)));
         return builder.build();
     }

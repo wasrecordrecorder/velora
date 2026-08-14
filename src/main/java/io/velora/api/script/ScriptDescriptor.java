@@ -1,7 +1,5 @@
 package io.velora.api.script;
 
-import io.velora.api.permission.PermissionSet;
-
 import java.util.List;
 
 public record ScriptDescriptor(
@@ -13,7 +11,6 @@ public record ScriptDescriptor(
         ScriptStatus status,
         boolean enabled,
         List<String> sourceFiles,
-        PermissionSet permissions,
         ScriptRevision activeRevision,
         int errorCount,
         int warningCount,
@@ -25,6 +22,5 @@ public record ScriptDescriptor(
         java.util.Objects.requireNonNull(version);
         java.util.Objects.requireNonNull(status);
         sourceFiles = sourceFiles == null ? List.of() : List.copyOf(sourceFiles);
-        permissions = permissions == null ? io.velora.api.permission.PermissionSet.empty() : permissions;
     }
 }

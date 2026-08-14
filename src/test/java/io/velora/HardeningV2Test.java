@@ -4,7 +4,6 @@ import io.velora.api.Velora;
 import io.velora.api.VeloraEngine;
 import io.velora.api.VeloraLimits;
 import io.velora.api.compiler.*;
-import io.velora.api.permission.PermissionSet;
 import io.velora.api.type.VeloraTypes;
 import io.velora.api.setting.SettingDescriptor;
 import io.velora.api.setting.SettingValue;
@@ -43,7 +42,6 @@ import static org.junit.jupiter.api.Assertions.*;
 class HardeningV2Test {
     private DefaultTypeRegistry types;
     private DefaultSettingRegistry settings;
-    private DefaultPermissionRegistry permissions;
     private DefaultConstantRegistry constants;
     private DefaultApiRegistry api;
 
@@ -51,7 +49,6 @@ class HardeningV2Test {
     void setUp() {
         types = new DefaultTypeRegistry();
         settings = new DefaultSettingRegistry();
-        permissions = new DefaultPermissionRegistry();
         constants = new DefaultConstantRegistry();
         api = new DefaultApiRegistry(types);
     }
@@ -61,7 +58,7 @@ class HardeningV2Test {
         assertTrue(lex.diagnostics().isEmpty(), "Lexer errors: " + lex.diagnostics());
         ParseResult parse = Parser.parse(source, "main.vls");
         assertTrue(parse.diagnostics().isEmpty(), "Parser errors: " + parse.diagnostics());
-        SemanticAnalyzer analyzer = new SemanticAnalyzer(types, settings, api, constants, permissions);
+        SemanticAnalyzer analyzer = new SemanticAnalyzer(types, settings, api, constants);
         ResolvedScript resolved = analyzer.analyze(parse.scriptNode());
         assertTrue(analyzer.diagnostics().isEmpty(), "Semantic errors: " + analyzer.diagnostics());
         IrModule ir = new IrBuilder(resolved, api).build();
@@ -74,7 +71,7 @@ class HardeningV2Test {
     private List<Diagnostic> semanticDiagnostics(String source) {
         ParseResult parse = Parser.parse(source, "main.vls");
         assertNotNull(parse.scriptNode());
-        SemanticAnalyzer analyzer = new SemanticAnalyzer(types, settings, api, constants, permissions);
+        SemanticAnalyzer analyzer = new SemanticAnalyzer(types, settings, api, constants);
         analyzer.analyze(parse.scriptNode());
         return analyzer.diagnostics();
     }
@@ -84,12 +81,12 @@ class HardeningV2Test {
     }
 
     private DefaultScriptCompiler compiler() {
-        return new DefaultScriptCompiler(types, settings, api, constants, permissions);
+        return new DefaultScriptCompiler(types, settings, api, constants);
     }
 
     @Test
     void floatArithmeticAndUnaryMinus() {
-        CompiledModule module = compile("@Script(name=\"T\", version=\"1\")\nscript T { float answer() { return -(10.0f - 2.0f * 3.0f / 2.0f) } }");
+        CompiledModule module = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { float answer() { return -(10.0f - 2.0f * 3.0f / 2.0f) } }");
         VmExecutionResult result = execute(module);
         assertTrue(result.success());
         assertEquals(-7.0, ((Number) result.returnValue().boxed()).doubleValue());
@@ -97,7 +94,7 @@ class HardeningV2Test {
 
     @Test
     void mixedNumericEqualityUsesNumericValue() {
-        CompiledModule module = compile("@Script(name=\"T\", version=\"1\")\nscript T { boolean answer() { return 1 == 1L } }");
+        CompiledModule module = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { boolean answer() { return 1 == 1L } }");
         VmExecutionResult result = execute(module);
         assertTrue(result.success());
         assertEquals(true, result.returnValue().boxed());
@@ -105,7 +102,7 @@ class HardeningV2Test {
 
     @Test
     void stringConcatenationHonorsRuntimeLimit() {
-        CompiledModule module = compile("@Script(name=\"T\", version=\"1\")\nscript T { String answer() { return \"abc\" + \"def\" } }");
+        CompiledModule module = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { String answer() { return \"abc\" + \"def\" } }");
         VmExecutionResult result = new VirtualMachine(api, List.of(), null, 100_000, 128, 5, 100, 8)
                 .execute(module, module.functionByName("answer").index(), new ScriptValue[0]);
         assertFalse(result.success());
@@ -114,7 +111,7 @@ class HardeningV2Test {
 
     @Test
     void invalidFunctionIndexReturnsVmFailure() {
-        CompiledModule module = compile("@Script(name=\"T\", version=\"1\")\nscript T { int answer() { return 42 } }");
+        CompiledModule module = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { int answer() { return 42 } }");
         VmExecutionResult result = new VirtualMachine(api, List.of(), 100_000).execute(module, 999, new ScriptValue[0]);
         assertFalse(result.success());
         assertTrue(result.error().message().contains("Function not found"));
@@ -122,21 +119,21 @@ class HardeningV2Test {
 
     @Test
     void semanticRejectsInvalidOperatorsAndAssignments() {
-        List<Diagnostic> operator = semanticDiagnostics("@Script(name=\"T\", version=\"1\")\nscript T { int answer() { return true + false } }");
+        List<Diagnostic> operator = semanticDiagnostics("@Script(\"T\")\n@Version(\"1\")\nscript T { int answer() { return true + false } }");
         assertTrue(operator.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_TYPE_MISMATCH));
-        List<Diagnostic> assignment = semanticDiagnostics("@Script(name=\"T\", version=\"1\")\nscript T { int answer() { int x = 1\n x = \"bad\"\n return x } }");
+        List<Diagnostic> assignment = semanticDiagnostics("@Script(\"T\")\n@Version(\"1\")\nscript T { int answer() { int x = 1\n x = \"bad\"\n return x } }");
         assertTrue(assignment.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_TYPE_MISMATCH));
     }
 
     @Test
     void semanticRejectsRuntimeFieldInitializer() {
-        List<Diagnostic> diagnostics = semanticDiagnostics("@Script(name=\"T\", version=\"1\")\nscript T { int make() { return 1 }\n int value = make()\n int answer() { return value } }");
+        List<Diagnostic> diagnostics = semanticDiagnostics("@Script(\"T\")\n@Version(\"1\")\nscript T { int make() { return 1 }\n int value = make()\n int answer() { return value } }");
         assertTrue(diagnostics.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_NON_CONSTANT_FIELD_INIT));
     }
 
     @Test
     void constantExpressionFieldInitializerExecutes() {
-        CompiledModule module = compile("@Script(name=\"T\", version=\"1\")\nscript T { int value = 20 + 22\n int answer() { return value } }");
+        CompiledModule module = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { int value = 20 + 22\n int answer() { return value } }");
         VmExecutionResult result = execute(module);
         assertTrue(result.success());
         assertEquals(42, ((Number) result.returnValue().boxed()).intValue());
@@ -144,7 +141,7 @@ class HardeningV2Test {
 
     @Test
     void bytecodeVerifierRejectsUnderflowBadJumpAndFallthrough() {
-        CompiledModule base = compile("@Script(name=\"T\", version=\"1\")\nscript T { int answer() { return 1 } }");
+        CompiledModule base = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { int answer() { return 1 } }");
         CompiledFunction underflow = new CompiledFunction("answer", 0, 0, 0, 1, false, false,
                 new int[]{Opcode.POP.ordinal(), Opcode.RETURN.ordinal()}, new int[0]);
         CompiledFunction badJump = new CompiledFunction("answer", 0, 0, 0, 1, false, false,
@@ -158,7 +155,7 @@ class HardeningV2Test {
 
     @Test
     void bytecodeVerifierRejectsBranchStackMismatchAndSmallMaxStack() {
-        CompiledModule base = compile("@Script(name=\"T\", version=\"1\")\nscript T { int answer() { return 1 } }");
+        CompiledModule base = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { int answer() { return 1 } }");
         int constant = 0;
         CompiledFunction mismatch = new CompiledFunction("answer", 0, 0, 0, 1, false, false,
                 new int[]{Opcode.TRUE.ordinal(), Opcode.JUMP_IF_FALSE.ordinal(), 5, Opcode.CONST.ordinal(), constant, Opcode.RETURN.ordinal()}, new int[0]);
@@ -171,7 +168,7 @@ class HardeningV2Test {
     @Test
     void compilerFoldsConstantArithmeticBeforeBytecode() {
         CompiledModule module = compiler().compileToModule(CompileRequest.builder("FoldT")
-                .source("main.vls", "@Script(name=\"FoldT\", version=\"1\")\nscript FoldT { int answer() { return 20 + 22 } }").build());
+                .source("main.vls", "@Script(\"FoldT\")\n@Version(\"1\")\nscript FoldT { int answer() { return 20 + 22 } }").build());
         assertNotNull(module);
         int[] code = module.functionByName("answer").code();
         assertEquals(3, code.length);
@@ -183,7 +180,7 @@ class HardeningV2Test {
     @Test
     void compilerOptimizationPreservesJumpTargets() {
         CompiledModule module = compiler().compileToModule(CompileRequest.builder("JumpFoldT")
-                .source("main.vls", "@Script(name=\"JumpFoldT\", version=\"1\")\nscript JumpFoldT { int answer() { int x = 20 + 22\n if (x == 42) { return 1 + 1 } return 0 } }").build());
+                .source("main.vls", "@Script(\"JumpFoldT\")\n@Version(\"1\")\nscript JumpFoldT { int answer() { int x = 20 + 22\n if (x == 42) { return 1 + 1 } return 0 } }").build());
         assertNotNull(module);
         VmExecutionResult result = new VirtualMachine(api, List.of(), 100_000).execute(module, module.functionByName("answer").index(), new ScriptValue[0]);
         assertTrue(result.success());
@@ -193,7 +190,7 @@ class HardeningV2Test {
     @Test
     void compilerCacheOnlyUsesContentAndRegistryHash() {
         DefaultScriptCompiler compiler = compiler();
-        String source = "@Script(name=\"CacheT\", version=\"1\")\nscript CacheT { int answer() { return 42 } }";
+        String source = "@Script(\"CacheT\")\n@Version(\"1\")\nscript CacheT { int answer() { return 42 } }";
         CompileResult full = compiler.compile(CompileRequest.builder("CacheT").source("main.vls", source).mode(CompileMode.FULL).build());
         CompileResult hit = compiler.compile(CompileRequest.builder("CacheT").source("main.vls", source).mode(CompileMode.CACHE_ONLY).build());
         CompileResult miss = compiler.compile(CompileRequest.builder("CacheT").source("main.vls", source.replace("42", "43")).mode(CompileMode.CACHE_ONLY).build());
@@ -207,7 +204,7 @@ class HardeningV2Test {
     void compilerUsesRequestScriptIdAndKeepsMultifileFunctionIndicesStable() {
         DefaultScriptCompiler compiler = compiler();
         CompileRequest request = CompileRequest.builder("folder-id")
-                .source("main.vls", "@Script(name=\"Display Name\", version=\"1\")\nscript SourceName { int run() { return helper() } entry onRun() { run() } }")
+                .source("main.vls", "@Script(\"Display Name\")\n@Version(\"1\")\nscript SourceName { int run() { return helper() } @Run start() { run() } }")
                 .source("helper.vls", "int helper() { return 42 }")
                 .build();
         CompileResult result = compiler.compile(request);
@@ -222,7 +219,7 @@ class HardeningV2Test {
     @Test
     void compilerSourceDetectionIgnoresScriptTextInsideString() {
         DefaultScriptCompiler compiler = compiler();
-        String main = "@Script(name=\"Multi\", version=\"1\")\nscript Multi { int answer() { return helper() } }";
+        String main = "@Script(\"Multi\")\n@Version(\"1\")\nscript Multi { int answer() { return helper() } }";
         String helper = "int helper() { String text = \"script Fake {}\"\n return 42 }";
         CompileResult result = compiler.compile(CompileRequest.builder("Multi").source("main.vls", main).source("helper.vls", helper).build());
         assertTrue(result.success(), "Compiler diagnostics: " + result.diagnostics());
@@ -231,22 +228,22 @@ class HardeningV2Test {
     @Test
     void bytecodeRoundTripKeepsMetadataAndFieldInitializers() {
         DefaultScriptCompiler compiler = compiler();
-        String source = "@Script(name=\"RoundTrip\", version=\"2\", author=\"Ava\", description=\"test\")\nscript RoundTrip { int value = 20 + 22\n int answer() { return value } }";
+        String source = "@Script(\"RoundTrip\")\n@Version(\"2\")\n@Author(\"Ava\")\n@Description(\"test\")\nscript RoundTrip { int value = 20 + 22\n int answer() { return value } }";
         CompileResult result = compiler.compile(CompileRequest.builder("RoundTrip").source("main.vls", source).build());
         assertTrue(result.success(), "Compiler diagnostics: " + result.diagnostics());
-        CompiledModule module = DefaultScriptCompiler.deserializeBytecode(result.bytecode(), List.of(), PermissionSet.empty(), PermissionSet.empty());
+        CompiledModule module = DefaultScriptCompiler.deserializeBytecode(result.bytecode(), List.of());
         assertNotNull(module);
         assertEquals("Ava", module.author());
         assertEquals("test", module.description());
         assertEquals(1, module.fieldInitializers().size());
         assertEquals(42, ((Number) module.fieldInitializers().get(0).initialValue().boxed()).intValue());
         byte[] damaged = Arrays.copyOf(result.bytecode(), 12);
-        assertNull(DefaultScriptCompiler.deserializeBytecode(damaged, List.of(), PermissionSet.empty(), PermissionSet.empty()));
+        assertNull(DefaultScriptCompiler.deserializeBytecode(damaged, List.of()));
     }
 
     @Test
     void schedulerRetiresCompletedFibersAndReleasesLimits() {
-        CompiledModule module = compile("@Script(name=\"T\", version=\"1\")\nscript T { int answer() { return 42 } }");
+        CompiledModule module = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { int answer() { return 42 } }");
         VeloraLimits limits = VeloraLimits.builder().maxFibersPerScript(1).build();
         ScriptScheduler scheduler = new ScriptScheduler(limits, api, new RuntimeErrorStore(10));
         ScriptFiber first = scheduler.spawnFiber("T", module.functionByName("answer").index(), new ScriptValue[0]);
@@ -265,7 +262,7 @@ class HardeningV2Test {
         engine.freeze();
         DefaultScriptCompiler compiler = (DefaultScriptCompiler) engine.compiler();
         CompiledModule module = compiler.compileToModule(CompileRequest.builder("ConsoleT")
-                .source("main.vls", "@Script(name=\"ConsoleT\", version=\"1\")\nscript ConsoleT { void answer() { console.print(\"hello\") } }").build());
+                .source("main.vls", "@Script(\"ConsoleT\")\n@Version(\"1\")\nscript ConsoleT { answer() { console.print(\"hello\") } }").build());
         assertNotNull(module);
         VmExecutionResult result = new VirtualMachine(engine.api(), List.of(), 100_000)
                 .execute(module, module.functionByName("answer").index(), new ScriptValue[0]);
@@ -281,11 +278,11 @@ class HardeningV2Test {
         var handleType = types.handle("ExpectedRef", Expected.class);
         api.namespace("objects", ns -> ns.function("good", handleType, ctx -> new Expected()).description("good").categoryId("test"));
         api.namespace("objects", ns -> ns.function("bad", handleType, ctx -> new Wrong()).description("bad").categoryId("test"));
-        CompiledModule good = compile("@Script(name=\"T\", version=\"1\")\nscript T { ExpectedRef answer() { return objects.good() } }");
+        CompiledModule good = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { ExpectedRef answer() { return objects.good() } }");
         VmExecutionResult goodResult = execute(good);
         assertTrue(goodResult.success());
         assertTrue(goodResult.returnValue() instanceof HandleValue);
-        CompiledModule bad = compile("@Script(name=\"T2\", version=\"1\")\nscript T2 { ExpectedRef answer() { return objects.bad() } }");
+        CompiledModule bad = compile("@Script(\"T2\")\n@Version(\"1\")\nscript T2 { ExpectedRef answer() { return objects.bad() } }");
         VmExecutionResult badResult = execute(bad);
         assertFalse(badResult.success());
         assertTrue(badResult.error().message().contains("Handle type mismatch"));
@@ -299,7 +296,7 @@ class HardeningV2Test {
 
     @Test
     void durationLiteralPreservesUnit() {
-        CompiledModule module = compile("@Script(name=\"T\", version=\"1\")\nscript T { Duration answer() { return 1.5.seconds } }");
+        CompiledModule module = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { Duration answer() { return 1.5.seconds } }");
         VmExecutionResult result = execute(module);
         assertTrue(result.success());
         assertEquals(1_500_000_000L, ((Number) result.returnValue().boxed()).longValue());
@@ -307,20 +304,20 @@ class HardeningV2Test {
 
     @Test
     void taskTypingRejectsFakeIntegerTask() {
-        List<Diagnostic> diagnostics = semanticDiagnostics("@Script(name=\"T\", version=\"1\")\nscript T { int child() { return 42 } async int run() { int task = spawn child() return await(task) } }");
+        List<Diagnostic> diagnostics = semanticDiagnostics("@Script(\"T\")\n@Version(\"1\")\nscript T { int child() { return 42 } async int run() { int task = spawn child() return await(task) } }");
         assertTrue(diagnostics.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_TYPE_MISMATCH));
         assertTrue(diagnostics.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE));
-        compile("@Script(name=\"T2\", version=\"1\")\nscript T2 { int child() { return 42 } async int run() { Task<int> task = spawn child() return await(task) } }");
+        compile("@Script(\"T2\")\n@Version(\"1\")\nscript T2 { int child() { return 42 } async int run() { Task<int> task = spawn child() return await(task) } }");
     }
 
     @Test
     void asyncOperationsAreRejectedFromSyncFunctions() {
         api.namespace("asyncApi", ns -> ns.suspendFunction("value", VeloraTypes.INT, p -> {}, ctx -> 1));
-        List<Diagnostic> await = semanticDiagnostics("@Script(name=\"T\", version=\"1\")\nscript T { int child() { return 1 } int answer() { Task<int> task = spawn child() return await(task) } }");
+        List<Diagnostic> await = semanticDiagnostics("@Script(\"T\")\n@Version(\"1\")\nscript T { int child() { return 1 } int answer() { Task<int> task = spawn child() return await(task) } }");
         assertTrue(await.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_ASYNC_VIOLATION));
-        List<Diagnostic> yield = semanticDiagnostics("@Script(name=\"T2\", version=\"1\")\nscript T2 { int answer() { yield() return 1 } }");
+        List<Diagnostic> yield = semanticDiagnostics("@Script(\"T2\")\n@Version(\"1\")\nscript T2 { int answer() { yield() return 1 } }");
         assertTrue(yield.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_ASYNC_VIOLATION));
-        List<Diagnostic> apiCall = semanticDiagnostics("@Script(name=\"T3\", version=\"1\")\nscript T3 { int answer() { return asyncApi.value() } }");
+        List<Diagnostic> apiCall = semanticDiagnostics("@Script(\"T3\")\n@Version(\"1\")\nscript T3 { int answer() { return asyncApi.value() } }");
         assertTrue(apiCall.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_ASYNC_VIOLATION));
     }
 
@@ -330,7 +327,7 @@ class HardeningV2Test {
         assertTrue(value instanceof SetValue);
         assertEquals(Set.of(1, 2, 3), value.boxed());
         api.namespace("sets", ns -> ns.function("values", VeloraTypes.set(VeloraTypes.INT), ctx -> new LinkedHashSet<>(List.of(1, 2, 3))));
-        CompiledModule module = compile("@Script(name=\"T\", version=\"1\")\nscript T { int answer() { return sets.values().size } }");
+        CompiledModule module = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { int answer() { return sets.values().size } }");
         VmExecutionResult result = execute(module);
         assertTrue(result.success());
         assertEquals(3, ((Number) result.returnValue().boxed()).intValue());
@@ -339,7 +336,7 @@ class HardeningV2Test {
     @Test
     void languageServiceUsesV2SyntaxAndOneBasedCoordinates() {
         DefaultEditorSession editor = new DefaultEditorSession("T", "main.vls");
-        editor.updateText("script T {\n    int answer() { return 1 }\n    String text = \"answer { }\"\n    // answer\n    int run() { return answer() }\n}");
+        editor.updateText("@Script(\"T\")\nscript T {\n    answer() { return 1 }\n    text = \"answer { }\"\n    // answer\n    run() { return answer() }\n}");
         List<String> labels = editor.completions(1, 1).stream().map(io.velora.api.language.CompletionItem::label).toList();
         assertTrue(labels.contains("script"));
         assertTrue(labels.contains("Task"));
@@ -347,9 +344,9 @@ class HardeningV2Test {
         assertFalse(labels.contains("fun"));
         assertFalse(labels.contains("val"));
         assertEquals(1, editor.snapshot().tokens().get(0).column());
-        assertEquals(2, editor.definition(5, 25).orElseThrow().line());
-        assertEquals(9, editor.definition(5, 25).orElseThrow().column());
-        assertTrue(editor.hover(1, 2).orElseThrow().content().contains("Declares a Velora script"));
+        assertEquals(3, editor.definition(6, 24).orElseThrow().line());
+        assertEquals(5, editor.definition(6, 24).orElseThrow().column());
+        assertTrue(editor.hover(2, 2).orElseThrow().content().contains("Declares a Velora script"));
         assertEquals(2, editor.rename("answer", "result").size());
         editor.close();
     }
@@ -371,15 +368,15 @@ class HardeningV2Test {
         assertEquals(2, api.find("ann", "sum").parameters().size());
         assertEquals(VeloraTypes.INT, api.find("ann", "sum").parameters().get(0).type());
         api.freeze();
-        CompiledModule module = compile("@Script(name=\"T\", version=\"1\")\nscript T { int answer() { return ann.sum(20, 22) } }");
+        CompiledModule module = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { int answer() { return ann.sum(20, 22) } }");
         VmExecutionResult result = execute(module);
         assertTrue(result.success());
         assertEquals(42, ((Number) result.returnValue().boxed()).intValue());
-        CompiledModule durationModule = compile("@Script(name=\"D\", version=\"1\")\nscript D { Duration answer() { return ann.echoDuration(2.seconds) } }");
+        CompiledModule durationModule = compile("@Script(\"D\")\n@Version(\"1\")\nscript D { Duration answer() { return ann.echoDuration(2.seconds) } }");
         VmExecutionResult durationResult = new VirtualMachine(api, List.of(), 100_000).execute(durationModule, durationModule.functionByName("answer").index(), new ScriptValue[0]);
         assertTrue(durationResult.success());
         assertEquals(2_000_000_000L, ((Number) durationResult.returnValue().boxed()).longValue());
-        CompiledModule handleModule = compile("@Script(name=\"H\", version=\"1\")\nscript H { EntityRef answer() { return ann.entity() } }");
+        CompiledModule handleModule = compile("@Script(\"H\")\n@Version(\"1\")\nscript H { EntityRef answer() { return ann.entity() } }");
         VmExecutionResult handleResult = new VirtualMachine(api, List.of(), 100_000).execute(handleModule, handleModule.functionByName("answer").index(), new ScriptValue[0]);
         assertTrue(handleResult.success());
         assertTrue(entity == handleResult.returnValue().boxed());
@@ -424,18 +421,18 @@ class HardeningV2Test {
 
     @Test
     void lexicalScopesWhenSafeAccessAndStringIndexExecuteCorrectly() {
-        CompiledModule scopes = compile("@Script(name=\"T\", version=\"1\")\nscript T { int answer() { int x = 1\n if (true) { int x = 42 }\n when (2) { 1 -> { return 0 } 2 -> { } else -> { return 0 } }\n return x } }");
+        CompiledModule scopes = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { int answer() { int x = 1\n if (true) { int x = 42 }\n when (2) { 1 -> { return 0 } 2 -> { } else -> { return 0 } }\n return x } }");
         VmExecutionResult scopeResult = execute(scopes);
         assertTrue(scopeResult.success());
         assertEquals(1, ((Number) scopeResult.returnValue().boxed()).intValue());
-        CompiledModule stringIndex = compile("@Script(name=\"T2\", version=\"1\")\nscript T2 { char answer() { return \"abc\"[1] } }");
+        CompiledModule stringIndex = compile("@Script(\"T2\")\n@Version(\"1\")\nscript T2 { char answer() { return \"abc\"[1] } }");
         VmExecutionResult stringResult = execute(stringIndex);
         assertTrue(stringResult.success());
         assertEquals('b', stringResult.returnValue().boxed());
-        CompiledModule safe = compile("@Script(name=\"T3\", version=\"1\")\nscript T3 { int? answer() { String? value = null\n return value?.length } }");
+        CompiledModule safe = compile("@Script(\"T3\")\n@Version(\"1\")\nscript T3 { int? answer() { String? value = null\n return value?.length } }");
         assertTrue(execute(safe).returnValue().isNull());
         CompiledModule safeElvis = compiler().compileToModule(CompileRequest.builder("T4").source("main.vls",
-                "@Script(name=\"T4\", version=\"1\")\nscript T4 { int answer() { String? value = null\n return value?.length ?: 0 } }").build());
+                "@Script(\"T4\")\n@Version(\"1\")\nscript T4 { int answer() { String? value = null\n return value?.length ?: 0 } }").build());
         assertNotNull(safeElvis);
         assertEquals(0, ((Number) new VirtualMachine(api, List.of(), 100_000)
                 .execute(safeElvis, safeElvis.functionByName("answer").index(), new ScriptValue[0]).returnValue().boxed()).intValue());
@@ -443,19 +440,19 @@ class HardeningV2Test {
 
     @Test
     void nullableUnsafeAccessAndForTypeMismatchAreCompileErrors() {
-        List<Diagnostic> nullable = semanticDiagnostics("@Script(name=\"T\", version=\"1\")\nscript T { int answer() { String? value = null\n return value.length } }");
+        List<Diagnostic> nullable = semanticDiagnostics("@Script(\"T\")\n@Version(\"1\")\nscript T { int answer() { String? value = null\n return value.length } }");
         assertTrue(nullable.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_TYPE_MISMATCH));
-        List<Diagnostic> loop = semanticDiagnostics("@Script(name=\"T2\", version=\"1\")\nscript T2 { int answer() { List<int> values = [1]\n for (String value in values) { }\n return 1 } }");
+        List<Diagnostic> loop = semanticDiagnostics("@Script(\"T2\")\n@Version(\"1\")\nscript T2 { int answer() { List<int> values = [1]\n for (String value in values) { }\n return 1 } }");
         assertTrue(loop.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_TYPE_MISMATCH));
     }
 
     @Test
     void indexErrorsAndIntegerOverflowUseDedicatedRuntimeCodes() {
-        CompiledModule index = compile("@Script(name=\"T\", version=\"1\")\nscript T { int answer() { List<int> values = [1]\n return values[2] } }");
+        CompiledModule index = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { int answer() { List<int> values = [1]\n return values[2] } }");
         VmExecutionResult indexResult = execute(index);
         assertFalse(indexResult.success());
         assertEquals(DiagnosticCode.RUNTIME_INDEX_OUT_OF_BOUNDS, indexResult.error().code());
-        CompiledModule overflow = compile("@Script(name=\"T2\", version=\"1\")\nscript T2 { int answer() { int value = 2147483647\n return value + 1 } }");
+        CompiledModule overflow = compile("@Script(\"T2\")\n@Version(\"1\")\nscript T2 { int answer() { int value = 2147483647\n return value + 1 } }");
         VmExecutionResult overflowResult = execute(overflow);
         assertFalse(overflowResult.success());
         assertEquals(DiagnosticCode.RUNTIME_ARITHMETIC_OVERFLOW, overflowResult.error().code());
@@ -470,9 +467,9 @@ class HardeningV2Test {
                 new io.velora.api.type.EnumType.Constant("SECOND", Mode.SECOND)));
         DefaultScriptCompiler compiler = compiler();
         CompileRequest numberRequest = CompileRequest.builder("ConstT")
-                .source("main.vls", "@Script(name=\"ConstT\", version=\"1\")\nscript ConstT { int answer() { return Answers.VALUE } }").build();
+                .source("main.vls", "@Script(\"ConstT\")\n@Version(\"1\")\nscript ConstT { int answer() { return Answers.VALUE } }").build();
         CompileRequest modeRequest = CompileRequest.builder("EnumT")
-                .source("main.vls", "@Script(name=\"EnumT\", version=\"1\")\nscript EnumT { Mode answer() { return Mode.SECOND } }").build();
+                .source("main.vls", "@Script(\"EnumT\")\n@Version(\"1\")\nscript EnumT { Mode answer() { return Mode.SECOND } }").build();
         CompileResult numberResult = compiler.compile(numberRequest);
         CompileResult modeResult = compiler.compile(modeRequest);
         assertTrue(numberResult.success(), "Diagnostics: " + numberResult.diagnostics());
@@ -511,7 +508,7 @@ class HardeningV2Test {
         api.namespace("worker", ns -> ns.suspendFunction("value", VeloraTypes.INT, p -> {}, ctx -> 42)
                 .thread(io.velora.api.function.ScriptThread.WORKER));
         api.freeze();
-        CompiledModule module = compile("@Script(name=\"WorkerT\", version=\"1\")\nscript WorkerT { async int answer() { return worker.value() } }");
+        CompiledModule module = compile("@Script(\"WorkerT\")\n@Version(\"1\")\nscript WorkerT { async int answer() { return worker.value() } }");
         WorkerExecutor workers = new WorkerExecutor() {
             @Override public void execute(Runnable action) { executions[0]++; action.run(); }
             @Override public void shutdown() {}
@@ -524,22 +521,19 @@ class HardeningV2Test {
     }
 
     @Test
-    void eventDescriptorsAreValidatedAtCompileTimeAndContributePermissions() {
+    void eventDescriptorsAreValidatedAtCompileTime() {
         List<String> output = new ArrayList<>();
         var events = new io.velora.internal.event.DefaultEventRegistry(host(output));
-        var permission = io.velora.api.permission.ScriptPermission.of("client.events.tick", "Tick", "Tick events");
-        permissions.register(permission);
         events.register(io.velora.api.event.EventDescriptor.builder("client.tick")
-                .scriptName("ClientTick").payloadType(VeloraTypes.INT).permission(permission).build());
-        DefaultScriptCompiler compiler = new DefaultScriptCompiler(types, settings, api, constants, permissions, events);
+                .scriptName("ClientTick").payloadType(VeloraTypes.INT).build());
+        DefaultScriptCompiler compiler = new DefaultScriptCompiler(types, settings, api, constants, events);
         CompileResult good = compiler.compile(CompileRequest.builder("EventT").source("main.vls",
-                "@Script(name=\"EventT\", version=\"1\")\nscript EventT { event ClientTick(int value) { } }").build());
+                "@Script(\"EventT\")\n@Version(\"1\")\nscript EventT { @ClientTick ClientTick(int value) { } }").build());
         assertTrue(good.success(), "Diagnostics: " + good.diagnostics());
         CompiledModule module = compiler.compileToModule(CompileRequest.builder("EventT").source("main.vls",
-                "@Script(name=\"EventT\", version=\"1\")\nscript EventT { event ClientTick(int value) { } }").build());
-        assertTrue(module.requiredPermissions().contains(permission));
+                "@Script(\"EventT\")\n@Version(\"1\")\nscript EventT { @ClientTick ClientTick(int value) { } }").build());
         CompileResult bad = compiler.compile(CompileRequest.builder("BadEventT").source("main.vls",
-                "@Script(name=\"BadEventT\", version=\"1\")\nscript BadEventT { event ClientTick(String value) { } }").build());
+                "@Script(\"BadEventT\")\n@Version(\"1\")\nscript BadEventT { @ClientTick ClientTick(String value) { } }").build());
         assertFalse(bad.success());
         assertTrue(bad.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_TYPE_MISMATCH));
     }
@@ -561,7 +555,7 @@ class HardeningV2Test {
     @Test
     void compilerRejectsUnsafeAndDuplicatePathsAndHashesSourcesDeterministically() {
         DefaultScriptCompiler compiler = compiler();
-        String main = "@Script(name=\"Multi\", version=\"1\")\nscript Multi { int answer() { return helper() } }";
+        String main = "@Script(\"Multi\")\n@Version(\"1\")\nscript Multi { int answer() { return helper() } }";
         String helper = "int helper() { return 42 }";
         CompileResult traversal = compiler.compile(CompileRequest.builder("Multi").source("../main.vls", main).build());
         assertFalse(traversal.success());
@@ -577,21 +571,21 @@ class HardeningV2Test {
 
     @Test
     void invalidAnnotationPlacementAndMetadataAreRejected() {
-        ParseResult misplaced = Parser.parse("@Script(name=\"T\", version=\"1\")\nscript T { @Unknown int answer() { return 1 } }", "main.vls");
-        assertTrue(misplaced.diagnostics().stream().anyMatch(Diagnostic::isError));
-        List<Diagnostic> metadata = semanticDiagnostics("@Script(name=\"T\", version=\"1\", unknown=\"x\")\nscript T { int answer() { return 1 } }");
+        List<Diagnostic> misplaced = semanticDiagnostics("@Script(\"T\")\nscript T { @Unknown int answer() { return 1 } }");
+        assertTrue(misplaced.stream().anyMatch(Diagnostic::isError));
+        List<Diagnostic> metadata = semanticDiagnostics("@Script(\"T\", unknown=\"x\")\nscript T { int answer() { return 1 } }");
         assertTrue(metadata.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_INVALID_ARGUMENT));
     }
 
     @Test
     void elvisTypingAndUnknownMembersAreValidated() {
-        CompiledModule module = compile("@Script(name=\"ElvisT\", version=\"1\")\nscript ElvisT { int answer() { String? value = null\n return (value ?: \"ok\").length } }");
+        CompiledModule module = compile("@Script(\"ElvisT\")\n@Version(\"1\")\nscript ElvisT { int answer() { String? value = null\n return (value ?: \"ok\").length } }");
         VmExecutionResult result = execute(module);
         assertTrue(result.success());
         assertEquals(2, ((Number) result.returnValue().boxed()).intValue());
-        List<Diagnostic> incompatible = semanticDiagnostics("@Script(name=\"BadElvis\", version=\"1\")\nscript BadElvis { int answer() { String? value = null\n return value ?: 1 } }");
+        List<Diagnostic> incompatible = semanticDiagnostics("@Script(\"BadElvis\")\n@Version(\"1\")\nscript BadElvis { int answer() { String? value = null\n return value ?: 1 } }");
         assertTrue(incompatible.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_TYPE_MISMATCH));
-        List<Diagnostic> member = semanticDiagnostics("@Script(name=\"BadMember\", version=\"1\")\nscript BadMember { int answer() { String value = \"x\"\n return value.lenght } }");
+        List<Diagnostic> member = semanticDiagnostics("@Script(\"BadMember\")\n@Version(\"1\")\nscript BadMember { int answer() { String value = \"x\"\n return value.lenght } }");
         assertTrue(member.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL));
     }
 
@@ -602,12 +596,12 @@ class HardeningV2Test {
             @VeloraFunction(name = "echo") public Long echo(Long value) { return value; }
         }
         api.registerAnnotated(new Binding());
-        CompiledModule module = compile("@Script(name=\"NumberBinding\", version=\"1\")\nscript NumberBinding { long answer() { return numbers.echo(42) } }");
+        CompiledModule module = compile("@Script(\"NumberBinding\")\n@Version(\"1\")\nscript NumberBinding { long answer() { return numbers.echo(42) } }");
         VmExecutionResult result = execute(module);
         assertTrue(result.success(), String.valueOf(result.error()));
         assertEquals(42L, ((Number) result.returnValue().boxed()).longValue());
         api.namespace("named", ns -> ns.function("read", VeloraTypes.LONG, p -> p.required("value", VeloraTypes.LONG), ctx -> ctx.argument("value", Long.class)));
-        CompiledModule named = compile("@Script(name=\"NamedBinding\", version=\"1\")\nscript NamedBinding { long answer() { return named.read(42) } }");
+        CompiledModule named = compile("@Script(\"NamedBinding\")\n@Version(\"1\")\nscript NamedBinding { long answer() { return named.read(42) } }");
         VmExecutionResult namedResult = execute(named);
         assertTrue(namedResult.success(), String.valueOf(namedResult.error()));
         assertEquals(42L, ((Number) namedResult.returnValue().boxed()).longValue());
@@ -619,11 +613,11 @@ class HardeningV2Test {
         api.namespace("defaults", ns -> ns
                 .function("duration", VeloraTypes.LONG, p -> p.optional("value", VeloraTypes.DURATION, Duration.ofSeconds(2)), ctx -> ctx.argument("value", Duration.class).toNanos())
                 .function("uuid", VeloraTypes.STRING, p -> p.optional("value", VeloraTypes.UUID, id), ctx -> ctx.argument("value", UUID.class).toString()));
-        CompiledModule duration = compile("@Script(name=\"DefaultsDuration\", version=\"1\")\nscript DefaultsDuration { long answer() { return defaults.duration() } }");
+        CompiledModule duration = compile("@Script(\"DefaultsDuration\")\n@Version(\"1\")\nscript DefaultsDuration { long answer() { return defaults.duration() } }");
         VmExecutionResult durationResult = execute(duration);
         assertTrue(durationResult.success(), String.valueOf(durationResult.error()));
         assertEquals(Duration.ofSeconds(2).toNanos(), ((Number) durationResult.returnValue().boxed()).longValue());
-        CompiledModule uuid = compile("@Script(name=\"DefaultsUuid\", version=\"1\")\nscript DefaultsUuid { String answer() { return defaults.uuid() } }");
+        CompiledModule uuid = compile("@Script(\"DefaultsUuid\")\n@Version(\"1\")\nscript DefaultsUuid { String answer() { return defaults.uuid() } }");
         VmExecutionResult uuidResult = execute(uuid);
         assertTrue(uuidResult.success(), String.valueOf(uuidResult.error()));
         assertEquals(id.toString(), uuidResult.returnValue().boxed());
@@ -643,7 +637,6 @@ class HardeningV2Test {
                 context.types().handle("TemporaryType", Object.class);
                 context.settings().register(io.velora.api.setting.SettingKind.named("TemporarySetting").resultType(VeloraTypes.INT).build());
                 context.constants().register("Temporary", "VALUE", VeloraTypes.INT, 1);
-                context.permissions().register(io.velora.api.permission.ScriptPermission.of("temporary.permission", "Temporary", "Temporary"));
                 context.api().namespace("temporary", ns -> ns.function("value", VeloraTypes.INT, ctx -> 1));
                 context.events().register(io.velora.api.event.EventDescriptor.builder("temporary.event").scriptName("TemporaryEvent").payloadType(VeloraTypes.UNIT).build());
                 throw new IllegalStateException("boom");
@@ -653,7 +646,6 @@ class HardeningV2Test {
         assertNull(engine.types().find("TemporaryType"));
         assertNull(engine.settings().find("TemporarySetting"));
         assertNull(engine.constants().find("Temporary", "VALUE"));
-        assertNull(engine.permissions().find("temporary.permission"));
         assertNull(engine.api().find("temporary", "value"));
         assertNull(engine.events().find("temporary.event"));
     }
@@ -666,9 +658,6 @@ class HardeningV2Test {
         var kind = io.velora.api.setting.SettingKind.named("SingleKind").resultType(VeloraTypes.INT).build();
         settings.register(kind);
         assertThrows(IllegalStateException.class, () -> settings.register(kind));
-        var permission = io.velora.api.permission.ScriptPermission.of("single.permission", "Single", "Single");
-        permissions.register(permission);
-        assertThrows(IllegalStateException.class, () -> permissions.register(permission));
         assertThrows(IllegalArgumentException.class, () -> types.handle("bad.type", Object.class));
         assertThrows(IllegalArgumentException.class, () -> types.struct("BrokenStruct", Object.class, b -> b
                 .property("value", VeloraTypes.INT, ignored -> 1)
@@ -683,42 +672,37 @@ class HardeningV2Test {
         var events = new io.velora.internal.event.DefaultEventRegistry(host(new ArrayList<>()));
         events.register(io.velora.api.event.EventDescriptor.builder("client.tick").scriptName("ClientTick").payloadType(VeloraTypes.UNIT).build());
         events.register(io.velora.api.event.EventDescriptor.builder("client.value").scriptName("ClientValue").payloadType(VeloraTypes.INT).build());
-        DefaultScriptCompiler compiler = new DefaultScriptCompiler(types, settings, api, constants, permissions, events);
+        DefaultScriptCompiler compiler = new DefaultScriptCompiler(types, settings, api, constants, events);
         CompileResult good = compiler.compile(CompileRequest.builder("TickScript").source("main.vls",
-                "@Script(name=\"TickScript\", version=\"1\")\nscript TickScript { event ClientTick() { } }").build());
+                "@Script(\"TickScript\")\n@Version(\"1\")\nscript TickScript { @ClientTick ClientTick() { } }").build());
         assertTrue(good.success(), "Diagnostics: " + good.diagnostics());
         CompileResult ignoredReturn = compiler.compile(CompileRequest.builder("BadTickScript").source("main.vls",
-                "@Script(name=\"BadTickScript\", version=\"1\")\nscript BadTickScript { event ClientTick() { return false } }").build());
+                "@Script(\"BadTickScript\")\n@Version(\"1\")\nscript BadTickScript { @ClientTick ClientTick() { return false } }").build());
         assertFalse(ignoredReturn.success());
         assertTrue(ignoredReturn.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_VOID_RETURN_VALUE));
         CompileResult missingPayload = compiler.compile(CompileRequest.builder("BadValueScript").source("main.vls",
-                "@Script(name=\"BadValueScript\", version=\"1\")\nscript BadValueScript { event ClientValue() { } }").build());
+                "@Script(\"BadValueScript\")\n@Version(\"1\")\nscript BadValueScript { @ClientValue ClientValue() { } }").build());
         assertFalse(missingPayload.success());
         assertTrue(missingPayload.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_WRONG_ARITY));
     }
 
     @Test
-    void scriptMetadataCannotAdvertiseUnsupportedOrConflictingRuntimeContracts() {
+    void languageVersionAndScriptMetadataAreStrict() {
         DefaultScriptCompiler compiler = compiler();
-        CompileResult language = compiler.compile(CompileRequest.builder("Meta").source("main.vls",
-                "@Script(name=\"Meta\", version=\"1\", languageVersion=2)\nscript Meta { int answer() { return 1 } }").build());
+        CompileResult language = compiler.compile(CompileRequest.builder("Meta").languageVersion(1).source("main.vls",
+                "@Script(\"Meta\")\nscript Meta { answer() { return 1 } }").build());
         assertFalse(language.success());
         assertTrue(language.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.COMPILER_UNSUPPORTED_VERSION));
 
-        CompileResult engine = compiler.compile(CompileRequest.builder("Meta").source("main.vls",
-                "@Script(name=\"Meta\", version=\"1\", minEngineVersion=\"99.0.0\")\nscript Meta { int answer() { return 1 } }").build());
-        assertFalse(engine.success());
-        assertTrue(engine.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.COMPILER_UNSUPPORTED_VERSION));
+        CompileResult unsupported = compiler.compile(CompileRequest.builder("Meta").source("main.vls",
+                "@Script(\"Meta\")\n@Category(\"Combat\")\nscript Meta { answer() { return 1 } }").build());
+        assertFalse(unsupported.success());
+        assertTrue(unsupported.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_UNKNOWN_ANNOTATION));
 
-        CompileResult id = compiler.compile(CompileRequest.builder("folder-id").source("main.vls",
-                "@Script(id=\"other-id\", name=\"Meta\", version=\"1\")\nscript Meta { int answer() { return 1 } }").build());
-        assertFalse(id.success());
-        assertTrue(id.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_INVALID_ARGUMENT));
-
-        CompileResult website = compiler.compile(CompileRequest.builder("Meta").source("main.vls",
-                "@Script(name=\"Meta\", version=\"1\", website=\"https://example.com\")\nscript Meta { int answer() { return 1 } }").build());
-        assertFalse(website.success());
-        assertTrue(website.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_INVALID_ARGUMENT));
+        CompileResult duplicate = compiler.compile(CompileRequest.builder("Meta").source("main.vls",
+                "@Script(\"Meta\")\n@Version(\"1\")\n@Version(\"2\")\nscript Meta { answer() { return 1 } }").build());
+        assertFalse(duplicate.success());
+        assertTrue(duplicate.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_INVALID_ARGUMENT));
     }
 
     @Test
@@ -738,7 +722,7 @@ class HardeningV2Test {
             }
         }
         api.registerAnnotated(new Binding());
-        CompiledModule module = compile("@Script(name=\"TypedBinding\", version=\"1\")\nscript TypedBinding { int answer() { Vec3 point = typed.vec3()\n Color color = typed.color\n return typed.sum(point, color) } }");
+        CompiledModule module = compile("@Script(\"TypedBinding\")\n@Version(\"1\")\nscript TypedBinding { int answer() { Vec3 point = typed.vec3()\n Color color = typed.color\n return typed.sum(point, color) } }");
         VmExecutionResult result = execute(module);
         assertTrue(result.success(), String.valueOf(result.error()));
         assertEquals(62, ((Number) result.returnValue().boxed()).intValue());
@@ -747,7 +731,7 @@ class HardeningV2Test {
     private CompiledModule withFunction(CompiledModule base, CompiledFunction function) {
         return new CompiledModule(base.scriptId(), base.scriptName(), base.version(), base.languageVersion(), base.sourceHash(), base.registryHash(),
                 base.constantPool(), List.of(function), base.settings(), base.persistentFieldIds(), base.persistentFieldTypes(), base.persistentFieldIndices(),
-                base.persistentFieldIsStatic(), base.requiredPermissions(), base.maximumPermissions(), base.lifecycleHooks(), base.eventHandlers(),
+                base.persistentFieldIsStatic(), base.lifecycleHooks(), base.eventHandlers(),
                 base.fieldInitializers(), base.author(), base.description());
     }
 

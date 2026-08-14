@@ -15,15 +15,18 @@ import java.util.Set;
 
 public final class CompletionEngine {
     private static final List<String> KEYWORDS = List.of(
-            "script", "settings", "static", "async", "entry", "event", "void", "if", "else",
-            "while", "for", "when", "return", "is", "in",
+            "script", "static", "async", "if", "else", "while", "for", "when", "return", "is", "in",
             "spawn", "true", "false", "null"
     );
     private static final List<String> TYPES = List.of(
             "boolean", "byte", "int", "long", "float", "double", "char", "String", "Duration",
             "Vec2", "Vec3", "Color", "UUID", "List", "Map", "Set", "Task"
     );
-    private static final List<String> BUILTINS = List.of("await", "delay", "yield");
+    private static final List<String> BUILTINS = List.of("list", "set", "map", "await", "delay", "yield");
+    private static final List<String> ANNOTATIONS = List.of(
+            "Script", "Version", "Author", "Description", "Setting", "Persistent",
+            "Load", "Enable", "Run", "Disable", "Unload"
+    );
 
     private CompletionEngine() {}
 
@@ -59,25 +62,30 @@ public final class CompletionEngine {
             }
             return List.copyOf(result);
         }
+        if (annotationContext(content, line, column, prefix.length())) {
+            addAnnotations(result, seen, ANNOTATIONS, prefix, null, null);
+            if (eventRegistry != null) {
+                for (var event : eventRegistry.all()) addAnnotation(result, seen, event.scriptName(), prefix, event.payloadType().name(), event.description());
+            }
+            return List.copyOf(result);
+        }
         add(result, seen, KEYWORDS, CompletionItem.CompletionKind.KEYWORD, prefix);
         add(result, seen, TYPES, CompletionItem.CompletionKind.TYPE, prefix);
         add(result, seen, BUILTINS, CompletionItem.CompletionKind.FUNCTION, prefix);
         if (typeRegistry != null) add(result, seen, typeRegistry.names().stream().toList(), CompletionItem.CompletionKind.TYPE, prefix);
         if (apiRegistry != null) add(result, seen, apiRegistry.namespaces().stream().toList(), CompletionItem.CompletionKind.NAMESPACE, prefix);
         if (constantRegistry != null) add(result, seen, constantRegistry.namespaces().stream().toList(), CompletionItem.CompletionKind.NAMESPACE, prefix);
-        if (settingRegistry != null && insideSettings(content, line, column)) {
-            for (String kind : settingRegistry.names()) {
-                String label = "@" + kind;
-                if (matches(kind, prefix) && seen.add(label)) result.add(new CompletionItem(label, "Setting", null, label, CompletionItem.CompletionKind.SETTING));
-            }
-        }
-        if (eventRegistry != null) {
-            for (var event : eventRegistry.all()) {
-                String label = "Event." + event.scriptName();
-                if (matches(label, prefix) && seen.add(label)) result.add(new CompletionItem(label, event.payloadType().name(), event.description(), label, CompletionItem.CompletionKind.CONSTANT));
-            }
-        }
         return List.copyOf(result);
+    }
+
+    private static void addAnnotations(List<CompletionItem> result, Set<String> seen, List<String> names, String prefix, String detail, String documentation) {
+        for (String name : names) addAnnotation(result, seen, name, prefix, detail, documentation);
+    }
+
+    private static void addAnnotation(List<CompletionItem> result, Set<String> seen, String name, String prefix, String detail, String documentation) {
+        if (!matches(name, prefix)) return;
+        String label = "@" + name;
+        if (seen.add(label)) result.add(new CompletionItem(label, detail, documentation, label, CompletionItem.CompletionKind.SNIPPET));
     }
 
     private static void add(List<CompletionItem> result, Set<String> seen, List<String> values, CompletionItem.CompletionKind kind, String prefix) {
@@ -111,22 +119,11 @@ public final class CompletionEngine {
         return start == end ? null : source.substring(start, end);
     }
 
-    private static boolean insideSettings(String content, int line, int column) {
+    private static boolean annotationContext(String content, int line, int column, int prefixLength) {
         String[] lines = content.split("\\R", -1);
         if (line < 1 || line > lines.length) return false;
-        StringBuilder before = new StringBuilder();
-        for (int i = 0; i < line - 1; i++) before.append(lines[i]).append('\n');
-        before.append(lines[line - 1], 0, Math.min(column - 1, lines[line - 1].length()));
-        int settings = before.lastIndexOf("settings");
-        if (settings < 0) return false;
-        int open = before.indexOf("{", settings);
-        if (open < 0) return false;
-        int depth = 0;
-        for (int i = open; i < before.length(); i++) {
-            char c = before.charAt(i);
-            if (c == '{') depth++;
-            else if (c == '}') depth--;
-        }
-        return depth > 0;
+        String source = lines[line - 1];
+        int cursor = Math.min(column - 1, source.length()) - prefixLength;
+        return cursor > 0 && source.charAt(cursor - 1) == '@';
     }
 }

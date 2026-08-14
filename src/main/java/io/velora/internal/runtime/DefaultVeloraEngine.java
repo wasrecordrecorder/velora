@@ -15,7 +15,6 @@ import io.velora.api.function.FunctionDescriptor;
 import io.velora.api.language.LanguageService;
 import io.velora.api.registry.*;
 import io.velora.api.script.ScriptManager;
-import io.velora.api.permission.ScriptPermission;
 import io.velora.api.setting.SettingKind;
 import io.velora.api.type.VeloraTypes;
 import io.velora.host.VeloraHost;
@@ -39,7 +38,6 @@ public final class DefaultVeloraEngine implements VeloraEngine {
     private final VeloraEngineBuilder builder;
     private final DefaultTypeRegistry typeRegistry;
     private final DefaultSettingRegistry settingRegistry;
-    private final DefaultPermissionRegistry permissionRegistry;
     private final DefaultConstantRegistry constantRegistry;
     private final DefaultApiRegistry apiRegistry;
     private final DefaultExtensionRegistry extensionRegistry;
@@ -54,12 +52,9 @@ public final class DefaultVeloraEngine implements VeloraEngine {
     private final Profiler profiler = new Profiler();
     private final RuntimeErrorStore errorStore = new RuntimeErrorStore(100);
     private final ScriptLogStore logStore = new ScriptLogStore(1000);
-    private final PermissionController permissionController = new PermissionController();
     private final EnabledScriptsStore enabledScriptsStore;
     private final LogRateLimiter logRateLimiter = new LogRateLimiter(100);
     private final Map<EventHandlerKey, Long> runningEventHandlers = new HashMap<>();
-    private final Map<String, Long> runningTickHandlers = new HashMap<>();
-    private final Set<String> tickScheduleFailures = new HashSet<>();
     private final Map<EventHandlerKey, Deque<ScriptValue[]>> pendingEventHandlers = new HashMap<>();
     private final Map<String, Integer> pendingEventCountsByScript = new HashMap<>();
     private VeloraState state = VeloraState.CREATED;
@@ -69,7 +64,6 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         this.enabledScriptsStore = new EnabledScriptsStore(builder.host().fileSystem());
         this.typeRegistry = new DefaultTypeRegistry();
         this.settingRegistry = new DefaultSettingRegistry();
-        this.permissionRegistry = new DefaultPermissionRegistry();
         this.constantRegistry = new DefaultConstantRegistry();
         this.apiRegistry = new DefaultApiRegistry(typeRegistry);
         registerBuiltInApi();
@@ -83,7 +77,6 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         categoryRegistry.register(new ApiCategory("console", "Console", "Script console output"));
         categoryRegistry.register(new ApiCategory("log", "Logging", "Logging utilities"));
         categoryRegistry.register(new ApiCategory("settings", "Settings", "Script settings and configuration"));
-        categoryRegistry.register(new ApiCategory("permissions", "Permissions", "Permission management"));
         this.state = VeloraState.CONFIGURING;
     }
 
@@ -106,7 +99,6 @@ public final class DefaultVeloraEngine implements VeloraEngine {
             ns.function("error", VeloraTypes.UNIT, p -> p.required("message", VeloraTypes.STRING), ctx -> { writeLog(ctx, ScriptLogEntry.Level.ERROR, String.valueOf(ctx.argument(0)), hostLogger); return null; }).description("Logs an error message").categoryId("log");
             ns.function("debug", VeloraTypes.UNIT, p -> p.required("message", VeloraTypes.STRING), ctx -> { writeLog(ctx, ScriptLogEntry.Level.DEBUG, String.valueOf(ctx.argument(0)), hostLogger); return null; }).description("Logs a debug message").categoryId("log");
         });
-        permissionRegistry.register(io.velora.api.permission.ScriptPermission.of("LOCAL_STORAGE", "Local storage", "Allows reading and writing script-local persistent storage"));
     }
 
     private void writeLog(io.velora.api.function.FunctionContext ctx, ScriptLogEntry.Level level, String message, io.velora.host.VeloraLogger hostLogger) {
@@ -190,9 +182,6 @@ public final class DefaultVeloraEngine implements VeloraEngine {
     public SettingRegistry settings() { return settingRegistry; }
 
     @Override
-    public PermissionRegistry permissions() { return permissionRegistry; }
-
-    @Override
     public ConstantRegistry constants() { return constantRegistry; }
 
     @Override
@@ -205,7 +194,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
     public ScriptCompiler compiler() {
         if (compiler == null) {
             compiler = new DefaultScriptCompiler(typeRegistry, settingRegistry, apiRegistry,
-                    constantRegistry, permissionRegistry, eventRegistry);
+                    constantRegistry, eventRegistry);
         }
         return compiler;
     }
@@ -218,10 +207,10 @@ public final class DefaultVeloraEngine implements VeloraEngine {
             }
             if (compiler == null) {
                 compiler = new DefaultScriptCompiler(typeRegistry, settingRegistry, apiRegistry,
-                        constantRegistry, permissionRegistry, eventRegistry);
+                        constantRegistry, eventRegistry);
             }
             if (debugService == null) debugService = new DefaultDebugService(logStore, errorStore, profiler, scheduler);
-            scriptManager = new DefaultScriptManager(scheduler, compiler, builder.host(), permissionController, enabledScriptsStore, debugService, permissionRegistry, templateRegistry);
+            scriptManager = new DefaultScriptManager(scheduler, compiler, builder.host(), enabledScriptsStore, debugService, templateRegistry);
             enabledScriptsStore.load();
             eventRegistry.setDispatcher(this::dispatchEvent);
             eventRegistry.setOverflowHandler(this::failScriptsForEvent);
@@ -258,7 +247,6 @@ public final class DefaultVeloraEngine implements VeloraEngine {
             @Override public EventRegistry events() { return eventRegistry; }
             @Override public TypeRegistry types() { return typeRegistry; }
             @Override public SettingRegistry settings() { return settingRegistry; }
-            @Override public PermissionRegistry permissions() { return permissionRegistry; }
             @Override public ConstantRegistry constants() { return constantRegistry; }
             @Override public io.velora.api.script.ScriptTemplateRegistry templates() { return templateRegistry; }
             @Override public CategoryRegistry categories() { return categoryRegistry; }
@@ -266,7 +254,6 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         for (VeloraExtension ext : extensionRegistry.extensions()) {
             int apiSnapshot = apiRegistry.all().size();
             int catSnapshot = categoryRegistry.all().size();
-            int permSnapshot = permissionRegistry.all().size();
             int eventSnapshot = eventRegistry.all().size();
             int typeSnapshot = typeRegistry.all().size();
             int settingSnapshot = settingRegistry.all().size();
@@ -277,7 +264,6 @@ public final class DefaultVeloraEngine implements VeloraEngine {
             } catch (Throwable t) {
                 apiRegistry.rollbackTo(apiSnapshot);
                 categoryRegistry.rollbackTo(catSnapshot);
-                permissionRegistry.rollbackTo(permSnapshot);
                 eventRegistry.rollbackTo(eventSnapshot);
                 typeRegistry.rollbackTo(typeSnapshot);
                 settingRegistry.rollbackTo(settingSnapshot);
@@ -286,10 +272,8 @@ public final class DefaultVeloraEngine implements VeloraEngine {
                 throw t;
             }
         }
-        validatePermissionReferences();
         typeRegistry.freeze();
         settingRegistry.freeze();
-        permissionRegistry.freeze();
         constantRegistry.freeze();
         apiRegistry.freeze();
         extensionRegistry.freeze();
@@ -298,25 +282,12 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         categoryRegistry.freeze();
         if (compiler == null) {
             compiler = new DefaultScriptCompiler(typeRegistry, settingRegistry, apiRegistry,
-                    constantRegistry, permissionRegistry, eventRegistry);
+                    constantRegistry, eventRegistry);
         }
         compiler.freeze();
         state = VeloraState.FROZEN;
     }
 
-
-    private void validatePermissionReferences() {
-        for (var function : apiRegistry.all()) {
-            if (function.permission() != null && permissionRegistry.find(function.permission().id()) == null) {
-                throw new IllegalStateException("API " + function.qualifiedName() + " references unregistered permission: " + function.permission().id());
-            }
-        }
-        for (var event : eventRegistry.all()) {
-            if (event.permission() != null && permissionRegistry.find(event.permission().id()) == null) {
-                throw new IllegalStateException("Event " + event.id() + " references unregistered permission: " + event.permission().id());
-            }
-        }
-    }
 
     @Override
     public void tick() {
@@ -354,34 +325,6 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         // Dispatch pending events to script handlers before running fibers
         eventRegistry.dispatchPending();
 
-        if (scriptManager != null) {
-            for (var inst : scriptManager.repository().all()) {
-                String scriptId = inst.scriptId();
-                Long runningId = runningTickHandlers.get(scriptId);
-                if (runningId != null && scheduler.fiber(runningId) == null) {
-                    runningTickHandlers.remove(scriptId);
-                    runningId = null;
-                }
-                if (!inst.enabled()) {
-                    runningTickHandlers.remove(scriptId);
-                    tickScheduleFailures.remove(scriptId);
-                    continue;
-                }
-                var module = inst.compiledModule();
-                if (module == null || !module.lifecycleHooks().contains("ON_TICK") || runningId != null) continue;
-                int fnIdx = findFunctionIndex(module, "ON_TICK");
-                if (fnIdx < 0) continue;
-                var fiber = scheduler.spawnFiber(scriptId, fnIdx, new ScriptValue[0]);
-                if (fiber != null) {
-                    runningTickHandlers.put(scriptId, fiber.id());
-                    tickScheduleFailures.remove(scriptId);
-                } else if (tickScheduleFailures.add(scriptId)) {
-                    errorStore.record(scriptId, new io.velora.api.debug.RuntimeError(
-                            scriptId, -1, "ON_TICK", io.velora.api.compiler.DiagnosticCode.RUNTIME_RESOURCE_LIMIT.name(),
-                            "Unable to schedule ON_TICK: runtime resource limit", "", now));
-                }
-            }
-        }
 
         scheduler.tick(now, modules, scriptSettings);
         drainEventHandlers();
@@ -401,7 +344,6 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         }
         for (ScriptInstance instance : scriptManager.repository().all()) {
             if (!instance.enabled() || instance.compiledModule() == null) continue;
-            if (descriptor.permission() != null && !scriptManager.hasPermissionGrant(instance.scriptId(), io.velora.api.permission.PermissionSet.of(descriptor.permission()))) continue;
             for (var handler : instance.compiledModule().eventHandlers()) {
                 if (!matchesEvent(handler.eventReference(), scriptName, eventId)) continue;
                 var function = instance.compiledModule().function(handler.functionIndex());
@@ -555,8 +497,6 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         runningEventHandlers.keySet().removeIf(key -> key.scriptId.equals(scriptId));
         pendingEventHandlers.keySet().removeIf(key -> key.scriptId.equals(scriptId));
         pendingEventCountsByScript.remove(scriptId);
-        runningTickHandlers.remove(scriptId);
-        tickScheduleFailures.remove(scriptId);
         profiler.recordQueueDepth(scriptId, 0);
     }
 
@@ -597,7 +537,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
     }
 
     private static boolean matchesEvent(String reference, String scriptName, String eventId) {
-        return reference.equals(scriptName) || reference.equals(eventId) || reference.startsWith("Event.") && reference.substring(6).equals(scriptName);
+        return reference.equals(scriptName) || reference.equals(eventId);
     }
 
     private record EventHandlerKey(String scriptId, String eventId, int functionIndex) {}

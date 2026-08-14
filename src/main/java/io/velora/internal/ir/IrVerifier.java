@@ -86,7 +86,9 @@ public final class IrVerifier {
         else if (instruction instanceof IrInstruction.Spawn spawn) functionCall(module, function, spawn.functionIndex(), spawn.argCount(), index, diagnostics);
         else if (instruction instanceof IrInstruction.CallApi call && (call.apiIndex() < 0 || call.argCount() < 0)) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Invalid API call in " + function.name() + " at " + index);
         else if (instruction instanceof IrInstruction.CallSuspend call && (call.apiIndex() < 0 || call.argCount() < 0)) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Invalid suspend API call in " + function.name() + " at " + index);
+        else if (instruction instanceof IrInstruction.CallMember call && call.argCount() < 0) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Invalid member call in " + function.name() + " at " + index);
         else if (instruction instanceof IrInstruction.CreateList list && list.elementCount() < 0) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Negative list size in " + function.name() + " at " + index);
+        else if (instruction instanceof IrInstruction.CreateSet set && set.elementCount() < 0) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Negative set size in " + function.name() + " at " + index);
         else if (instruction instanceof IrInstruction.CreateMap map && map.entryCount() < 0) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Negative map size in " + function.name() + " at " + index);
         else if (instruction instanceof IrInstruction.Jump jump) jump(jump.targetBlock(), function, index, diagnostics);
         else if (instruction instanceof IrInstruction.JumpIfFalse jump) jump(jump.targetBlock(), function, index, diagnostics);
@@ -138,8 +140,10 @@ public final class IrVerifier {
             case IrInstruction.Call call -> call.argCount();
             case IrInstruction.CallApi call -> call.argCount();
             case IrInstruction.CallSuspend call -> call.argCount();
+            case IrInstruction.CallMember call -> call.argCount() + 1;
             case IrInstruction.Spawn spawn -> spawn.argCount();
             case IrInstruction.CreateList list -> list.elementCount();
+            case IrInstruction.CreateSet set -> set.elementCount();
             case IrInstruction.CreateMap map -> map.entryCount() * 2;
             default -> 0;
         };
@@ -168,8 +172,10 @@ public final class IrVerifier {
             case IrInstruction.Call call -> 1 - call.argCount();
             case IrInstruction.CallApi call -> 1 - call.argCount();
             case IrInstruction.CallSuspend call -> 1 - call.argCount();
+            case IrInstruction.CallMember call -> -call.argCount();
             case IrInstruction.Spawn spawn -> 1 - spawn.argCount();
             case IrInstruction.CreateList list -> 1 - list.elementCount();
+            case IrInstruction.CreateSet set -> 1 - set.elementCount();
             case IrInstruction.CreateMap map -> 1 - map.entryCount() * 2;
             default -> 0;
         };

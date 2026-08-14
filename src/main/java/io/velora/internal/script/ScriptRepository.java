@@ -38,7 +38,7 @@ public final class ScriptRepository {
             result.add(new ScriptDescriptor(
                 d.id(), d.name(), d.version(), d.author(), d.description(),
                 instance.status(), instance.enabled(),
-                d.sourceFiles(), d.permissions(), d.activeRevision(),
+                d.sourceFiles(), d.activeRevision(),
                 d.errorCount(), d.warningCount(), d.lastReloadTimeNanos()
             ));
         }

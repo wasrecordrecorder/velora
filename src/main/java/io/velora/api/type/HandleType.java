@@ -32,7 +32,7 @@ public final class HandleType implements VeloraType {
 
     @Override
     public boolean isHashable() {
-        return false; // Handles are not hashable as map keys in V1
+        return false; // Handles are not hashable as map keys
     }
 
     @Override

@@ -13,7 +13,7 @@ public final class IrOptimizer {
         for (IrFunction function : module.functions()) functions.add(optimizeFunction(function));
         return new IrModule(module.scriptId(), module.scriptName(), module.version(), module.languageVersion(), functions,
                 module.settings(), module.persistentFieldIds(), module.persistentFieldTypes(), module.persistentFieldIndices(),
-                module.persistentFieldIsStatic(), module.requiredPermissions(), module.maximumPermissions(), module.lifecycleHooks(),
+                module.persistentFieldIsStatic(), module.lifecycleHooks(),
                 module.eventHandlers(), module.fieldInitializers(), module.author(), module.description());
     }
 

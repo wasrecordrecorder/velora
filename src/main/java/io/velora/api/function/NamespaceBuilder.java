@@ -1,6 +1,5 @@
 package io.velora.api.function;
 
-import io.velora.api.permission.ScriptPermission;
 import io.velora.api.type.VeloraType;
 
 import java.util.function.Consumer;
@@ -23,15 +22,7 @@ public interface NamespaceBuilder {
      */
     NamespaceBuilder property(String name, VeloraType type, FunctionInvoker getter, String description);
 
-    /**
-     * Register a property with explicit permission.
-     */
-    NamespaceBuilder property(String name, VeloraType type, ScriptPermission permission, FunctionInvoker getter);
 
-    /**
-     * Register a property with explicit permission and description.
-     */
-    NamespaceBuilder property(String name, VeloraType type, ScriptPermission permission, FunctionInvoker getter, String description);
 
     /**
      * Register a synchronous function.
@@ -40,9 +31,7 @@ public interface NamespaceBuilder {
 
     NamespaceBuilder function(String name, VeloraType returnType, Consumer<ParameterListBuilder> parameters, FunctionInvoker invoker);
 
-    NamespaceBuilder function(String name, VeloraType returnType, ScriptPermission permission, FunctionInvoker invoker);
 
-    NamespaceBuilder function(String name, VeloraType returnType, Consumer<ParameterListBuilder> parameters, ScriptPermission permission, FunctionInvoker invoker);
 
     /**
      * Set description for the last registered function or property.
@@ -68,14 +57,4 @@ public interface NamespaceBuilder {
             FunctionInvoker invoker
     );
 
-    /**
-     * Register a suspending function with parameters and permission.
-     */
-    NamespaceBuilder suspendFunction(
-            String name,
-            VeloraType returnType,
-            Consumer<ParameterListBuilder> parameters,
-            ScriptPermission permission,
-            FunctionInvoker invoker
-    );
 }

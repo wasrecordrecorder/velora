@@ -29,7 +29,6 @@ class SchedulerV2Test {
 
     private DefaultTypeRegistry typeRegistry;
     private DefaultSettingRegistry settingRegistry;
-    private DefaultPermissionRegistry permissionRegistry;
     private DefaultConstantRegistry constantRegistry;
     private DefaultApiRegistry apiRegistry;
 
@@ -37,7 +36,6 @@ class SchedulerV2Test {
     void setUp() {
         typeRegistry = new DefaultTypeRegistry();
         settingRegistry = new DefaultSettingRegistry();
-        permissionRegistry = new DefaultPermissionRegistry();
         constantRegistry = new DefaultConstantRegistry();
         apiRegistry = new DefaultApiRegistry(new DefaultTypeRegistry());
     }
@@ -46,7 +44,7 @@ class SchedulerV2Test {
         ParseResult parseResult = Parser.parse(source, "main.vls");
         assertNotNull(parseResult.scriptNode());
         SemanticAnalyzer analyzer = new SemanticAnalyzer(
-                typeRegistry, settingRegistry, apiRegistry, constantRegistry, permissionRegistry);
+                typeRegistry, settingRegistry, apiRegistry, constantRegistry);
         ResolvedScript resolved = analyzer.analyze(parseResult.scriptNode());
         IrModule irModule = new IrBuilder(resolved, apiRegistry).build();
         return new BytecodeWriter().write(irModule);
@@ -65,7 +63,7 @@ class SchedulerV2Test {
     @Test
     @DisplayName("Fiber starts in READY state")
     void fiberStartsReady() {
-        CompiledModule m = compile("@Script(name=\"T\", version=\"1\")\nscript T {\n    int run() { return 42 }\n}");
+        CompiledModule m = compile("@Script(\"T\")\n@Version(\"1\")\nscript T {\n    int run() { return 42 }\n}");
         ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), apiRegistry);
         ScriptFiber fiber = scheduler.spawnFiber("T", 0, new ScriptValue[0]);
         assertEquals(FiberState.READY, fiber.state());
@@ -76,7 +74,7 @@ class SchedulerV2Test {
     @Test
     @DisplayName("Fiber completes after tick")
     void fiberCompletes() {
-        CompiledModule m = compile("@Script(name=\"T\", version=\"1\")\nscript T {\n    int run() { return 42 }\n}");
+        CompiledModule m = compile("@Script(\"T\")\n@Version(\"1\")\nscript T {\n    int run() { return 42 }\n}");
         ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), apiRegistry);
         ScriptFiber fiber = scheduler.spawnFiber("T", 0, new ScriptValue[0]);
         scheduler.tick(System.nanoTime(), modules(m), emptySettings());
@@ -87,7 +85,7 @@ class SchedulerV2Test {
     @Test
     @DisplayName("Fiber with args")
     void fiberWithArgs() {
-        CompiledModule m = compile("@Script(name=\"T\", version=\"1\")\nscript T {\n    int run(int n) { return n + 1 }\n}");
+        CompiledModule m = compile("@Script(\"T\")\n@Version(\"1\")\nscript T {\n    int run(int n) { return n + 1 }\n}");
         ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), apiRegistry);
         ScriptFiber fiber = scheduler.spawnFiber("T", 0, new ScriptValue[]{PrimitiveValue.of(41)});
         scheduler.tick(System.nanoTime(), modules(m), emptySettings());
@@ -99,7 +97,7 @@ class SchedulerV2Test {
     @Test
     @DisplayName("Delay puts fiber to sleep")
     void delaySleeps() {
-        CompiledModule m = compile("@Script(name=\"T\", version=\"1\")\nscript T {\n    async void run() { delay(1000000000) }\n}");
+        CompiledModule m = compile("@Script(\"T\")\n@Version(\"1\")\nscript T {\n    async run() { delay(1000000000) }\n}");
         ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), apiRegistry);
         ScriptFiber fiber = scheduler.spawnFiber("T", 0, new ScriptValue[0]);
         long now = System.nanoTime();
@@ -110,7 +108,7 @@ class SchedulerV2Test {
     @Test
     @DisplayName("Fiber wakes after delay completes")
     void delayWakes() {
-        CompiledModule m = compile("@Script(name=\"T\", version=\"1\")\nscript T {\n    async void run() { delay(1000000000) }\n}");
+        CompiledModule m = compile("@Script(\"T\")\n@Version(\"1\")\nscript T {\n    async run() { delay(1000000000) }\n}");
         ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), apiRegistry);
         ScriptFiber fiber = scheduler.spawnFiber("T", 0, new ScriptValue[0]);
         long now = System.nanoTime();
@@ -123,7 +121,7 @@ class SchedulerV2Test {
     @Test
     @DisplayName("Injected runtime clock drives delay scheduling")
     void injectedClockDrivesDelayScheduling() {
-        CompiledModule m = compile("@Script(name=\"T\", version=\"1\")\nscript T { async void run() { delay(100) } }");
+        CompiledModule m = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { async run() { delay(100) } }");
         AtomicLong now = new AtomicLong(1_000);
         ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), apiRegistry,
                 new io.velora.internal.debug.RuntimeErrorStore(10), null, constantRegistry, typeRegistry, now::get);
@@ -143,7 +141,7 @@ class SchedulerV2Test {
     @Test
     @DisplayName("Short delay completes quickly")
     void shortDelay() {
-        CompiledModule m = compile("@Script(name=\"T\", version=\"1\")\nscript T {\n    async void run() { delay(1) }\n}");
+        CompiledModule m = compile("@Script(\"T\")\n@Version(\"1\")\nscript T {\n    async run() { delay(1) }\n}");
         ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), apiRegistry);
         ScriptFiber fiber = scheduler.spawnFiber("T", 0, new ScriptValue[0]);
         long now = System.nanoTime();
@@ -158,7 +156,8 @@ class SchedulerV2Test {
     @DisplayName("Spawn child and await result")
     void spawnAwait() {
         CompiledModule m = compile("""
-            @Script(name="T", version="1")
+            @Script("T")
+@Version("1")
             script T {
                 int child() { return 42 }
                 async int run() { Task<int> r = spawn child()
@@ -181,7 +180,8 @@ class SchedulerV2Test {
     @DisplayName("Completed spawned tasks remain awaitable")
     void completedSpawnedTasksRemainAwaitable() {
         CompiledModule m = compile("""
-            @Script(name="T", version="1")
+            @Script("T")
+@Version("1")
             script T {
                 int first() { return 20 }
                 int second() { return 22 }
@@ -206,10 +206,11 @@ class SchedulerV2Test {
     @DisplayName("Spawn child without await - child runs independently")
     void spawnNoAwait() {
         CompiledModule m = compile("""
-            @Script(name="T", version="1")
+            @Script("T")
+@Version("1")
             script T {
                 int child() { return 42 }
-                async void run() { spawn child() }
+                async run() { spawn child() }
             }
             """);
         ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), apiRegistry);
@@ -226,7 +227,7 @@ class SchedulerV2Test {
     @Test
     @DisplayName("Cancel sleeping fiber")
     void cancelSleeping() {
-        CompiledModule m = compile("@Script(name=\"T\", version=\"1\")\nscript T {\n    async void run() { delay(999999999999) }\n}");
+        CompiledModule m = compile("@Script(\"T\")\n@Version(\"1\")\nscript T {\n    async run() { delay(999999999999) }\n}");
         ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), apiRegistry);
         ScriptFiber fiber = scheduler.spawnFiber("T", 0, new ScriptValue[0]);
         long now = System.nanoTime();
@@ -242,7 +243,7 @@ class SchedulerV2Test {
     @Test
     @DisplayName("Cancel ready fiber before execution")
     void cancelReady() {
-        CompiledModule m = compile("@Script(name=\"T\", version=\"1\")\nscript T {\n    async void run() { delay(999999999999) }\n}");
+        CompiledModule m = compile("@Script(\"T\")\n@Version(\"1\")\nscript T {\n    async run() { delay(999999999999) }\n}");
         ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), apiRegistry);
         ScriptFiber fiber = scheduler.spawnFiber("T", 0, new ScriptValue[0]);
         scheduler.cancelFiber(fiber.id());
@@ -255,7 +256,7 @@ class SchedulerV2Test {
     @Test
     @DisplayName("Multiple fibers execute in same tick")
     void multipleFibers() {
-        CompiledModule m = compile("@Script(name=\"T\", version=\"1\")\nscript T {\n    int run() { return 42 }\n}");
+        CompiledModule m = compile("@Script(\"T\")\n@Version(\"1\")\nscript T {\n    int run() { return 42 }\n}");
         ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), apiRegistry);
         ScriptFiber f1 = scheduler.spawnFiber("T", 0, new ScriptValue[0]);
         ScriptFiber f2 = scheduler.spawnFiber("T", 0, new ScriptValue[0]);
@@ -269,7 +270,7 @@ class SchedulerV2Test {
     @Test
     @DisplayName("Fiber IDs are unique and sequential")
     void fiberIds() {
-        CompiledModule m = compile("@Script(name=\"T\", version=\"1\")\nscript T {\n    int run() { return 42 }\n}");
+        CompiledModule m = compile("@Script(\"T\")\n@Version(\"1\")\nscript T {\n    int run() { return 42 }\n}");
         ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), apiRegistry);
         ScriptFiber f1 = scheduler.spawnFiber("T", 0, new ScriptValue[0]);
         ScriptFiber f2 = scheduler.spawnFiber("T", 0, new ScriptValue[0]);

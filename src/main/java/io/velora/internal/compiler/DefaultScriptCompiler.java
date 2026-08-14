@@ -31,25 +31,22 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
     private final SettingRegistry settingRegistry;
     private final ApiRegistry apiRegistry;
     private final ConstantRegistry constantRegistry;
-    private final PermissionRegistry permissionRegistry;
     private final EventRegistry eventRegistry;
     private final BytecodeCache cache = new BytecodeCache();
     private boolean frozen;
 
     public DefaultScriptCompiler(TypeRegistry typeRegistry, SettingRegistry settingRegistry,
-                                 ApiRegistry apiRegistry, ConstantRegistry constantRegistry,
-                                 PermissionRegistry permissionRegistry) {
-        this(typeRegistry, settingRegistry, apiRegistry, constantRegistry, permissionRegistry, null);
+                                 ApiRegistry apiRegistry, ConstantRegistry constantRegistry) {
+        this(typeRegistry, settingRegistry, apiRegistry, constantRegistry, null);
     }
 
     public DefaultScriptCompiler(TypeRegistry typeRegistry, SettingRegistry settingRegistry,
                                  ApiRegistry apiRegistry, ConstantRegistry constantRegistry,
-                                 PermissionRegistry permissionRegistry, EventRegistry eventRegistry) {
+                                 EventRegistry eventRegistry) {
         this.typeRegistry = typeRegistry;
         this.settingRegistry = settingRegistry;
         this.apiRegistry = apiRegistry;
         this.constantRegistry = constantRegistry;
-        this.permissionRegistry = permissionRegistry;
         this.eventRegistry = eventRegistry;
     }
 
@@ -72,7 +69,7 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
 
     private Compilation compileInternal(CompileRequest request) {
         List<Diagnostic> diagnostics = new ArrayList<>();
-        if (request.languageVersion() > 1) {
+        if (request.languageVersion() != 2) {
             diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_UNSUPPORTED_VERSION,
                     "Unsupported language version: " + request.languageVersion(), SourceRange.of("main.vls", 0, 0)));
             return Compilation.failure(diagnostics);
@@ -114,7 +111,7 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
         diagnostics.addAll(parseResult.diagnostics());
         if (hasErrors(diagnostics) || parseResult.scriptNode() == null) return Compilation.failure(diagnostics);
 
-        SemanticAnalyzer analyzer = new SemanticAnalyzer(typeRegistry, settingRegistry, apiRegistry, constantRegistry, permissionRegistry, eventRegistry);
+        SemanticAnalyzer analyzer = new SemanticAnalyzer(typeRegistry, settingRegistry, apiRegistry, constantRegistry, eventRegistry);
         ResolvedScript resolved = analyzer.analyze(parseResult.scriptNode());
         diagnostics.addAll(analyzer.diagnostics());
         validateScriptMetadata(request, parseResult, resolved, diagnostics);
@@ -133,51 +130,9 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
 
 
     private void validateScriptMetadata(CompileRequest request, ParseResult parseResult, ResolvedScript resolved, List<Diagnostic> diagnostics) {
-        if (resolved.languageVersion() != 1) {
+        if (resolved.languageVersion() != request.languageVersion()) {
             diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_UNSUPPORTED_VERSION,
-                    "Unsupported language version: " + resolved.languageVersion(), SourceRange.of(parseResult.scriptNode().filePath(), 0, 0)));
-        }
-        String declaredId = null;
-        for (var annotation : parseResult.scriptNode().annotations()) {
-            if (annotation.name().equals("Script") && annotation.namedArg("id") instanceof String id) declaredId = id;
-        }
-        if (declaredId != null && !declaredId.equals(request.scriptId())) {
-            diagnostics.add(Diagnostic.error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT,
-                    "@Script id '" + declaredId + "' must match project id '" + request.scriptId() + "'", SourceRange.of(parseResult.scriptNode().filePath(), 0, 0)));
-        }
-        String minimum = resolved.metadata().minEngineVersion();
-        if (minimum != null) {
-            int comparison = compareVersions(io.velora.api.Velora.version(), minimum);
-            if (comparison == Integer.MIN_VALUE) {
-                diagnostics.add(Diagnostic.error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT,
-                        "Invalid minEngineVersion: " + minimum, SourceRange.of(parseResult.scriptNode().filePath(), 0, 0)));
-            } else if (comparison < 0) {
-                diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_UNSUPPORTED_VERSION,
-                        "Script requires Velora " + minimum + " or newer; current engine is " + io.velora.api.Velora.version(), SourceRange.of(parseResult.scriptNode().filePath(), 0, 0)));
-            }
-        }
-    }
-
-    private int compareVersions(String current, String required) {
-        int[] left = numericVersion(current);
-        int[] right = numericVersion(required);
-        if (left == null || right == null) return Integer.MIN_VALUE;
-        for (int i = 0; i < 3; i++) {
-            int comparison = Integer.compare(left[i], right[i]);
-            if (comparison != 0) return comparison;
-        }
-        return 0;
-    }
-
-    private int[] numericVersion(String value) {
-        if (value == null || !value.matches("\\d+(\\.\\d+){0,2}")) return null;
-        String[] parts = value.split("\\.");
-        int[] result = new int[3];
-        try {
-            for (int i = 0; i < parts.length; i++) result[i] = Integer.parseInt(parts[i]);
-            return result;
-        } catch (NumberFormatException ignored) {
-            return null;
+                    "Script language version does not match compile request", SourceRange.of(parseResult.scriptNode().filePath(), 0, 0)));
         }
     }
 
@@ -249,8 +204,6 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
         });
         apiRegistry.all().stream().sorted(Comparator.comparing(FunctionDescriptor::qualifiedName)).forEach(function -> {
             out.append("F|").append(function.qualifiedName()).append('|').append(function.returnType().name()).append('|').append(function.suspending()).append('|').append(function.thread()).append('|').append(function.cost()).append('|');
-            if (function.permission() != null) out.append(function.permission().id());
-            out.append('|');
             function.parameters().forEach(parameter -> out.append(parameter.name()).append(':').append(parameter.type().name()).append(':').append(parameter.required()).append(':').append(parameter.hasDefault()).append(':').append(stableValue(parameter.defaultValue())).append(','));
             out.append(';');
         });
@@ -260,9 +213,8 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             out.append(kind.editor().map(editor -> editor.editorId()).orElse("")).append(';');
         });
         constantRegistry.all().stream().sorted(Comparator.comparing(ConstantRegistry.Constant::qualifiedName)).forEach(constant -> out.append("C|").append(constant.qualifiedName()).append('|').append(constant.type().name()).append('|').append(stableValue(constant.value())).append(';'));
-        permissionRegistry.all().stream().sorted(Comparator.comparing(io.velora.api.permission.ScriptPermission::id)).forEach(permission -> out.append("P|").append(permission.id()).append('|').append(permission.displayName()).append('|').append(permission.description()).append('|').append(permission.categoryId()).append('|').append(permission.extensionId()).append(';'));
         if (eventRegistry != null) {
-            eventRegistry.all().stream().sorted(Comparator.comparing(EventDescriptor::id)).forEach(event -> out.append("E|").append(event.id()).append('|').append(event.scriptName()).append('|').append(event.payloadType().name()).append('|').append(event.defaultConcurrency()).append('|').append(event.queueLimit()).append('|').append(event.overflowPolicy()).append('|').append(event.cost()).append('|').append(event.permission() != null ? event.permission().id() : "").append(';'));
+            eventRegistry.all().stream().sorted(Comparator.comparing(EventDescriptor::id)).forEach(event -> out.append("E|").append(event.id()).append('|').append(event.scriptName()).append('|').append(event.payloadType().name()).append('|').append(event.defaultConcurrency()).append('|').append(event.queueLimit()).append('|').append(event.overflowPolicy()).append('|').append(event.cost()).append(';'));
         }
         return SourceHash.compute(out.toString());
     }
@@ -302,7 +254,7 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
     private byte[] serializeBytecode(CompiledModule module) {
         try (ByteArrayOutputStream bytes = new ByteArrayOutputStream(); DataOutputStream out = new DataOutputStream(bytes)) {
             out.writeUTF("VLCB");
-            out.writeInt(2);
+            out.writeInt(3);
             writeString(out, module.scriptId());
             writeString(out, module.scriptName());
             writeString(out, module.version());
@@ -374,18 +326,17 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
     }
 
     public static CompiledModule deserializeBytecode(byte[] data,
-                                                      List<io.velora.api.setting.SettingDescriptor> settings,
-                                                      io.velora.api.permission.PermissionSet requiredPermissions,
-                                                      io.velora.api.permission.PermissionSet maximumPermissions) {
+                                                      List<io.velora.api.setting.SettingDescriptor> settings) {
         if (data == null || data.length == 0) return null;
         try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(data))) {
             if (!"VLCB".equals(in.readUTF())) return null;
             int format = in.readInt();
-            if (format < 1 || format > 2) return null;
+            if (format < 1 || format > 3) return null;
             String scriptId = readString(in, format);
             String scriptName = readString(in, format);
             String version = readString(in, format);
             int languageVersion = in.readInt();
+            if (languageVersion != 2) return null;
             String sourceHash = readString(in, format);
             String registryHash = readString(in, format);
 
@@ -457,7 +408,7 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             CompiledModule module = new CompiledModule(scriptId, scriptName, version, languageVersion,
                     sourceHash, registryHash, pool, functions, settings,
                     persistentFieldIds, persistentFieldTypes, persistentFieldIndices, persistentFieldIsStatic,
-                    requiredPermissions, maximumPermissions, lifecycleHooks, eventHandlers, initializers, author, description);
+                    lifecycleHooks, eventHandlers, initializers, author, description);
             return new BytecodeVerifier().verify(module).stream().anyMatch(Diagnostic::isError) ? null : module;
         } catch (IOException | RuntimeException e) {
             return null;
@@ -506,6 +457,24 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
         if (value instanceof PrimitiveValue.ByteV v) { out.writeByte(6); out.writeByte(v.value()); return; }
         if (value instanceof PrimitiveValue.CharV v) { out.writeByte(7); out.writeChar(v.value()); return; }
         if (value instanceof StringValue v) { out.writeByte(8); writeString(out, v.value()); return; }
+        if (value instanceof ListValue v) {
+            out.writeByte(9);
+            out.writeInt(v.elements().size());
+            for (ScriptValue element : v.elements()) writeValue(out, element);
+            return;
+        }
+        if (value instanceof SetValue v) {
+            out.writeByte(10);
+            out.writeInt(v.elements().size());
+            for (ScriptValue element : v.elements()) writeValue(out, element);
+            return;
+        }
+        if (value instanceof MapValue v) {
+            out.writeByte(11);
+            out.writeInt(v.entries().size());
+            for (var entry : v.entries().entrySet()) { writeValue(out, entry.getKey()); writeValue(out, entry.getValue()); }
+            return;
+        }
         throw new IllegalArgumentException("Unsupported field initializer value: " + value.getClass().getSimpleName());
     }
 
@@ -520,6 +489,24 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             case 6 -> PrimitiveValue.of(in.readByte());
             case 7 -> PrimitiveValue.of(in.readChar());
             case 8 -> new StringValue(readString(in, 2));
+            case 9 -> {
+                int count = readCount(in, 1_000_000);
+                List<ScriptValue> values = new ArrayList<>(count);
+                for (int i = 0; i < count; i++) values.add(readValue(in));
+                yield new ListValue(values);
+            }
+            case 10 -> {
+                int count = readCount(in, 1_000_000);
+                Set<ScriptValue> values = new LinkedHashSet<>();
+                for (int i = 0; i < count; i++) values.add(readValue(in));
+                yield new SetValue(values);
+            }
+            case 11 -> {
+                int count = readCount(in, 1_000_000);
+                Map<ScriptValue, ScriptValue> values = new LinkedHashMap<>();
+                for (int i = 0; i < count; i++) values.put(readValue(in), readValue(in));
+                yield new MapValue(values);
+            }
             default -> throw new IOException("Invalid initializer value tag");
         };
     }

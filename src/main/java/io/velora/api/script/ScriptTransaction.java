@@ -23,7 +23,6 @@ public interface ScriptTransaction {
     enum ConflictReason {
         SOURCE_REVISION_CONFLICT,
         SETTING_MIGRATION_CONFLICT,
-        PERMISSION_CONFLICT,
         COMPILE_ERROR,
         ACTIVATION_ERROR
     }

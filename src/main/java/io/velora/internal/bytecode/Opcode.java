@@ -55,11 +55,13 @@ public enum Opcode {
     CALL(2),           // CALL functionIndex argCount
     CALL_API(2),       // CALL_API apiIndex argCount
     CALL_SUSPEND(2),   // CALL_SUSPEND apiIndex argCount (returns a task)
+    CALL_MEMBER(2),    // CALL_MEMBER memberIndex argCount
     GET_MEMBER(1),     // GET_MEMBER memberIndex (struct property)
     SET_MEMBER(1),
 
     // Collections
     CREATE_LIST(1),    // CREATE_LIST elementCount
+    CREATE_SET(1),     // CREATE_SET elementCount
     CREATE_MAP(1),     // CREATE_MAP entryCount
     GET_INDEX(0),
 

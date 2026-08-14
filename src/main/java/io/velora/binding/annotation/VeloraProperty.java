@@ -12,8 +12,6 @@ import java.lang.annotation.Target;
 public @interface VeloraProperty {
     String name();
 
-    String permission() default "";
-
     int cost() default 1;
 
     ScriptThread thread() default ScriptThread.ANY;

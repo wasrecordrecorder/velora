@@ -1,7 +1,6 @@
 package io.velora.internal.registry;
 
 import io.velora.api.function.*;
-import io.velora.api.permission.ScriptPermission;
 import io.velora.api.registry.TypeRegistry;
 import io.velora.api.type.VeloraType;
 
@@ -143,104 +142,79 @@ public final class DefaultApiRegistry implements ApiRegistry {
 
     private final class NamespaceBuilderImpl implements NamespaceBuilder {
         private final String ns;
-        private FunctionDescriptor lastRegistered = null;
+        private FunctionDescriptor lastRegistered;
 
-        NamespaceBuilderImpl(String ns) {
-            this.ns = ns;
-        }
+        NamespaceBuilderImpl(String ns) { this.ns = ns; }
 
-        @Override
-        public String namespace() {
-            return ns;
-        }
+        @Override public String namespace() { return ns; }
 
         @Override
         public NamespaceBuilder property(String name, VeloraType type, FunctionInvoker getter) {
-            return property(name, type, null, getter, "");
+            return property(name, type, getter, "");
         }
 
         @Override
         public NamespaceBuilder property(String name, VeloraType type, FunctionInvoker getter, String description) {
-            return property(name, type, null, getter, description);
-        }
-
-        @Override
-        public NamespaceBuilder property(String name, VeloraType type, ScriptPermission permission, FunctionInvoker getter) {
-            return property(name, type, permission, getter, "");
-        }
-
-        @Override
-        public NamespaceBuilder property(String name, VeloraType type, ScriptPermission permission, FunctionInvoker getter, String description) {
-            FunctionDescriptor fd = FunctionDescriptor.builder()
-                    .namespace(ns).name(name)
-                    .returns(type)
-                    .permission(permission)
-                    .invoker(getter)
-                    .description(description)
-                    .build();
-            registerFromBuilder(fd);
-            lastRegistered = fd;
+            FunctionDescriptor descriptor = FunctionDescriptor.builder()
+                    .namespace(ns).name(name).returns(type).invoker(getter).description(description).build();
+            registerFromBuilder(descriptor);
+            lastRegistered = descriptor;
             return this;
         }
 
         @Override
         public NamespaceBuilder function(String name, VeloraType returnType, FunctionInvoker invoker) {
-            return function(name, returnType, parameters -> {}, null, invoker);
+            return function(name, returnType, parameters -> {}, invoker);
         }
 
         @Override
         public NamespaceBuilder function(String name, VeloraType returnType, Consumer<ParameterListBuilder> parameters, FunctionInvoker invoker) {
-            return function(name, returnType, parameters, null, invoker);
+            ParameterListBuilder builder = new ParameterListBuilder();
+            parameters.accept(builder);
+            FunctionDescriptor descriptor = FunctionDescriptor.builder()
+                    .namespace(ns).name(name).parameters(builder.build()).returns(returnType).invoker(invoker).build();
+            registerFromBuilder(descriptor);
+            lastRegistered = descriptor;
+            return this;
         }
 
         @Override
-        public NamespaceBuilder function(String name, VeloraType returnType, ScriptPermission permission, FunctionInvoker invoker) {
-            return function(name, returnType, parameters -> {}, permission, invoker);
-        }
-
-        @Override
-        public NamespaceBuilder function(String name, VeloraType returnType, Consumer<ParameterListBuilder> parameters, ScriptPermission permission, FunctionInvoker invoker) {
-            ParameterListBuilder pb = new ParameterListBuilder();
-            parameters.accept(pb);
-            FunctionDescriptor fd = FunctionDescriptor.builder()
-                    .namespace(ns).name(name)
-                    .parameters(pb.build())
-                    .returns(returnType)
-                    .permission(permission)
-                    .invoker(invoker)
-                    .build();
-            registerFromBuilder(fd);
-            lastRegistered = fd;
+        public NamespaceBuilder suspendFunction(String name, VeloraType returnType, Consumer<ParameterListBuilder> parameters, FunctionInvoker invoker) {
+            ParameterListBuilder builder = new ParameterListBuilder();
+            parameters.accept(builder);
+            FunctionDescriptor descriptor = FunctionDescriptor.builder()
+                    .namespace(ns).name(name).parameters(builder.build()).returns(returnType).suspending(true).invoker(invoker).build();
+            registerFromBuilder(descriptor);
+            lastRegistered = descriptor;
             return this;
         }
 
         @Override
         public NamespaceBuilder description(String description) {
-            if (lastRegistered != null) replaceLast(copyLast(description, lastRegistered.categoryId()));
+            if (lastRegistered != null) replaceLast(copyLast(description, lastRegistered.categoryId(), lastRegistered.thread(), lastRegistered.cost()));
             return this;
         }
 
         @Override
         public NamespaceBuilder categoryId(String categoryId) {
-            if (lastRegistered != null) replaceLast(copyLast(lastRegistered.description(), categoryId));
+            if (lastRegistered != null) replaceLast(copyLast(lastRegistered.description(), categoryId, lastRegistered.thread(), lastRegistered.cost()));
             return this;
         }
 
-
         @Override
         public NamespaceBuilder thread(ScriptThread thread) {
-            if (lastRegistered != null) replaceLast(copyLast(thread, lastRegistered.cost()));
+            if (lastRegistered != null) replaceLast(copyLast(lastRegistered.description(), lastRegistered.categoryId(), thread, lastRegistered.cost()));
             return this;
         }
 
         @Override
         public NamespaceBuilder cost(int cost) {
             if (cost <= 0) throw new IllegalArgumentException("Cost must be positive");
-            if (lastRegistered != null) replaceLast(copyLast(lastRegistered.thread(), cost));
+            if (lastRegistered != null) replaceLast(copyLast(lastRegistered.description(), lastRegistered.categoryId(), lastRegistered.thread(), cost));
             return this;
         }
 
-        private FunctionDescriptor copyLast(ScriptThread thread, int cost) {
+        private FunctionDescriptor copyLast(String description, String categoryId, ScriptThread thread, int cost) {
             return FunctionDescriptor.builder()
                     .namespace(lastRegistered.namespace())
                     .name(lastRegistered.name())
@@ -248,24 +222,7 @@ public final class DefaultApiRegistry implements ApiRegistry {
                     .returns(lastRegistered.returnType())
                     .suspending(lastRegistered.suspending())
                     .thread(thread)
-                    .permission(lastRegistered.permission())
                     .cost(cost)
-                    .invoker(lastRegistered.invoker())
-                    .description(lastRegistered.description())
-                    .categoryId(lastRegistered.categoryId())
-                    .build();
-        }
-
-        private FunctionDescriptor copyLast(String description, String categoryId) {
-            return FunctionDescriptor.builder()
-                    .namespace(lastRegistered.namespace())
-                    .name(lastRegistered.name())
-                    .parameters(lastRegistered.parameters())
-                    .returns(lastRegistered.returnType())
-                    .suspending(lastRegistered.suspending())
-                    .thread(lastRegistered.thread())
-                    .permission(lastRegistered.permission())
-                    .cost(lastRegistered.cost())
                     .invoker(lastRegistered.invoker())
                     .description(description)
                     .categoryId(categoryId)
@@ -273,33 +230,11 @@ public final class DefaultApiRegistry implements ApiRegistry {
         }
 
         private void replaceLast(FunctionDescriptor descriptor) {
-            Map<String, FunctionDescriptor> nsMap = byNamespace.get(ns);
-            if (nsMap != null) nsMap.remove(lastRegistered.name());
+            Map<String, FunctionDescriptor> namespace = byNamespace.get(ns);
+            if (namespace != null) namespace.remove(lastRegistered.name());
             all.remove(lastRegistered);
             registerFromBuilder(descriptor);
             lastRegistered = descriptor;
-        }
-
-        @Override
-        public NamespaceBuilder suspendFunction(String name, VeloraType returnType, Consumer<ParameterListBuilder> parameters, FunctionInvoker invoker) {
-            return suspendFunction(name, returnType, parameters, null, invoker);
-        }
-
-        @Override
-        public NamespaceBuilder suspendFunction(String name, VeloraType returnType, Consumer<ParameterListBuilder> parameters, ScriptPermission permission, FunctionInvoker invoker) {
-            ParameterListBuilder pb = new ParameterListBuilder();
-            parameters.accept(pb);
-            FunctionDescriptor fd = FunctionDescriptor.builder()
-                    .namespace(ns).name(name)
-                    .parameters(pb.build())
-                    .returns(returnType)
-                    .suspending(true)
-                    .permission(permission)
-                    .invoker(invoker)
-                    .build();
-            registerFromBuilder(fd);
-            lastRegistered = fd;
-            return this;
         }
     }
 }

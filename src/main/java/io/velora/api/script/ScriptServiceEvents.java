@@ -45,7 +45,6 @@ public interface ScriptServiceEvents {
         RELOADED,
         ROLLED_BACK,
         SETTINGS_CHANGED,
-        PERMISSIONS_CHANGED,
         RUNTIME_ERROR,
         LOG_ADDED
     }

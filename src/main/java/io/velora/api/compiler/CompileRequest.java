@@ -26,7 +26,7 @@ public record CompileRequest(
         private final String scriptId;
         private final List<SourceFile> sources = new java.util.ArrayList<>();
         private CompileMode mode = CompileMode.FULL;
-        private int languageVersion = 1;
+        private int languageVersion = 2;
         private final Map<String, String> options = new java.util.LinkedHashMap<>();
 
         public Builder(String scriptId) {

@@ -2,6 +2,7 @@ package io.velora.internal.script;
 
 import io.velora.api.script.ScriptDescriptor;
 import io.velora.api.script.ScriptStatus;
+import io.velora.api.compiler.Diagnostic;
 
 import java.util.*;
 
@@ -13,6 +14,7 @@ public final class ScriptInstance {
     private io.velora.internal.setting.SettingStore settingStore;
     private long revision;
     private Throwable lastError;
+    private List<Diagnostic> diagnostics = List.of();
 
     public ScriptInstance(String scriptId, ScriptDescriptor descriptor) {
         this.scriptId = scriptId;
@@ -32,5 +34,7 @@ public final class ScriptInstance {
     public void revision(long r) { this.revision = r; }
     public Throwable lastError() { return lastError; }
     public void lastError(Throwable e) { this.lastError = e; }
+    public List<Diagnostic> diagnostics() { return diagnostics; }
+    public void diagnostics(List<Diagnostic> value) { diagnostics = value == null ? List.of() : List.copyOf(value); }
     public boolean enabled() { return statusMachine.isRunning(); }
 }

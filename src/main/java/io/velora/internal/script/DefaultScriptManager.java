@@ -2,10 +2,8 @@ package io.velora.internal.script;
 
 import io.velora.api.compiler.*;
 import io.velora.api.script.*;
-import io.velora.api.registry.PermissionRegistry;
 import io.velora.api.setting.SettingSchema;
 import io.velora.api.setting.SettingDescriptor;
-import io.velora.api.type.VeloraTypes;
 import io.velora.host.ScriptFileEntry;
 import io.velora.host.VeloraHost;
 import io.velora.host.SourceSnapshot;
@@ -13,7 +11,6 @@ import io.velora.internal.bytecode.CompiledModule;
 import io.velora.internal.compiler.DefaultScriptCompiler;
 import io.velora.internal.scheduler.ScriptScheduler;
 import io.velora.internal.setting.SettingStore;
-import io.velora.internal.security.PermissionController;
 import io.velora.internal.persistence.EnabledScriptsStore;
 import io.velora.internal.vm.ScriptValue;
 
@@ -29,32 +26,26 @@ public final class DefaultScriptManager implements ScriptManager {
     private final VeloraHost host;
     private final ScriptCompiler compiler;
     private final Map<String, ScriptRuntime> runtimes = new HashMap<>();
-    private final Map<String, io.velora.api.permission.PermissionSet> grants = new HashMap<>();
-    private final PermissionController permissionController;
     private final EnabledScriptsStore enabledScriptsStore;
     private final io.velora.api.debug.DebugService debugService;
-    private final PermissionRegistry permissionRegistry;
     private final ScriptTemplateRegistry templateRegistry;
 
     public DefaultScriptManager(ScriptScheduler scheduler, ScriptCompiler compiler) {
-        this(scheduler, compiler, null, null, null, null, null, null);
+        this(scheduler, compiler, null, null, null, null);
     }
 
     public DefaultScriptManager(ScriptScheduler scheduler, ScriptCompiler compiler, VeloraHost host) {
-        this(scheduler, compiler, host, null, null, null, null, null);
+        this(scheduler, compiler, host, null, null, null);
     }
 
     public DefaultScriptManager(ScriptScheduler scheduler, ScriptCompiler compiler, VeloraHost host,
-                                PermissionController permissionController, EnabledScriptsStore enabledScriptsStore,
-                                io.velora.api.debug.DebugService debugService, PermissionRegistry permissionRegistry,
+                                EnabledScriptsStore enabledScriptsStore, io.velora.api.debug.DebugService debugService,
                                 ScriptTemplateRegistry templateRegistry) {
         this.scheduler = scheduler;
         this.compiler = compiler;
         this.host = host;
-        this.permissionController = permissionController;
         this.enabledScriptsStore = enabledScriptsStore;
         this.debugService = debugService;
-        this.permissionRegistry = permissionRegistry;
         this.templateRegistry = templateRegistry;
     }
 
@@ -108,10 +99,9 @@ public final class DefaultScriptManager implements ScriptManager {
 
         List<String> sourceFiles = files.keySet().stream().sorted().toList();
         ScriptDescriptor descriptor = new ScriptDescriptor(scriptId, request.name(), "1.0.0", null, null, ScriptStatus.DISCOVERED, false,
-                sourceFiles, io.velora.api.permission.PermissionSet.empty(), null, 0, 0, 0);
+                sourceFiles, null, 0, 0, 0);
         ScriptInstance instance = ScriptInstanceFactory.create(scriptId, descriptor);
         repository.register(instance);
-        loadGrants(scriptId);
         compileInstance(instance);
         if (instance.compiledModule() == null) {
             repository.remove(scriptId);
@@ -159,7 +149,6 @@ public final class DefaultScriptManager implements ScriptManager {
             if (!unloaded.success()) return unloaded;
         }
         if (enabledScriptsStore != null) enabledScriptsStore.disable(scriptId);
-        grants.remove(scriptId);
         try {
             host.fileSystem().deleteScript(scriptId);
         } catch (Throwable error) {
@@ -179,15 +168,6 @@ public final class DefaultScriptManager implements ScriptManager {
             return ScriptOperationResult.failure(scriptId, "Script not compiled");
         }
         
-        // Check permission grants
-        io.velora.api.permission.PermissionSet required = instance.compiledModule().requiredPermissions();
-        if (required != null && !required.isEmpty()) {
-            io.velora.api.permission.PermissionSet granted = grants.getOrDefault(scriptId, io.velora.api.permission.PermissionSet.empty());
-            if (!granted.containsAll(required)) {
-                return ScriptOperationResult.failure(scriptId, "Permission denied: required permissions not granted");
-            }
-        }
-        
         // Load persistent fields before enabling
         loadPersistentFields(instance);
         
@@ -205,7 +185,7 @@ public final class DefaultScriptManager implements ScriptManager {
         // Only call ON_LOAD and ON_ENABLE synchronously during enable.
         // ON_RUN is spawned asynchronously by runtime.start().
         for (String hook : module.lifecycleHooks()) {
-            if (hook.equals("ON_DISABLE") || hook.equals("ON_UNLOAD") || hook.equals("ON_RUN") || hook.equals("ON_TICK")) continue;
+            if (hook.equals("ON_DISABLE") || hook.equals("ON_UNLOAD") || hook.equals("ON_RUN")) continue;
             int fnIdx = findFunctionIndex(module, hook);
             if (fnIdx >= 0) {
                 scheduler.spawnFiberAndAwait(instance.scriptId(), fnIdx, new ScriptValue[0], mods, sets);
@@ -275,14 +255,15 @@ public final class DefaultScriptManager implements ScriptManager {
     public ScriptOperationResult reload(String scriptId) {
         ScriptInstance instance = repository.get(scriptId);
         if (instance == null) return ScriptOperationResult.failure(scriptId, "Script not found");
-        CompiledModule candidate = compileModule(instance);
-        if (candidate == null) return ScriptOperationResult.failure(scriptId, "Compilation failed");
+        CompileAttempt attempt = compileModule(instance);
+        instance.diagnostics(attempt.diagnostics());
+        if (attempt.module() == null) {
+            updateDiagnosticCounts(instance, attempt.diagnostics(), instance.status());
+            return ScriptOperationResult.failure(scriptId, attempt.diagnostics().isEmpty() ? "Compilation failed" : attempt.diagnostics().toString());
+        }
+        CompiledModule candidate = attempt.module();
 
         boolean wasEnabled = instance.enabled();
-        if (wasEnabled && !hasPermissionGrant(scriptId, candidate.requiredPermissions())) {
-            return ScriptOperationResult.failure(scriptId, "Permission denied: reloaded script requires permissions that are not granted");
-        }
-
         CompiledModule oldModule = instance.compiledModule();
         SettingStore oldSettings = instance.settingStore();
         ScriptDescriptor oldDescriptor = instance.descriptor();
@@ -345,13 +326,7 @@ public final class DefaultScriptManager implements ScriptManager {
     }
 
     private SettingStore createSettingStore(CompiledModule module) {
-        List<SettingDescriptor> settingsList = new ArrayList<>(module.settings());
-        if (settingsList.isEmpty()) {
-            settingsList.add(new SettingDescriptor("enabled", "Enabled", VeloraTypes.BOOLEAN, Boolean.TRUE,
-                    null, "Whether the script is enabled", null, 0, false, false, false,
-                    null, List.of(), 0));
-        }
-        return new SettingStore(settingsList);
+        return new SettingStore(module.settings());
     }
 
     private ScriptDescriptor descriptorForModule(ScriptDescriptor current, CompiledModule module, ScriptRevision revision, long reloadTime) {
@@ -359,7 +334,7 @@ public final class DefaultScriptManager implements ScriptManager {
                 module.version() != null ? module.version() : current.version(),
                 module.author() != null ? module.author() : current.author(),
                 module.description() != null ? module.description() : current.description(),
-                ScriptStatus.LOADED, false, current.sourceFiles(), module.requiredPermissions(), revision,
+                ScriptStatus.LOADED, false, current.sourceFiles(), revision,
                 current.errorCount(), current.warningCount(), reloadTime);
     }
 
@@ -432,6 +407,12 @@ public final class DefaultScriptManager implements ScriptManager {
     }
 
     @Override
+    public List<Diagnostic> diagnostics(String scriptId) {
+        ScriptInstance instance = repository.get(scriptId);
+        return instance != null ? instance.diagnostics() : List.of();
+    }
+
+    @Override
     public ScriptTransaction beginTransaction(String scriptId) {
         ScriptInstance instance = repository.get(scriptId);
         if (instance == null) throw new IllegalArgumentException("Script not found: " + scriptId);
@@ -457,12 +438,11 @@ public final class DefaultScriptManager implements ScriptManager {
             if (repository.get(scriptId) != null) continue;
             List<String> sourceFiles = entry.getValue().stream().map(ScriptFileEntry::relativePath).distinct().sorted().toList();
             ScriptDescriptor descriptor = new ScriptDescriptor(scriptId, scriptId, "1.0.0", null, null,
-                    ScriptStatus.DISCOVERED, false, sourceFiles, io.velora.api.permission.PermissionSet.empty(),
+                    ScriptStatus.DISCOVERED, false, sourceFiles,
                     null, 0, 0, 0);
             ScriptInstance instance = ScriptInstanceFactory.create(scriptId, descriptor);
             repository.register(instance);
-            loadGrants(scriptId);
-            serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.DISCOVERED, scriptId));
+                serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.DISCOVERED, scriptId));
             compileInstance(instance);
         }
     }
@@ -474,43 +454,78 @@ public final class DefaultScriptManager implements ScriptManager {
                 .map(ScriptFileEntry::relativePath).distinct().sorted().toList();
         ScriptDescriptor current = instance.descriptor();
         instance.descriptor(new ScriptDescriptor(current.id(), current.name(), current.version(), current.author(), current.description(),
-                current.status(), current.enabled(), paths, current.permissions(), current.activeRevision(),
+                current.status(), current.enabled(), paths, current.activeRevision(),
                 current.errorCount(), current.warningCount(), current.lastReloadTimeNanos()));
     }
 
-    private CompiledModule compileModule(ScriptInstance instance) {
-        if (host == null || host.fileSystem() == null || !(compiler instanceof DefaultScriptCompiler defaultCompiler)) return null;
+    private CompileAttempt compileModule(ScriptInstance instance) {
+        if (host == null || host.fileSystem() == null || !(compiler instanceof DefaultScriptCompiler defaultCompiler)) return new CompileAttempt(null, List.of());
         serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.COMPILE_STARTED, instance.scriptId()));
         List<SourceFile> sources = new ArrayList<>();
         for (String path : instance.descriptor().sourceFiles()) {
             SourceSnapshot snapshot = host.fileSystem().readSource(instance.scriptId(), path);
             if (snapshot != null) sources.add(new SourceFile(path, snapshot.content(), snapshot.contentHash()));
         }
-        CompiledModule module = sources.isEmpty() ? null : defaultCompiler.compileToModule(CompileRequest.builder(instance.scriptId()).sources(sources).mode(CompileMode.FULL).build());
+        if (sources.isEmpty()) {
+            serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.COMPILE_FINISHED, instance.scriptId()));
+            return new CompileAttempt(null, List.of(Diagnostic.error(DiagnosticCode.COMPILER_BAD_SOURCE, "No source files", SourceRange.of("main.vls", 0, 0))));
+        }
+        CompileRequest full = CompileRequest.builder(instance.scriptId()).sources(sources).mode(CompileMode.FULL).build();
+        CompileResult result = defaultCompiler.compile(full);
+        CompiledModule module = null;
+        if (result.success()) {
+            CompileRequest cached = CompileRequest.builder(instance.scriptId()).sources(sources).mode(CompileMode.INCREMENTAL).build();
+            module = defaultCompiler.compileToModule(cached);
+        }
         serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.COMPILE_FINISHED, instance.scriptId()));
-        return module;
+        return new CompileAttempt(module, result.diagnostics());
     }
 
     private void compileInstance(ScriptInstance instance) {
-        CompiledModule module = compileModule(instance);
-        if (module != null) {
-            instance.compiledModule(module);
-            instance.settingStore(createSettingStore(module));
-            instance.revision(1);
-            loadSettingsFromDisk(instance);
-            instance.statusMachine().transition(ScriptStatus.LOADED);
-            ScriptDescriptor d = instance.descriptor();
-            ScriptRevision rev = ScriptRevision.initial(instance.scriptId(), module.sourceHash());
-            String name = module.scriptName() != null ? module.scriptName() : d.name();
-            String version = module.version() != null ? module.version() : d.version();
-            String author = module.author() != null ? module.author() : d.author();
-            String description = module.description() != null ? module.description() : d.description();
-            instance.descriptor(new ScriptDescriptor(
+        CompileAttempt attempt = compileModule(instance);
+        instance.diagnostics(attempt.diagnostics());
+        CompiledModule module = attempt.module();
+        if (module == null) {
+            instance.compiledModule(null);
+            instance.statusMachine().transition(ScriptStatus.FAILED);
+            updateDiagnosticCounts(instance, attempt.diagnostics(), ScriptStatus.FAILED);
+            return;
+        }
+        instance.compiledModule(module);
+        instance.settingStore(createSettingStore(module));
+        instance.revision(1);
+        loadSettingsFromDisk(instance);
+        instance.statusMachine().transition(ScriptStatus.LOADED);
+        ScriptDescriptor d = instance.descriptor();
+        ScriptRevision rev = ScriptRevision.initial(instance.scriptId(), module.sourceHash());
+        String name = module.scriptName() != null ? module.scriptName() : d.name();
+        String version = module.version() != null ? module.version() : d.version();
+        String author = module.author() != null ? module.author() : d.author();
+        String description = module.description() != null ? module.description() : d.description();
+        int errors = diagnosticCount(attempt.diagnostics(), DiagnosticSeverity.ERROR);
+        int warnings = diagnosticCount(attempt.diagnostics(), DiagnosticSeverity.WARNING);
+        instance.descriptor(new ScriptDescriptor(
                 d.id(), name, version, author, description,
-                instance.status(), instance.enabled(),
-                d.sourceFiles(), module.requiredPermissions(), rev,
-                d.errorCount(), d.warningCount(), d.lastReloadTimeNanos()
-            ));
+                instance.status(), instance.enabled(), d.sourceFiles(), rev,
+                errors, warnings, d.lastReloadTimeNanos()));
+    }
+
+    private void updateDiagnosticCounts(ScriptInstance instance, List<Diagnostic> diagnostics, ScriptStatus status) {
+        ScriptDescriptor d = instance.descriptor();
+        instance.descriptor(new ScriptDescriptor(d.id(), d.name(), d.version(), d.author(), d.description(), status,
+                instance.enabled(), d.sourceFiles(), d.activeRevision(),
+                diagnosticCount(diagnostics, DiagnosticSeverity.ERROR), diagnosticCount(diagnostics, DiagnosticSeverity.WARNING), d.lastReloadTimeNanos()));
+    }
+
+    private int diagnosticCount(List<Diagnostic> diagnostics, DiagnosticSeverity severity) {
+        int count = 0;
+        for (Diagnostic diagnostic : diagnostics) if (diagnostic.severity() == severity) count++;
+        return count;
+    }
+
+    private record CompileAttempt(CompiledModule module, List<Diagnostic> diagnostics) {
+        private CompileAttempt {
+            diagnostics = diagnostics == null ? List.of() : List.copyOf(diagnostics);
         }
     }
 
@@ -646,90 +661,6 @@ public final class DefaultScriptManager implements ScriptManager {
     public ScriptRevisionManager revisionManager() { return revisionManager; }
     public ScriptServiceEventBus eventBus() { return eventBus; }
 
-    @Override
-    public void grantPermissions(String scriptId, io.velora.api.permission.PermissionSet set) {
-        io.velora.api.permission.PermissionSet existing = grants.getOrDefault(scriptId, io.velora.api.permission.PermissionSet.empty());
-        java.util.Set<io.velora.api.permission.ScriptPermission> combined = new java.util.HashSet<>();
-        for (io.velora.api.permission.ScriptPermission p : existing.all()) combined.add(p);
-        for (io.velora.api.permission.ScriptPermission p : set.all()) combined.add(p);
-        grants.put(scriptId, io.velora.api.permission.PermissionSet.of(combined));
-        persistGrants(scriptId);
-        serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.PERMISSIONS_CHANGED, scriptId));
-    }
-
-    @Override
-    public void revokePermissions(String scriptId, io.velora.api.permission.PermissionSet set) {
-        io.velora.api.permission.PermissionSet existing = grants.getOrDefault(scriptId, io.velora.api.permission.PermissionSet.empty());
-        java.util.Set<io.velora.api.permission.ScriptPermission> remaining = new java.util.HashSet<>();
-        for (io.velora.api.permission.ScriptPermission p : existing.all()) {
-            if (!set.contains(p)) remaining.add(p);
-        }
-        grants.put(scriptId, io.velora.api.permission.PermissionSet.of(remaining));
-        persistGrants(scriptId);
-        serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.PERMISSIONS_CHANGED, scriptId));
-        // If script is enabled and no longer has required permissions, disable it
-        ScriptInstance instance = repository.get(scriptId);
-        if (instance != null && instance.enabled() && instance.compiledModule() != null) {
-            io.velora.api.permission.PermissionSet required = instance.compiledModule().requiredPermissions();
-            if (required != null && !required.isEmpty()) {
-                io.velora.api.permission.PermissionSet granted = grants.getOrDefault(scriptId, io.velora.api.permission.PermissionSet.empty());
-                if (!granted.containsAll(required)) {
-                    disable(scriptId);
-                }
-            }
-        }
-    }
-
-    private void persistGrants(String scriptId) {
-        if (host == null || host.fileSystem() == null) return;
-        try {
-            io.velora.api.permission.PermissionSet granted = grants.getOrDefault(scriptId, io.velora.api.permission.PermissionSet.empty());
-            StringBuilder sb = new StringBuilder();
-            for (io.velora.api.permission.ScriptPermission p : granted.all()) {
-                if (sb.length() > 0) sb.append("\n");
-                sb.append(p.id());
-            }
-            host.fileSystem().writeDataAtomic(scriptId, "grants.velora", sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        } catch (Throwable t) {
-            if (host != null && host.logger() != null) {
-                host.logger().warn("Failed to persist grants for " + scriptId + ": " + t.getMessage());
-            }
-        }
-    }
-
-    private void loadGrants(String scriptId) {
-        if (host == null || host.fileSystem() == null) return;
-        if (grants.containsKey(scriptId)) return;
-        try {
-            byte[] data = host.fileSystem().readData(scriptId, "grants.velora");
-            if (data == null || data.length == 0) return;
-            String content = new String(data, java.nio.charset.StandardCharsets.UTF_8);
-            java.util.Set<io.velora.api.permission.ScriptPermission> loaded = new java.util.HashSet<>();
-            for (String line : content.split("\n")) {
-                String permId = line.trim();
-                if (!permId.isEmpty()) {
-                    io.velora.api.permission.ScriptPermission p = resolvePermissionById(permId);
-                    if (p != null) loaded.add(p);
-                }
-            }
-            if (!loaded.isEmpty()) {
-                grants.put(scriptId, io.velora.api.permission.PermissionSet.of(loaded));
-            }
-        } catch (Throwable t) {
-            if (host.logger() != null) host.logger().warn("Failed to load permission grants for " + scriptId + ": " + t.getMessage());
-        }
-    }
-
-    private io.velora.api.permission.ScriptPermission resolvePermissionById(String permId) {
-        return permissionRegistry != null ? permissionRegistry.find(permId) : null;
-    }
-
-    @Override
-    public boolean hasPermissionGrant(String scriptId, io.velora.api.permission.PermissionSet required) {
-        io.velora.api.permission.PermissionSet granted = grants.getOrDefault(scriptId, io.velora.api.permission.PermissionSet.empty());
-        return granted.containsAll(required);
-    }
-
     private final class ScriptHandleImpl implements ScriptHandle {
         private final ScriptInstance instance;
 
@@ -747,6 +678,7 @@ public final class DefaultScriptManager implements ScriptManager {
         @Override public ScriptOperationResult reload() { return DefaultScriptManager.this.reload(instance.scriptId()); }
         @Override public SettingSchema settings() { return DefaultScriptManager.this.settings(instance.scriptId()); }
         @Override public Map<String, io.velora.api.setting.SettingValue> settingValues() { return DefaultScriptManager.this.settingValues(instance.scriptId()); }
+        @Override public List<Diagnostic> diagnostics() { return DefaultScriptManager.this.diagnostics(instance.scriptId()); }
         @Override public io.velora.api.debug.DebugSnapshot debug() { return debugService != null ? debugService.snapshot(instance.scriptId()) : io.velora.api.debug.DebugSnapshot.empty(instance.scriptId()); }
     }
 

@@ -13,26 +13,18 @@ public enum TokenType {
     NULL,
 
     // Annotations
-    ANNOTATION,      // @Name or @Name.Sub
+    ANNOTATION,
 
     // Keywords
     KW_SCRIPT,
-    KW_SETTINGS,
     KW_STATIC,
     KW_ASYNC,
-    KW_ENTRY,
-    KW_EVENT,
-    KW_VOID,
     KW_IF,
     KW_ELSE,
     KW_WHILE,
     KW_FOR,
     KW_WHEN,
     KW_RETURN,
-    KW_IMPORT,
-    KW_PACKAGE,
-    KW_PRIVATE,
-    KW_PUBLIC,
     KW_IS,
     KW_IN,
     KW_SPAWN,

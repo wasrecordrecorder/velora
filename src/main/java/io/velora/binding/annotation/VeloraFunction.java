@@ -12,8 +12,6 @@ import java.lang.annotation.Target;
 public @interface VeloraFunction {
     String name();
 
-    String permission() default "";
-
     ScriptThread thread() default ScriptThread.ANY;
 
     boolean suspending() default false;

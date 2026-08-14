@@ -18,10 +18,6 @@ import java.util.Set;
 
 public final class Parser {
 
-    private static final Set<String> OLD_KEYWORDS = Set.of("fun", "val", "var", "suspend", "setting");
-    private static final Set<String> ENTRY_NAMES = Set.of(
-            "onLoad", "onEnable", "onRun", "onDisable", "onUnload", "onTick");
-
     private final ParserContext context;
     private final ExpressionParser exprParser;
 
@@ -32,14 +28,9 @@ public final class Parser {
 
     public ParseResult parse() {
         try {
-            String packageDecl = parsePackageDecl();
-            List<String> imports = parseImports();
             List<AnnotationNode> annotations = parseAnnotations();
-            ScriptNode script = parseScript(packageDecl, imports, annotations);
-            if (script == null) {
-                return ParseResult.failure(context.diagnostics());
-            }
-            // Check for multiple script declarations (skip trailing newlines)
+            ScriptNode script = parseScript(annotations);
+            if (script == null) return ParseResult.failure(context.diagnostics());
             context.tokens().skipNewlines();
             if (context.tokens().hasMore()) {
                 context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Multiple script declarations are not allowed", context.currentLine(), context.currentColumn());
@@ -71,35 +62,6 @@ public final class Parser {
             count++;
         }
         return Token.eof(0, 0, 0);
-    }
-
-    private void migrationError(String oldKw, String suggestion, Token token) {
-        context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN,
-                "Migration: '" + oldKw + "' is removed in V2. Use " + suggestion + " instead.", token);
-    }
-
-    private String parsePackageDecl() {
-        context.skipTrivia();
-        if (!context.check(TokenType.KW_PACKAGE)) return null;
-        Token start = context.advance();
-        StringBuilder sb = new StringBuilder();
-        while (context.check(TokenType.IDENTIFIER) || context.check(TokenType.DOT)) sb.append(context.advance().text());
-        context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Package declarations are not supported in Velora V2", start);
-        return sb.toString();
-    }
-
-    private List<String> parseImports() {
-        List<String> imports = new ArrayList<>();
-        context.skipTrivia();
-        while (context.check(TokenType.KW_IMPORT)) {
-            Token start = context.advance();
-            StringBuilder sb = new StringBuilder();
-            while (context.check(TokenType.IDENTIFIER) || context.check(TokenType.DOT) || context.check(TokenType.STAR)) sb.append(context.advance().text());
-            imports.add(sb.toString());
-            context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Import declarations are not supported in Velora V2", start);
-            context.skipTrivia();
-        }
-        return imports;
     }
 
     private List<AnnotationNode> parseAnnotations() {
@@ -290,7 +252,7 @@ public final class Parser {
     /** Represents a range value like 8..128 in setting declarations. */
     public record RangeValue(Number min, Number max) {}
 
-    private ScriptNode parseScript(String packageDecl, List<String> imports, List<AnnotationNode> annotations) {
+    private ScriptNode parseScript(List<AnnotationNode> annotations) {
         context.skipTrivia();
         if (!context.check(TokenType.KW_SCRIPT)) {
             context.error(DiagnosticCode.PARSER_MISSING_TOKEN, "Expected 'script' keyword", context.currentLine(), context.currentColumn());
@@ -300,38 +262,21 @@ public final class Parser {
         Token scriptToken = context.advance();
         Token nameToken = context.expect(TokenType.IDENTIFIER, "Expected script name");
         String scriptName = nameToken.text();
-
-        // V2: no constructor settings. If we see '(', it's old syntax.
-        context.skipTrivia();
-        if (context.check(TokenType.LPAREN)) {
-            context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN,
-                    "Migration: script constructor settings are removed in V2. Use 'settings { }' inside script body.",
-                    context.peek());
-            // Skip the constructor part
-            context.advance();
-            while (!context.check(TokenType.LBRACE) && !context.check(TokenType.EOF)) {
-                context.advance();
-            }
-        }
-
-        // Parse script body - settings block may appear as first member
         BlockNode body = parseScriptBody();
 
-        // Extract settings block from body if present
-        SettingBlockNode settingBlock = null;
+        List<SettingDeclarationNode> settings = new ArrayList<>();
         List<ScriptMemberNode> members = new ArrayList<>();
         if (body != null) {
-            for (StatementNode s : body.statements()) {
-                if (s instanceof SettingBlockNode sb) {
-                    settingBlock = sb;
-                } else if (s instanceof ScriptMemberNode sm) {
-                    members.add(sm);
-                }
+            for (StatementNode statement : body.statements()) {
+                if (statement instanceof SettingBlockNode block) settings.addAll(block.declarations());
+                else if (statement instanceof ScriptMemberNode member) members.add(member);
             }
         }
 
+        SettingBlockNode settingBlock = settings.isEmpty() ? null
+                : new SettingBlockNode(context.filePath(), scriptToken.line(), scriptToken.column(), settings);
         return new ScriptNode(context.filePath(), scriptToken.line(), scriptToken.column(),
-                packageDecl, imports, annotations, scriptName, settingBlock, members);
+                annotations, scriptName, settingBlock, members);
     }
 
     private BlockNode parseScriptBody() {
@@ -352,348 +297,149 @@ public final class Parser {
 
     private StatementNode parseScriptMember() {
         context.skipTrivia();
-
-        // Collect leading annotations
-        List<AnnotationNode> leadingAnnotations = new ArrayList<>();
+        List<AnnotationNode> annotations = new ArrayList<>();
         while (context.check(TokenType.ANNOTATION)) {
-            leadingAnnotations.add(parseAnnotation());
+            annotations.add(parseAnnotation());
             context.skipTrivia();
         }
 
-        // Check for old keywords (migration diagnostics)
-        Token token = context.peek();
-        if (token.is(TokenType.IDENTIFIER) && OLD_KEYWORDS.contains(token.text())) {
-            String kw = token.text();
-            String suggestion = switch (kw) {
-                case "fun" -> "Type name(params) { }";
-                case "val" -> "Type name = value";
-                case "var" -> "Type name = value";
-                case "suspend" -> "async";
-                case "setting" -> "settings { }";
-                default -> kw;
-            };
-            migrationError(kw, suggestion, token);
-            // Skip to next member
-            while (!context.check(TokenType.RBRACE) && !context.check(TokenType.EOF)) {
-                context.advance();
-                context.skipTrivia();
-                if (context.check(TokenType.IDENTIFIER) || context.check(TokenType.ANNOTATION) ||
-                    context.check(TokenType.KW_SETTINGS) || context.check(TokenType.KW_ENTRY) ||
-                    context.check(TokenType.KW_EVENT) || context.check(TokenType.KW_ASYNC) ||
-                    context.check(TokenType.KW_STATIC) || context.check(TokenType.HASH) ||
-                    context.check(TokenType.KW_PRIVATE) || context.check(TokenType.KW_PUBLIC)) {
-                    break;
-                }
-            }
-            return null;
-        }
-
-        // Modifiers
-        boolean isPrivate = false;
-        boolean isPublic = false;
-        if (context.check(TokenType.KW_PRIVATE)) {
-            Token modifier = context.advance();
-            isPrivate = true;
-            context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Visibility modifiers are not supported in Velora V2", modifier);
-        } else if (context.check(TokenType.KW_PUBLIC)) {
-            Token modifier = context.advance();
-            isPublic = true;
-            context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Visibility modifiers are not supported in Velora V2", modifier);
-        }
+        boolean isAsync = context.match(TokenType.KW_ASYNC);
+        context.skipTrivia();
+        boolean isStatic = context.match(TokenType.KW_STATIC);
+        context.skipTrivia();
+        boolean isConst = context.match(TokenType.HASH);
         context.skipTrivia();
 
-        // settings block
-        if (context.check(TokenType.KW_SETTINGS)) {
-            return parseSettingBlock();
+        if (context.check(TokenType.IDENTIFIER) && Set.of("settings", "entry", "event", "void", "private", "public").contains(context.peek().text())) {
+            Token old = context.advance();
+            context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Removed Velora syntax: '" + old.text() + "'", old);
+            skipBrokenMember();
+            return null;
         }
 
-        // async modifier
-        boolean isAsync = false;
-        if (context.check(TokenType.KW_ASYNC)) {
-            context.advance();
-            isAsync = true;
-            context.skipTrivia();
-        }
-
-        // entry declaration
-        if (context.check(TokenType.KW_ENTRY)) {
-            return parseEntryDeclaration(leadingAnnotations, isAsync);
-        }
-
-        // event declaration
-        if (context.check(TokenType.KW_EVENT)) {
-            return parseEventDeclaration(leadingAnnotations, isAsync);
-        }
-
-        // static modifier
-        boolean isStatic = false;
-        if (context.check(TokenType.KW_STATIC)) {
-            context.advance();
-            isStatic = true;
-            context.skipTrivia();
-        }
-
-        // const modifier (#)
-        boolean isConst = false;
-        if (context.check(TokenType.HASH)) {
-            context.advance();
-            isConst = true;
-            context.skipTrivia();
-        }
-
-        // At this point, we should have a Type name pattern (field or method)
-        // Parse the type
-        Token typeToken = context.peek();
-        if (!typeToken.is(TokenType.IDENTIFIER) && !typeToken.is(TokenType.KW_VOID)) {
-            if (isAsync || isStatic || isConst || isPrivate || isPublic || !leadingAnnotations.isEmpty()) {
-                context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN,
-                        "Expected type name in declaration but found: " + typeToken.type() + " '" + typeToken.text() + "'", typeToken);
-            } else {
-                context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN,
-                        "Unexpected token in script body: " + typeToken.type() + " '" + typeToken.text() + "'", typeToken);
+        AnnotationNode setting = null;
+        for (AnnotationNode annotation : annotations) {
+            if (annotation.name().equals("Setting")) {
+                if (setting != null) context.error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "Duplicate @Setting annotation", context.peek());
+                setting = annotation;
             }
+        }
+
+        if (setting != null) {
+            if (isAsync || isStatic || isConst) context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "@Setting cannot be async, static or const", context.peek());
+            for (AnnotationNode annotation : annotations) {
+                if (annotation != setting) context.error(DiagnosticCode.SEMANTIC_UNKNOWN_ANNOTATION, "@" + annotation.name() + " cannot be combined with @Setting", context.peek());
+            }
+            return parseInlineSetting(setting);
+        }
+
+        Token first = context.peek();
+        if (!first.is(TokenType.IDENTIFIER)) {
+            context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN,
+                    "Expected field or function declaration, found " + first.type() + " '" + first.text() + "'", first);
             context.advance();
             return null;
+        }
+
+        Token second = peekAhead(1);
+        if (second.is(TokenType.LPAREN)) {
+            Token name = context.advance();
+            return parseMethodDeclarationRest(annotations, isAsync, null, name.text(), name);
+        }
+        if (second.is(TokenType.EQ)) {
+            Token name = context.advance();
+            return parseFieldDeclarationRest(annotations, isStatic, isConst, null, name.text(), name);
         }
 
         TypeNode type = parseTypeNode();
         context.skipTrivia();
-
-        // Now we need the name
-        Token nameToken = context.expect(TokenType.IDENTIFIER, "Expected declaration name");
-        String name = nameToken.text();
+        Token name = context.expect(TokenType.IDENTIFIER, "Expected declaration name");
         context.skipTrivia();
-
-        // Check if this is a method (followed by '(') or a field
         if (context.check(TokenType.LPAREN)) {
-            // Method declaration
-            return parseMethodDeclarationRest(leadingAnnotations, isPrivate, isAsync, type, name, nameToken);
-        } else {
-            // Field declaration
-            return parseFieldDeclarationRest(leadingAnnotations, isPrivate, isStatic, isConst, type, name, nameToken);
+            if (isStatic || isConst) context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Functions cannot be static or const", name);
+            return parseMethodDeclarationRest(annotations, isAsync, type, name.text(), name);
         }
+        return parseFieldDeclarationRest(annotations, isStatic, isConst, type, name.text(), name);
     }
 
-    private StatementNode parseMethodDeclarationRest(List<AnnotationNode> annotations, boolean isPrivate,
-                                                      boolean isAsync, TypeNode returnType, String name, Token nameToken) {
-        for (AnnotationNode annotation : annotations) {
-            context.error(DiagnosticCode.SEMANTIC_UNKNOWN_ANNOTATION, "Annotation @" + annotation.name() + " is not supported on functions", nameToken);
-        }
-        context.expect(TokenType.LPAREN, "Expected '(' after method name");
+    private StatementNode parseMethodDeclarationRest(List<AnnotationNode> annotations, boolean isAsync,
+                                                      TypeNode returnType, String name, Token nameToken) {
+        context.expect(TokenType.LPAREN, "Expected '(' after function name");
         List<ParameterNode> parameters = new ArrayList<>();
         context.skipTrivia();
         if (!context.check(TokenType.RPAREN)) {
             parameters.add(parseParameter());
-            while (context.match(TokenType.COMMA)) {
-                parameters.add(parseParameter());
-            }
+            while (context.match(TokenType.COMMA)) parameters.add(parseParameter());
         }
         context.expect(TokenType.RPAREN, "Expected ')' after parameters");
         BlockNode body = parseBlock();
         return new FunctionNode(context.filePath(), nameToken.line(), nameToken.column(),
-                name, parameters, returnType, isAsync, isPrivate, body);
+                name, parameters, returnType, isAsync, body, annotations);
     }
 
-    private StatementNode parseFieldDeclarationRest(List<AnnotationNode> annotations, boolean isPrivate,
-                                                     boolean isStatic, boolean isConst, TypeNode type,
-                                                     String name, Token nameToken) {
+    private StatementNode parseFieldDeclarationRest(List<AnnotationNode> annotations, boolean isStatic,
+                                                     boolean isConst, TypeNode type, String name, Token nameToken) {
         ExpressionNode initializer = null;
         context.skipTrivia();
-        if (context.match(TokenType.EQ)) {
-            context.skipTrivia();
-            initializer = exprParser.parseExpression();
-        }
+        if (context.match(TokenType.EQ)) initializer = exprParser.parseExpression();
+        if (initializer == null) context.error(DiagnosticCode.SEMANTIC_MISSING_INITIALIZER, "Field '" + name + "' requires an initializer", nameToken);
 
         boolean persistent = false;
         String persistentId = null;
-        for (AnnotationNode ann : annotations) {
-            if (!ann.name().equals("Persistent")) {
-                context.error(DiagnosticCode.SEMANTIC_UNKNOWN_ANNOTATION, "Annotation @" + ann.name() + " is not supported on fields", nameToken);
+        for (AnnotationNode annotation : annotations) {
+            if (!annotation.name().equals("Persistent")) {
+                context.error(DiagnosticCode.SEMANTIC_UNKNOWN_ANNOTATION, "Annotation @" + annotation.name() + " is not supported on fields", nameToken);
                 continue;
             }
             persistent = true;
-            if (ann.positionalArgs().size() > 1 || !ann.namedArgs().isEmpty()) {
+            if (annotation.positionalArgs().size() > 1 || !annotation.namedArgs().isEmpty()) {
                 context.error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "@Persistent accepts at most one positional String id", nameToken);
             }
-            if (!ann.positionalArgs().isEmpty()) {
-                Object id = ann.positionalArg(0);
-                if (id instanceof String stringId) persistentId = stringId;
+            if (!annotation.positionalArgs().isEmpty()) {
+                Object value = annotation.positionalArg(0);
+                if (value instanceof String id) persistentId = id;
                 else context.error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "@Persistent id must be String", nameToken);
             }
         }
-
         return new PropertyDeclarationNode(context.filePath(), nameToken.line(), nameToken.column(),
-                !isConst, isPrivate, isStatic, isConst, name, type, initializer, annotations, persistent, persistentId);
+                !isConst, isStatic, isConst, name, type, initializer, annotations, persistent, persistentId);
     }
 
-    private StatementNode parseEntryDeclaration(List<AnnotationNode> annotations, boolean isAsync) {
-        Token entryToken = context.expect(TokenType.KW_ENTRY);
-        for (AnnotationNode annotation : annotations) {
-            context.error(DiagnosticCode.SEMANTIC_UNKNOWN_ANNOTATION, "Annotation @" + annotation.name() + " is not supported on lifecycle entries", entryToken);
-        }
-        Token nameToken = context.expect(TokenType.IDENTIFIER, "Expected entry name");
-        String entryName = nameToken.text();
-
-        // Validate entry name
-        if (!ENTRY_NAMES.contains(entryName)) {
-            context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN,
-                    "Unknown entry point: " + entryName + ". Valid entries: onLoad, onEnable, onRun, onDisable, onUnload, onTick", nameToken);
-        }
-
-        context.expect(TokenType.LPAREN, "Expected '(' after entry name");
-        List<ParameterNode> parameters = new ArrayList<>();
+    private SettingBlockNode parseInlineSetting(AnnotationNode annotation) {
         context.skipTrivia();
-        if (!context.check(TokenType.RPAREN)) {
-            parameters.add(parseParameter());
-            while (context.match(TokenType.COMMA)) {
-                parameters.add(parseParameter());
-            }
-        }
-        context.expect(TokenType.RPAREN, "Expected ')' after entry parameters");
-        if (!parameters.isEmpty()) context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Lifecycle entries do not accept parameters", nameToken);
-        BlockNode body = parseBlock();
-
-        // Map entry name to lifecycle hook
-        LifecycleNode.Hook hook = switch (entryName) {
-            case "onLoad" -> LifecycleNode.Hook.ON_LOAD;
-            case "onEnable" -> LifecycleNode.Hook.ON_ENABLE;
-            case "onRun" -> LifecycleNode.Hook.ON_RUN;
-            case "onDisable" -> LifecycleNode.Hook.ON_DISABLE;
-            case "onUnload" -> LifecycleNode.Hook.ON_UNLOAD;
-            case "onTick" -> LifecycleNode.Hook.ON_TICK;
-            default -> LifecycleNode.Hook.ON_RUN;
-        };
-
-        return new LifecycleNode(context.filePath(), entryToken.line(), entryToken.column(), hook, isAsync, body);
-    }
-
-    private StatementNode parseEventDeclaration(List<AnnotationNode> annotations, boolean isAsync) {
-        Token eventToken = context.expect(TokenType.KW_EVENT);
-        Token nameToken = context.expect(TokenType.IDENTIFIER, "Expected event handler name");
-        String handlerName = nameToken.text();
-
-        context.expect(TokenType.LPAREN, "Expected '(' after event name");
-        context.skipTrivia();
-        TypeNode paramType = null;
-        String paramName = null;
-        if (!context.check(TokenType.RPAREN)) {
-            paramType = parseTypeNode();
+        TypeNode type = null;
+        Token name;
+        Token first = context.peek();
+        Token second = peekAhead(1);
+        if (first.is(TokenType.IDENTIFIER) && second.is(TokenType.EQ)) {
+            name = context.advance();
+        } else {
+            type = parseTypeNode();
             context.skipTrivia();
-            Token paramNameToken = context.expect(TokenType.IDENTIFIER, "Expected event parameter name");
-            paramName = paramNameToken.text();
+            name = context.expect(TokenType.IDENTIFIER, "Expected setting name");
         }
-        context.expect(TokenType.RPAREN, "Expected ')' after event parameter");
-        BlockNode body = parseBlock();
-
-        String eventRef = handlerName;
-        boolean eventAnnotation = false;
-        for (AnnotationNode ann : annotations) {
-            String annName = ann.name();
-            if (!annName.equals("Event") && !annName.startsWith("Event.")) {
-                context.error(DiagnosticCode.SEMANTIC_UNKNOWN_ANNOTATION, "Annotation @" + annName + " is not supported on event handlers", eventToken);
-                continue;
-            }
-            if (eventAnnotation) {
-                context.error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "Only one event annotation is allowed", eventToken);
-                continue;
-            }
-            eventAnnotation = true;
-            if (annName.startsWith("Event.")) {
-                if (!ann.positionalArgs().isEmpty() || !ann.namedArgs().isEmpty()) context.error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "@" + annName + " does not accept arguments", eventToken);
-                eventRef = annName;
-            } else {
-                if (ann.positionalArgs().size() != 1 || !(ann.positionalArg(0) instanceof String) || !ann.namedArgs().isEmpty()) {
-                    context.error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "@Event requires exactly one positional String event name", eventToken);
-                } else eventRef = (String) ann.positionalArg(0);
-            }
-        }
-
-        return new EventHandlerNode(context.filePath(), eventToken.line(), eventToken.column(),
-                eventRef, annotations, paramName, paramType, isAsync, body);
+        context.expect(TokenType.EQ, "Expected '=' after setting name");
+        ExpressionNode initializer = exprParser.parseExpression();
+        SettingDeclarationNode declaration = new SettingDeclarationNode(context.filePath(), annotation.line(), annotation.column(),
+                name.text(), type, initializer, annotation.positionalArgs(), annotation.namedArgs());
+        return new SettingBlockNode(context.filePath(), annotation.line(), annotation.column(), List.of(declaration));
     }
 
-    private SettingBlockNode parseSettingBlock() {
-        Token settingToken = context.expect(TokenType.KW_SETTINGS);
-        context.expect(TokenType.LBRACE, "Expected '{' after 'settings'");
-        List<SettingDeclarationNode> declarations = new ArrayList<>();
-        context.skipTrivia();
-        while (!context.check(TokenType.RBRACE) && context.tokens().hasMore()) {
-            if (context.check(TokenType.ANNOTATION)) {
-                declarations.add(parseSettingDeclaration());
-            } else {
-                context.skipTrivia();
-                if (context.check(TokenType.RBRACE)) break;
-                Token token = context.peek();
-                context.error(DiagnosticCode.PARSER_INVALID_SETTING_DECL, "Expected a setting annotation, got '" + token.text() + "'", token);
-                context.advance();
-            }
-            context.skipTrivia();
-        }
-        context.expect(TokenType.RBRACE, "Expected '}' after settings block");
-        return new SettingBlockNode(context.filePath(), settingToken.line(), settingToken.column(), declarations);
-    }
-
-    private SettingDeclarationNode parseSettingDeclaration() {
-        Token annotationToken = context.advance();
-        String annotationName = annotationToken.text().substring(1); // strip @
-
-        // Check for old @Slider syntax
-        if (annotationName.equals("Slider")) {
-            context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN,
-                    "Migration: @Slider is removed in V2. Use @Number with range syntax: @Number id (\"name\", min..max, step, default, @Number.Slider)",
-                    annotationToken);
-        }
-
-        context.skipTrivia();
-        Token identifierToken = context.expect(TokenType.IDENTIFIER, "Expected setting identifier");
-        String identifier = identifierToken.text();
-
-        context.skipTrivia();
-        context.expect(TokenType.LPAREN, "Expected '(' after setting identifier");
-
-        List<Object> positionalArgs = new ArrayList<>();
-        Map<String, Object> namedArgs = new LinkedHashMap<>();
-
-        context.skipTrivia();
-        if (!context.check(TokenType.RPAREN)) {
-            parseSettingArguments(positionalArgs, namedArgs);
-        }
-
-        context.expect(TokenType.RPAREN, "Expected ')' after setting declaration");
-
-        return new SettingDeclarationNode(context.filePath(), annotationToken.line(), annotationToken.column(),
-                annotationName, identifier, positionalArgs, namedArgs);
-    }
-
-    private void parseSettingArguments(List<Object> positionalArgs, Map<String, Object> namedArgs) {
-        boolean first = true;
-        while (!context.check(TokenType.RPAREN) && context.tokens().hasMore()) {
-            if (!first) {
-                if (!context.match(TokenType.COMMA)) break;
-                context.skipTrivia();
-            }
-            first = false;
-
-            // Named argument
-            if (context.check(TokenType.IDENTIFIER) && peekAhead(1).is(TokenType.EQ)) {
-                Token nameToken = context.advance();
-                context.advance(); // EQ
-                context.skipTrivia();
-                boolean explicitNull = isExplicitNull();
-                Object value = parseAnnotationValue();
-                if (namedArgs.containsKey(nameToken.text())) context.error(DiagnosticCode.PARSER_INVALID_SETTING_DECL, "Duplicate named setting argument: " + nameToken.text(), nameToken);
-                else if (value != null || explicitNull) namedArgs.put(nameToken.text(), value);
-            } else {
-                boolean explicitNull = isExplicitNull();
-                Object value = parseAnnotationValue();
-                if (value instanceof RangeValue rv) {
-                    positionalArgs.add(rv.min());
-                    positionalArgs.add(rv.max());
-                } else if (value != null || explicitNull) {
-                    positionalArgs.add(value);
+    private void skipBrokenMember() {
+        int braces = 0;
+        while (!context.check(TokenType.EOF)) {
+            Token token = context.peek();
+            if (token.is(TokenType.LBRACE)) braces++;
+            else if (token.is(TokenType.RBRACE)) {
+                if (braces == 0) return;
+                braces--;
+                if (braces == 0) {
+                    context.advance();
+                    return;
                 }
             }
-            context.skipTrivia();
+            context.advance();
+            if (braces == 0 && token.is(TokenType.NEWLINE)) return;
         }
     }
 
@@ -786,19 +532,6 @@ public final class Parser {
             return parseSpawnStatement();
         }
 
-        // Check for old keywords in statement position
-        if (token.is(TokenType.IDENTIFIER) && OLD_KEYWORDS.contains(token.text())) {
-            String kw = token.text();
-            String suggestion = switch (kw) {
-                case "val" -> "Type name = value";
-                case "var" -> "Type name = value";
-                default -> kw;
-            };
-            migrationError(kw, suggestion, token);
-            context.advance();
-            return null;
-        }
-
         // Check for local variable declaration: #Type name or Type name
         if (isLocalDeclarationStart()) {
             return parseLocalVariable();
@@ -865,16 +598,21 @@ public final class Parser {
     private StatementNode parseForStatement() {
         Token forToken = context.expect(TokenType.KW_FOR);
         context.expect(TokenType.LPAREN, "Expected '(' after 'for'");
-        // V2: for (Type var in iterable)
-        TypeNode type = parseTypeNode();
         context.skipTrivia();
-        Token varToken = context.expect(TokenType.IDENTIFIER, "Expected loop variable");
+        TypeNode type = null;
+        Token variable;
+        if (context.check(TokenType.IDENTIFIER) && peekAhead(1).is(TokenType.KW_IN)) {
+            variable = context.advance();
+        } else {
+            type = parseTypeNode();
+            context.skipTrivia();
+            variable = context.expect(TokenType.IDENTIFIER, "Expected loop variable");
+        }
         context.expect(TokenType.KW_IN, "Expected 'in' in for loop");
         ExpressionNode iterable = exprParser.parseExpression();
         context.expect(TokenType.RPAREN, "Expected ')' after for iterable");
         BlockNode body = parseBlock();
-        return new ForStatementNode(context.filePath(), forToken.line(), forToken.column(),
-                type, varToken.text(), iterable, body);
+        return new ForStatementNode(context.filePath(), forToken.line(), forToken.column(), type, variable.text(), iterable, body);
     }
 
     private StatementNode parseWhenStatement() {
@@ -926,12 +664,7 @@ public final class Parser {
 
     private TypeNode parseTypeNode() {
         context.skipTrivia();
-        Token nameToken;
-        if (context.check(TokenType.KW_VOID)) {
-            nameToken = context.advance();
-        } else {
-            nameToken = context.expect(TokenType.IDENTIFIER, "Expected type name");
-        }
+        Token nameToken = context.expect(TokenType.IDENTIFIER, "Expected type name");
         String typeName = nameToken.text();
         List<TypeNode> typeArgs = new ArrayList<>();
         context.skipTrivia();

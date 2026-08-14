@@ -1,6 +1,5 @@
 package io.velora.api.event;
 
-import io.velora.api.permission.ScriptPermission;
 import io.velora.api.type.VeloraType;
 
 import java.util.Objects;
@@ -10,7 +9,7 @@ import java.util.function.BinaryOperator;
  * Immutable descriptor for a registered event.
  *
  * <p>Created through an EventDescriptor.Builder and frozen into the
- * {@link EventRegistry}. Scripts reference events by their {@link #scriptName()}.
+ * {@link EventRegistry}. A descriptor with script name {@code Tick} is referenced as {@code @Tick} in Velora.
  */
 public final class EventDescriptor {
 
@@ -20,7 +19,6 @@ public final class EventDescriptor {
     private final String categoryId;
     private final String extensionId;
     private final VeloraType payloadType;
-    private final ScriptPermission permission;
     private final EventConcurrency defaultConcurrency;
     private final int queueLimit;
     private final EventOverflowPolicy overflowPolicy;
@@ -35,7 +33,6 @@ public final class EventDescriptor {
         this.categoryId = b.categoryId;
         this.extensionId = b.extensionId;
         this.payloadType = b.payloadType;
-        this.permission = b.permission;
         this.defaultConcurrency = b.defaultConcurrency;
         this.queueLimit = b.queueLimit;
         this.overflowPolicy = b.overflowPolicy;
@@ -50,7 +47,6 @@ public final class EventDescriptor {
     public String categoryId() { return categoryId; }
     public String extensionId() { return extensionId; }
     public VeloraType payloadType() { return payloadType; }
-    public ScriptPermission permission() { return permission; }
     public EventConcurrency defaultConcurrency() { return defaultConcurrency; }
     public int queueLimit() { return queueLimit; }
     public EventOverflowPolicy overflowPolicy() { return overflowPolicy; }
@@ -66,7 +62,6 @@ public final class EventDescriptor {
         b.categoryId = this.categoryId;
         b.extensionId = this.extensionId;
         b.payloadType = this.payloadType;
-        b.permission = this.permission;
         b.defaultConcurrency = this.defaultConcurrency;
         b.queueLimit = this.queueLimit;
         b.overflowPolicy = this.overflowPolicy;
@@ -91,7 +86,6 @@ public final class EventDescriptor {
         private String categoryId = "";
         private String extensionId = "";
         private VeloraType payloadType;
-        private ScriptPermission permission;
         private EventConcurrency defaultConcurrency = EventConcurrency.QUEUE;
         private int queueLimit = 256;
         private EventOverflowPolicy overflowPolicy = EventOverflowPolicy.DROP_OLDEST;
@@ -105,7 +99,6 @@ public final class EventDescriptor {
         public Builder categoryId(String v) { this.categoryId = v; return this; }
         public Builder extensionId(String v) { this.extensionId = v; return this; }
         public Builder payloadType(VeloraType v) { this.payloadType = v; return this; }
-        public Builder permission(ScriptPermission v) { this.permission = v; return this; }
         public Builder defaultConcurrency(EventConcurrency v) { this.defaultConcurrency = v; return this; }
         public Builder queueLimit(int v) { this.queueLimit = v; return this; }
         public Builder overflowPolicy(EventOverflowPolicy v) { this.overflowPolicy = v; return this; }
@@ -115,8 +108,9 @@ public final class EventDescriptor {
         public EventDescriptor build() {
             Objects.requireNonNull(id, "id");
             if (id.isBlank()) throw new IllegalArgumentException("Event id cannot be blank");
-            if (scriptName == null) scriptName = id;
-            if (scriptName.isBlank()) throw new IllegalArgumentException("Event scriptName cannot be blank");
+            if (scriptName == null) scriptName = deriveScriptName(id);
+            if (!isScriptIdentifier(scriptName)) throw new IllegalArgumentException("Event scriptName must be a script annotation identifier: " + scriptName);
+            if (isReservedAnnotation(scriptName)) throw new IllegalArgumentException("Event scriptName conflicts with a built-in annotation: " + scriptName);
             Objects.requireNonNull(defaultConcurrency, "defaultConcurrency");
             Objects.requireNonNull(overflowPolicy, "overflowPolicy");
             if (overflowPolicy == EventOverflowPolicy.COALESCE && coalescer == null) throw new IllegalStateException("COALESCE overflow policy requires a coalescer for event " + id);
@@ -128,6 +122,32 @@ public final class EventDescriptor {
                 throw new IllegalArgumentException("cost must be positive");
             }
             return new EventDescriptor(this);
+        }
+
+        private static String deriveScriptName(String id) {
+            String tail = id.replaceFirst("^.*[.:/]", "");
+            StringBuilder result = new StringBuilder();
+            for (String part : tail.split("[^A-Za-z0-9]+")) {
+                if (part.isEmpty()) continue;
+                result.append(Character.toUpperCase(part.charAt(0))).append(part.substring(1));
+            }
+            if (result.isEmpty()) throw new IllegalArgumentException("Cannot derive script annotation name from event id: " + id);
+            if (Character.isDigit(result.charAt(0))) result.insert(0, "Event");
+            return result.toString();
+        }
+
+        private static boolean isScriptIdentifier(String value) {
+            if (value == null || value.isEmpty() || !Character.isJavaIdentifierStart(value.charAt(0))) return false;
+            for (int i = 1; i < value.length(); i++) if (!Character.isJavaIdentifierPart(value.charAt(i))) return false;
+            return true;
+        }
+
+        private static boolean isReservedAnnotation(String value) {
+            return switch (value) {
+                case "Script", "Version", "Author", "Description", "Setting", "Persistent",
+                     "Load", "Enable", "Run", "Disable", "Unload" -> true;
+                default -> false;
+            };
         }
     }
 }

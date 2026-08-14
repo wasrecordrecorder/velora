@@ -1,6 +1,5 @@
 package io.velora.api.function;
 
-import io.velora.api.permission.ScriptPermission;
 import io.velora.api.type.VeloraType;
 
 /**

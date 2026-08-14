@@ -26,8 +26,6 @@ public interface VeloraEngine extends AutoCloseable {
 
     SettingRegistry settings();
 
-    PermissionRegistry permissions();
-
     ConstantRegistry constants();
 
     VeloraExtensionRegistry extensions();

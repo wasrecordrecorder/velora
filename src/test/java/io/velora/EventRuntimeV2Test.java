@@ -122,7 +122,7 @@ class EventRuntimeV2Test {
                 .coalescer((left, right) -> (Integer) left + (Integer) right)
                 .build());
         engine.freeze();
-        String source = "@Script(name=\"EventQueue\", version=\"1\")\nscript EventQueue { async event Sum(int value) { delay(10.milliseconds)\n probe.record(value) } }";
+        String source = "@Script(\"EventQueue\")\n@Version(\"1\")\nscript EventQueue { @Sum async Sum(int value) { delay(10.milliseconds)\n probe.record(value) } }";
         assertEquals(true, engine.scripts().create(io.velora.api.script.ScriptCreateRequest.builder("event-queue", "EventQueue").file("main.vls", source).build()).success());
         assertEquals(true, engine.scripts().enable("event-queue").success());
         EventKey<Integer> key = EventKey.of("runtime.sum", Integer.class);
@@ -181,7 +181,7 @@ class EventRuntimeV2Test {
                 .defaultConcurrency(EventConcurrency.QUEUE)
                 .build());
         engine.freeze();
-        String source = "@Script(name=\"StopEventScript\", version=\"1\")\nscript StopEventScript { async event StopEvent() { delay(20.milliseconds)\n console.print(\"event-after-disable\") } }";
+        String source = "@Script(\"StopEventScript\")\n@Version(\"1\")\nscript StopEventScript { @StopEvent async StopEvent() { delay(20.milliseconds)\n console.print(\"event-after-disable\") } }";
         assertEquals(true, engine.scripts().create(io.velora.api.script.ScriptCreateRequest.builder("stop-event", "StopEventScript").file("main.vls", source).build()).success());
         assertEquals(true, engine.scripts().enable("stop-event").success());
         engine.events().emitSafe(EventKey.of("runtime.stop", Void.class), null);
@@ -231,7 +231,7 @@ class EventRuntimeV2Test {
                 .coalescer((left, right) -> null)
                 .build());
         engine.freeze();
-        String source = "@Script(name=\"UnitQueue\", version=\"1\")\nscript UnitQueue { async event UnitEvent() { delay(10.milliseconds)\n console.print(\"unit-event\") } }";
+        String source = "@Script(\"UnitQueue\")\n@Version(\"1\")\nscript UnitQueue { @UnitEvent async UnitEvent() { delay(10.milliseconds)\n console.print(\"unit-event\") } }";
         assertEquals(true, engine.scripts().create(io.velora.api.script.ScriptCreateRequest.builder("unit-queue", "UnitQueue").file("main.vls", source).build()).success());
         assertEquals(true, engine.scripts().enable("unit-queue").success());
         EventKey<Void> key = EventKey.of("runtime.unit", Void.class);

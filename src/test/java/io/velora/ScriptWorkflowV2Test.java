@@ -34,7 +34,7 @@ class ScriptWorkflowV2Test {
     @Test
     void multiFileDiscoveryAndReloadTransactionAreProjectWide() {
         MemoryFileSystem fs = new MemoryFileSystem();
-        fs.put("multi", "main.vls", "@Script(name=\"Multi\", version=\"1\")\nscript Multi { int answer() { return helper() } }");
+        fs.put("multi", "main.vls", "@Script(\"Multi\")\n@Version(\"1\")\nscript Multi { int answer() { return helper() } }");
         fs.put("multi", "helper.vls", "int helper() { return 1 }");
         VeloraEngine engine = Velora.builder().host(host(fs)).build();
         engine.freeze();
@@ -60,8 +60,8 @@ class ScriptWorkflowV2Test {
     @Test
     void synchronousLifecycleExecutionKeepsOtherScriptsRunnable() {
         MemoryFileSystem fs = new MemoryFileSystem();
-        fs.put("first", "main.vls", "@Script(name=\"First\", version=\"1\")\nscript First { entry onRun() { console.print(\"first-run\") } }");
-        fs.put("second", "main.vls", "@Script(name=\"Second\", version=\"1\")\nscript Second { entry onEnable() { console.print(\"second-enable\") } }");
+        fs.put("first", "main.vls", "@Script(\"First\")\n@Version(\"1\")\nscript First { @Run run() { console.print(\"first-run\") } }");
+        fs.put("second", "main.vls", "@Script(\"Second\")\n@Version(\"1\")\nscript Second { @Enable enable() { console.print(\"second-enable\") } }");
         VeloraEngine engine = Velora.builder().host(host(fs)).build();
         engine.freeze();
         engine.scripts().discover();
@@ -76,11 +76,13 @@ class ScriptWorkflowV2Test {
     @Test
     void everyLifecycleHookExecutesInRuntimeOrder() {
         MemoryFileSystem fs = new MemoryFileSystem();
-        fs.put("lifecycle", "main.vls", "@Script(name=\"Lifecycle\", version=\"1\")\nscript Lifecycle { entry onLoad() { console.print(\"load\") } entry onEnable() { console.print(\"enable\") } entry onRun() { console.print(\"run\") } entry onTick() { console.print(\"tick\") } entry onDisable() { console.print(\"disable\") } entry onUnload() { console.print(\"unload\") } }");
+        fs.put("lifecycle", "main.vls", "@Script(\"Lifecycle\")\n@Version(\"1\")\nscript Lifecycle { @Load load() { console.print(\"load\") } @Enable enable() { console.print(\"enable\") } @Run run() { console.print(\"run\") } @Tick tick() { console.print(\"tick\") } @Disable disable() { console.print(\"disable\") } @Unload unload() { console.print(\"unload\") } }");
         VeloraEngine engine = Velora.builder().host(host(fs)).build();
+        engine.events().register(io.velora.api.event.EventDescriptor.builder("client.tick").scriptName("Tick").payloadType(io.velora.api.type.VeloraTypes.UNIT).build());
         engine.freeze();
         engine.scripts().discover();
         assertTrue(engine.scripts().enable("lifecycle").success());
+        engine.events().emitSafe(io.velora.api.event.EventKey.of("client.tick", Void.class), null);
         engine.tick();
         List<String> beforeDisable = engine.debug().logs("lifecycle").stream().map(log -> log.message()).toList();
         assertTrue(beforeDisable.contains("load"));
@@ -99,7 +101,7 @@ class ScriptWorkflowV2Test {
         MemoryFileSystem fs = new MemoryFileSystem();
         VeloraEngine engine = Velora.builder().host(host(fs)).limits(VeloraLimits.builder().memoryPerScript(64).build()).build();
         engine.freeze();
-        String source = "@Script(name=\"Limited\", version=\"1\")\nscript Limited { entry onRun() { console.print(\"never\") } }";
+        String source = "@Script(\"Limited\")\n@Version(\"1\")\nscript Limited { @Run run() { console.print(\"never\") } }";
         assertTrue(engine.scripts().create(ScriptCreateRequest.builder("limited", "Limited").file("main.vls", source).build()).success());
         var result = engine.scripts().enable("limited");
         assertFalse(result.success());
@@ -111,13 +113,17 @@ class ScriptWorkflowV2Test {
     @Test
     void asyncOnTickDoesNotOverlapItself() throws Exception {
         MemoryFileSystem fs = new MemoryFileSystem();
-        String source = "@Script(name=\"TickSerial\", version=\"1\")\nscript TickSerial { async entry onTick() { delay(20.milliseconds)\n console.print(\"tick-finished\") } }";
+        String source = "@Script(\"TickSerial\")\n@Version(\"1\")\nscript TickSerial { @Tick async tick() { delay(20.milliseconds)\n console.print(\"tick-finished\") } }";
         fs.put("tick-serial", "main.vls", source);
         VeloraEngine engine = Velora.builder().host(host(fs)).build();
+        engine.events().register(io.velora.api.event.EventDescriptor.builder("client.tick").scriptName("Tick").payloadType(io.velora.api.type.VeloraTypes.UNIT).build());
         engine.freeze();
         engine.scripts().discover();
         assertTrue(engine.scripts().enable("tick-serial").success());
+        var tick = io.velora.api.event.EventKey.of("client.tick", Void.class);
+        engine.events().emitSafe(tick, null);
         engine.tick();
+        engine.events().emitSafe(tick, null);
         engine.tick();
         Thread.sleep(25);
         engine.tick();
@@ -132,7 +138,7 @@ class ScriptWorkflowV2Test {
         VeloraFileSystem fs = VeloraFileSystem.local(root);
         VeloraEngine first = Velora.builder().host(host(fs)).build();
         first.freeze();
-        String source = "@Script(name=\"Disk\", version=\"1\")\nscript Disk { int value() { return 41 } }";
+        String source = "@Script(\"Disk\")\n@Version(\"1\")\nscript Disk { int value() { return 41 } }";
         assertTrue(first.scripts().create(ScriptCreateRequest.builder("disk", "Disk").file("main.vls", source).build()).success());
         SourceSnapshot before = fs.readSource("disk", "main.vls");
         assertNotNull(before);
@@ -153,24 +159,21 @@ class ScriptWorkflowV2Test {
     }
 
     @Test
-    void clientServiceEventsReflectCompilePermissionsAndConsoleChanges() {
+    void clientServiceEventsReflectCompileAndConsoleChanges() {
         MemoryFileSystem fs = new MemoryFileSystem();
         VeloraEngine engine = Velora.builder().host(host(fs)).build();
         engine.freeze();
         List<io.velora.api.script.ScriptServiceEvents.Type> events = new ArrayList<>();
         engine.scripts().events().subscribe(event -> events.add(event.type()));
         var created = engine.scripts().create(ScriptCreateRequest.builder("events", "Events")
-                .file("main.vls", "@Script(name=\"Events\", version=\"1\")\nscript Events { entry onRun() { console.print(\"service-log\") } }")
+                .file("main.vls", "@Script(\"Events\")\n@Version(\"1\")\nscript Events { @Run run() { console.print(\"service-log\") } }")
                 .build());
         assertTrue(created.success(), created.message());
-        var localStorage = engine.permissions().find("LOCAL_STORAGE");
-        engine.scripts().grantPermissions("events", io.velora.api.permission.PermissionSet.of(localStorage));
         assertTrue(engine.scripts().enable("events").success());
         engine.tick();
         assertTrue(events.contains(io.velora.api.script.ScriptServiceEvents.Type.COMPILE_STARTED));
         assertTrue(events.contains(io.velora.api.script.ScriptServiceEvents.Type.COMPILE_FINISHED));
         assertTrue(events.contains(io.velora.api.script.ScriptServiceEvents.Type.CREATED));
-        assertTrue(events.contains(io.velora.api.script.ScriptServiceEvents.Type.PERMISSIONS_CHANGED));
         assertTrue(events.contains(io.velora.api.script.ScriptServiceEvents.Type.LOG_ADDED));
         engine.close();
     }
@@ -185,7 +188,7 @@ class ScriptWorkflowV2Test {
             @Override public void register(io.velora.api.VeloraExtensionContext context) {
                 context.templates().register(io.velora.api.script.ScriptTemplate.builder("base")
                         .name("Base")
-                        .file("main.vls", "@Script(name=\"Templated\", version=\"1\")\nscript Templated { settings { @Number amount (\"Amount\", 0..100, 1, 10, @Number.Slider) } }")
+                        .file("main.vls", "@Script(\"Templated\")\n@Version(\"1\")\nscript Templated { @Setting(\"Amount\", min=0, max=100, step=1, editor=\"slider\") amount = 10 }")
                         .build());
             }
         });
@@ -203,7 +206,7 @@ class ScriptWorkflowV2Test {
     @Test
     void clientsCanReadUpdateAndReloadCurrentSettingValues() {
         MemoryFileSystem fs = new MemoryFileSystem();
-        fs.put("settings", "main.vls", "@Script(name=\"Settings\", version=\"1\")\nscript Settings { settings { @Number amount (\"Amount\", 0..100, 1, 10, @Number.Slider) } entry onRun() { console.print(\"amount=\" + amount) } }");
+        fs.put("settings", "main.vls", "@Script(\"Settings\")\n@Version(\"1\")\nscript Settings { @Setting(\"Amount\", min=0, max=100, step=1, editor=\"slider\") amount = 10 @Run run() { console.print(\"amount=\" + amount) } }");
         VeloraEngine first = Velora.builder().host(host(fs)).build();
         first.freeze();
         first.scripts().discover();
@@ -227,7 +230,7 @@ class ScriptWorkflowV2Test {
     @Test
     void invalidOrStaleTransactionsNeverMutateSources() {
         MemoryFileSystem fs = new MemoryFileSystem();
-        fs.put("safe", "main.vls", "@Script(name=\"Safe\", version=\"1\")\nscript Safe { int answer() { return helper() } }");
+        fs.put("safe", "main.vls", "@Script(\"Safe\")\n@Version(\"1\")\nscript Safe { int answer() { return helper() } }");
         fs.put("safe", "helper.vls", "int helper() { return 1 }");
         VeloraEngine engine = Velora.builder().host(host(fs)).build();
         engine.freeze();
@@ -261,7 +264,7 @@ class ScriptWorkflowV2Test {
     @Test
     void transactionDeleteParticipatesInWholeProjectValidationAndPathsAreSafe() {
         MemoryFileSystem fs = new MemoryFileSystem();
-        fs.put("delete", "main.vls", "@Script(name=\"Delete\", version=\"1\")\nscript Delete { int answer() { return helper() } }");
+        fs.put("delete", "main.vls", "@Script(\"Delete\")\n@Version(\"1\")\nscript Delete { int answer() { return helper() } }");
         fs.put("delete", "helper.vls", "int helper() { return 1 }");
         VeloraEngine engine = Velora.builder().host(host(fs)).build();
         engine.freeze();
@@ -275,6 +278,34 @@ class ScriptWorkflowV2Test {
         assertNotNull(fs.readSource("delete", "helper.vls"));
         assertThrows(IllegalArgumentException.class, () -> engine.scripts().beginTransaction("delete").write("../escape.vls", "", null));
         assertThrows(IllegalArgumentException.class, () -> engine.scripts().beginTransaction("delete").delete("C:\\escape.vls"));
+        engine.close();
+    }
+
+
+    @Test
+    void discoveryExposesCompilerDiagnosticsAndFailedStatus() {
+        MemoryFileSystem fs = new MemoryFileSystem();
+        fs.put("broken", "main.vls", "@Script(\"Broken\")\nscript Broken { answer() { return missing } }");
+        VeloraEngine engine = Velora.builder().host(host(fs)).build();
+        engine.freeze();
+        engine.scripts().discover();
+        var descriptor = engine.scripts().find("broken").orElseThrow().descriptor();
+        assertEquals(io.velora.api.script.ScriptStatus.FAILED, descriptor.status());
+        assertTrue(descriptor.errorCount() > 0);
+        assertTrue(engine.scripts().diagnostics("broken").stream().anyMatch(d -> d.code() == io.velora.api.compiler.DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL));
+        assertTrue(engine.scripts().find("broken").orElseThrow().diagnostics().stream().anyMatch(d -> d.code() == io.velora.api.compiler.DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL));
+        engine.close();
+    }
+
+    @Test
+    void scriptsWithoutSettingsDoNotReceiveSyntheticSettings() {
+        MemoryFileSystem fs = new MemoryFileSystem();
+        fs.put("plain", "main.vls", "@Script(\"Plain\")\nscript Plain { answer() { return 1 } }");
+        VeloraEngine engine = Velora.builder().host(host(fs)).build();
+        engine.freeze();
+        engine.scripts().discover();
+        assertTrue(engine.scripts().settings("plain").settings().isEmpty());
+        assertTrue(engine.scripts().settingValues("plain").isEmpty());
         engine.close();
     }
 

@@ -4,12 +4,11 @@ import java.util.List;
 
 /**
  * A runtime-state field declared in the script body, e.g.
- * {@code int ticks = 0}, {@code static int totalMined = 0},
- * {@code #int MAX_ATTEMPTS = 5}, {@code Vec3 home = null}.
+ * {@code ticks = 0}, {@code static totalMined = 0},
+ * {@code #MAX_ATTEMPTS = 5}, {@code Vec3? home = null}.
  */
 public final class PropertyDeclarationNode extends ScriptMemberNode {
     private final boolean isVar;
-    private final boolean isPrivate;
     private final boolean isStatic;
     private final boolean isConst;
     private final String name;
@@ -20,13 +19,12 @@ public final class PropertyDeclarationNode extends ScriptMemberNode {
     private final String persistentId;
 
     public PropertyDeclarationNode(String filePath, int line, int column,
-                                   boolean isVar, boolean isPrivate, boolean isStatic, boolean isConst,
+                                   boolean isVar, boolean isStatic, boolean isConst,
                                    String name,
                                    TypeNode declaredType, ExpressionNode initializer,
                                    List<AnnotationNode> annotations, boolean persistent, String persistentId) {
         super(filePath, line, column);
         this.isVar = isVar;
-        this.isPrivate = isPrivate;
         this.isStatic = isStatic;
         this.isConst = isConst;
         this.name = name;
@@ -38,7 +36,6 @@ public final class PropertyDeclarationNode extends ScriptMemberNode {
     }
 
     public boolean isVar() { return isVar; }
-    public boolean isPrivate() { return isPrivate; }
     public boolean isStatic() { return isStatic; }
     public boolean isConst() { return isConst; }
     public String name() { return name; }

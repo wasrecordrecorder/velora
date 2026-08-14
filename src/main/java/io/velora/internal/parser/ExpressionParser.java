@@ -297,6 +297,9 @@ public final class ExpressionParser {
             return new LiteralExpressionNode(context.filePath(), token.line(), token.column(),
                     null, LiteralExpressionNode.LiteralKind.NULL);
         }
+        if (token.is(TokenType.IDENTIFIER) && isCollectionConstructor(token.text()) && context.tokens().peek(1).is(TokenType.LT)) {
+            return parseCollectionConstructor();
+        }
         if (token.is(TokenType.IDENTIFIER)) {
             context.advance();
             return new IdentifierExpressionNode(context.filePath(), token.line(), token.column(), token.text());
@@ -452,6 +455,27 @@ public final class ExpressionParser {
         context.skipTrivia();
         ExpressionNode value = parseExpression();
         return Map.entry(key, value);
+    }
+
+    private boolean isCollectionConstructor(String name) {
+        return name.equals("list") || name.equals("set") || name.equals("map");
+    }
+
+    private ExpressionNode parseCollectionConstructor() {
+        Token token = context.advance();
+        context.expect(TokenType.LT, "Expected '<' after collection constructor");
+        List<TypeNode> arguments = new ArrayList<>();
+        arguments.add(parseTypeReference());
+        while (context.match(TokenType.COMMA)) arguments.add(parseTypeReference());
+        context.expect(TokenType.GT, "Expected '>' after collection type arguments");
+        context.expect(TokenType.LPAREN, "Expected '(' after collection type");
+        context.expect(TokenType.RPAREN, "Collection constructors do not accept values; use a literal for initial elements");
+        CollectionConstructorExpressionNode.Kind kind = switch (token.text()) {
+            case "list" -> CollectionConstructorExpressionNode.Kind.LIST;
+            case "set" -> CollectionConstructorExpressionNode.Kind.SET;
+            default -> CollectionConstructorExpressionNode.Kind.MAP;
+        };
+        return new CollectionConstructorExpressionNode(context.filePath(), token.line(), token.column(), kind, arguments);
     }
 
     private TypeNode parseTypeReference() {

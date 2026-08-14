@@ -261,11 +261,6 @@ public final class VirtualMachine {
                             return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
                                     "WORKER API function must be suspending: " + fd.qualifiedName(), 0, fiberId), instructions, System.nanoTime() - startTime);
                         }
-                        if (fd.permission() != null && module.maximumPermissions() != null && !module.maximumPermissions().isEmpty() && host == null) {
-                            for (int i = 0; i < argCount; i++) stack.pop();
-                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
-                                    "Permission denied: " + fd.permission().id(), 0, fiberId), instructions, System.nanoTime() - startTime);
-                        }
                         Object[] apiArgs = new Object[argCount];
                         for (int i = argCount - 1; i >= 0; i--) apiArgs[i] = stack.pop().boxed();
                         try {
@@ -346,6 +341,46 @@ public final class VirtualMachine {
                                     t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName(), 0, fiberId), instructions, System.nanoTime() - startTime);
                         }
                     }
+                    case CALL_MEMBER -> {
+                        String memberName = module.constantPool().stringValue(operand0);
+                        int argCount = operand1;
+                        ScriptValue[] memberArgs = new ScriptValue[argCount];
+                        for (int i = argCount - 1; i >= 0; i--) memberArgs[i] = stack.pop();
+                        ScriptValue recv = stack.pop();
+                        ScriptValue result;
+                        if (recv instanceof ListValue list) {
+                            result = switch (memberName) {
+                                case "add" -> { list.elements().add(memberArgs[0]); enforceValueLimits(list); yield PrimitiveValue.nullValue(); }
+                                case "remove" -> PrimitiveValue.of(list.elements().remove(memberArgs[0]));
+                                case "contains" -> PrimitiveValue.of(list.elements().contains(memberArgs[0]));
+                                case "clear" -> { list.elements().clear(); yield PrimitiveValue.nullValue(); }
+                                default -> null;
+                            };
+                        } else if (recv instanceof SetValue set) {
+                            result = switch (memberName) {
+                                case "add" -> { set.elements().add(memberArgs[0]); enforceValueLimits(set); yield PrimitiveValue.nullValue(); }
+                                case "remove" -> PrimitiveValue.of(set.elements().remove(memberArgs[0]));
+                                case "contains" -> PrimitiveValue.of(set.elements().contains(memberArgs[0]));
+                                case "clear" -> { set.elements().clear(); yield PrimitiveValue.nullValue(); }
+                                default -> null;
+                            };
+                        } else if (recv instanceof MapValue map) {
+                            result = switch (memberName) {
+                                case "put" -> { map.entries().put(memberArgs[0], memberArgs[1]); enforceValueLimits(map); yield PrimitiveValue.nullValue(); }
+                                case "remove" -> PrimitiveValue.of(map.entries().remove(memberArgs[0]) != null);
+                                case "containsKey" -> PrimitiveValue.of(map.entries().containsKey(memberArgs[0]));
+                                case "clear" -> { map.entries().clear(); yield PrimitiveValue.nullValue(); }
+                                default -> null;
+                            };
+                        } else {
+                            result = null;
+                        }
+                        if (result == null) {
+                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                                    "Method not found: " + memberName, 0, fiberId), instructions, System.nanoTime() - startTime);
+                        }
+                        stack.push(result);
+                    }
                     case GET_MEMBER -> {
                         String memberName = module.constantPool().stringValue(operand0);
                         ScriptValue recv = stack.pop();
@@ -353,12 +388,18 @@ public final class VirtualMachine {
                             stack.push(PrimitiveValue.of(sv.value().length()));
                         } else if (recv instanceof ListValue lv && memberName.equals("size")) {
                             stack.push(PrimitiveValue.of(lv.elements().size()));
+                        } else if (recv instanceof ListValue lv && memberName.equals("isEmpty")) {
+                            stack.push(PrimitiveValue.of(lv.elements().isEmpty()));
                         } else if (recv instanceof ListValue lv && vectorMemberIndex(memberName) >= 0 && vectorMemberIndex(memberName) < lv.elements().size()) {
                             stack.push(lv.elements().get(vectorMemberIndex(memberName)));
                         } else if (recv instanceof MapValue mv && memberName.equals("size")) {
                             stack.push(PrimitiveValue.of(mv.entries().size()));
+                        } else if (recv instanceof MapValue mv && memberName.equals("isEmpty")) {
+                            stack.push(PrimitiveValue.of(mv.entries().isEmpty()));
                         } else if (recv instanceof SetValue sv && memberName.equals("size")) {
                             stack.push(PrimitiveValue.of(sv.elements().size()));
+                        } else if (recv instanceof SetValue sv && memberName.equals("isEmpty")) {
+                            stack.push(PrimitiveValue.of(sv.elements().isEmpty()));
                         } else if (recv instanceof StructValue struct) {
                             stack.push(struct.fields().getOrDefault(memberName, PrimitiveValue.nullValue()));
                         } else {
@@ -381,6 +422,14 @@ public final class VirtualMachine {
                         enforceValueLimits(value);
                         stack.push(value);
                     }
+                    case CREATE_SET -> {
+                        int count = operand0;
+                        Set<ScriptValue> elements = new LinkedHashSet<>();
+                        for (int i = 0; i < count; i++) elements.add(stack.pop());
+                        ScriptValue value = new SetValue(elements);
+                        enforceValueLimits(value);
+                        stack.push(value);
+                    }
                     case CREATE_MAP -> {
                         int count = operand0;
                         Map<ScriptValue, ScriptValue> entries = new LinkedHashMap<>();
@@ -400,6 +449,10 @@ public final class VirtualMachine {
                             int i = index.value();
                             if (i < 0 || i >= list.elements().size()) throw new IndexAccessException("List index out of bounds: " + i);
                             stack.push(list.elements().get(i));
+                        } else if (recv instanceof SetValue set && idx instanceof PrimitiveValue.IntV index) {
+                            int i = index.value();
+                            if (i < 0 || i >= set.elements().size()) throw new IndexAccessException("Set index out of bounds: " + i);
+                            stack.push(set.elements().stream().skip(i).findFirst().orElseThrow());
                         } else if (recv instanceof StringValue string && idx instanceof PrimitiveValue.IntV index) {
                             int i = index.value();
                             if (i < 0 || i >= string.value().length()) throw new IndexAccessException("String index out of bounds: " + i);

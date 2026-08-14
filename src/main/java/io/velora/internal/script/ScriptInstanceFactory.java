@@ -10,7 +10,7 @@ public final class ScriptInstanceFactory {
                 descriptor.id(), descriptor.name(), descriptor.version(),
                 descriptor.author(), descriptor.description(),
                 ScriptStatus.DISCOVERED, false, descriptor.sourceFiles(),
-                descriptor.permissions(), descriptor.activeRevision(),
+                descriptor.activeRevision(),
                 descriptor.errorCount(), descriptor.warningCount(),
                 descriptor.lastReloadTimeNanos()
         );

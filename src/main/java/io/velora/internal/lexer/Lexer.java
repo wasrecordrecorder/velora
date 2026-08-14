@@ -20,10 +20,7 @@ public final class Lexer {
 
     private static final Map<String, TokenType> KEYWORDS = Map.ofEntries(
             Map.entry("script", TokenType.KW_SCRIPT),
-            Map.entry("settings", TokenType.KW_SETTINGS),
             Map.entry("async", TokenType.KW_ASYNC),
-            Map.entry("entry", TokenType.KW_ENTRY),
-            Map.entry("event", TokenType.KW_EVENT),
             Map.entry("static", TokenType.KW_STATIC),
             Map.entry("if", TokenType.KW_IF),
             Map.entry("else", TokenType.KW_ELSE),
@@ -31,17 +28,12 @@ public final class Lexer {
             Map.entry("for", TokenType.KW_FOR),
             Map.entry("when", TokenType.KW_WHEN),
             Map.entry("return", TokenType.KW_RETURN),
-            Map.entry("import", TokenType.KW_IMPORT),
-            Map.entry("package", TokenType.KW_PACKAGE),
-            Map.entry("private", TokenType.KW_PRIVATE),
-            Map.entry("public", TokenType.KW_PUBLIC),
             Map.entry("is", TokenType.KW_IS),
             Map.entry("in", TokenType.KW_IN),
             Map.entry("spawn", TokenType.KW_SPAWN),
             Map.entry("true", TokenType.KW_TRUE),
             Map.entry("false", TokenType.KW_FALSE),
-            Map.entry("null", TokenType.KW_NULL),
-            Map.entry("void", TokenType.KW_VOID)
+            Map.entry("null", TokenType.KW_NULL)
     );
 
     private final String source;
@@ -186,8 +178,7 @@ public final class Lexer {
         int startCol = column;
         pos++; // @
         column++;
-        // Handle dotted annotation names like @Event.ChatMessage or @Number.Slider
-        while (pos < length && (Character.isLetterOrDigit(source.charAt(pos)) || source.charAt(pos) == '_' || source.charAt(pos) == '.')) {
+        while (pos < length && (Character.isLetterOrDigit(source.charAt(pos)) || source.charAt(pos) == '_')) {
             pos++;
             column++;
         }

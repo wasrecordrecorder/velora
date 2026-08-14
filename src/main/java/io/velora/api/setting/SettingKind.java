@@ -8,7 +8,7 @@ import java.util.Optional;
 import java.util.function.Function;
 
 /**
- * Describes a setting annotation kind (e.g. {@code Slider}, {@code Toggle}).
+ * Describes a setting kind selected through {@code @Setting(..., kind="Name")}.
  *
  * <p>Registered in the {@link io.velora.api.registry.SettingRegistry} before
  * freeze. The compiler uses the {@link #parameterSchema()} to validate setting
@@ -66,7 +66,7 @@ public final class SettingKind {
         return new Builder().name(name);
     }
 
-    /** A parameter slot in the setting annotation signature. */
+    /** A parameter slot in the selected setting kind schema. */
     public record Parameter(String name, ParameterRole role, VeloraType type, boolean required) {
         public enum ParameterRole { IDENTIFIER, DISPLAY_NAME, DEFAULT_VALUE, MIN, MAX, STEP, VALUES, NAMED }
 
@@ -87,7 +87,7 @@ public final class SettingKind {
         }
     }
 
-    /** A parsed setting declaration (annotation name, identifier, positional and named args). */
+    /** A parsed setting declaration (kind name, identifier, positional and named arguments). */
     public record SettingDeclaration(String annotationName, String identifier,
                                       List<Object> positionalArguments,
                                       java.util.Map<String, Object> namedArguments) {

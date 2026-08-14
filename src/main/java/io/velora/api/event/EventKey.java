@@ -6,7 +6,7 @@ import java.util.Objects;
  * Type-safe key for a registered event.
  *
  * <p>Keys are stable identifiers shared between the host (registration/emit) and
- * scripts ({@code @EventHandler}). The payload type is carried for compile-time
+ * scripts (for example a registered script name {@code Tick} becomes {@code @Tick}). The payload type is carried for compile-time
  * safety on the host side.
  *
  * @param <T> the immutable payload type

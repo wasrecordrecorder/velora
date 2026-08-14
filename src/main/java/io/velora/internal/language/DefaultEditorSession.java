@@ -81,7 +81,7 @@ public final class DefaultEditorSession implements EditorSession {
     @Override
     public Optional<HoverInfo> hover(int line, int column) {
         ensureOpen();
-        return HoverEngine.getHover(content, line, column, filePath, apiRegistry, typeRegistry, constantRegistry);
+        return HoverEngine.getHover(content, line, column, filePath, apiRegistry, typeRegistry, constantRegistry, eventRegistry);
     }
 
     @Override

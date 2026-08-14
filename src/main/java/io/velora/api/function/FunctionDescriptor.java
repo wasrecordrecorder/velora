@@ -1,6 +1,5 @@
 package io.velora.api.function;
 
-import io.velora.api.permission.ScriptPermission;
 import io.velora.api.type.VeloraType;
 
 import java.util.*;
@@ -19,7 +18,6 @@ public final class FunctionDescriptor {
     private final VeloraType returnType;
     private final boolean suspending;
     private final ScriptThread thread;
-    private final ScriptPermission permission;
     private final int cost;
     private final FunctionInvoker invoker;
     private final int index; // assigned at freeze
@@ -34,7 +32,6 @@ public final class FunctionDescriptor {
         this.returnType = b.returnType;
         this.suspending = b.suspending;
         this.thread = b.thread;
-        this.permission = b.permission;
         this.cost = b.cost;
         this.invoker = b.invoker;
         this.index = b.index;
@@ -51,7 +48,6 @@ public final class FunctionDescriptor {
         b.returnType = this.returnType;
         b.suspending = this.suspending;
         b.thread = this.thread;
-        b.permission = this.permission;
         b.cost = this.cost;
         b.invoker = this.invoker;
         b.index = index;
@@ -67,7 +63,6 @@ public final class FunctionDescriptor {
     public VeloraType returnType() { return returnType; }
     public boolean suspending() { return suspending; }
     public ScriptThread thread() { return thread; }
-    public ScriptPermission permission() { return permission; }
     public int cost() { return cost; }
     public FunctionInvoker invoker() { return invoker; }
     public int index() { return index; }
@@ -93,7 +88,6 @@ public final class FunctionDescriptor {
         private VeloraType returnType;
         private boolean suspending = false;
         private ScriptThread thread = ScriptThread.ANY;
-        private ScriptPermission permission;
         private int cost = 1;
         private FunctionInvoker invoker;
         private int index = -1;
@@ -109,7 +103,6 @@ public final class FunctionDescriptor {
         public Builder returns(VeloraType type) { this.returnType = type; return this; }
         public Builder suspending(boolean v) { this.suspending = v; return this; }
         public Builder thread(ScriptThread v) { this.thread = v; return this; }
-        public Builder permission(ScriptPermission v) { this.permission = v; return this; }
         public Builder cost(int v) { this.cost = v; return this; }
         public Builder invoker(FunctionInvoker v) { this.invoker = v; return this; }
 

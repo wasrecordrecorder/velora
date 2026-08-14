@@ -28,9 +28,11 @@ public sealed interface IrInstruction {
     record Call(int functionIndex, int argCount, VeloraType returnType) implements IrInstruction {}
     record CallApi(int apiIndex, int argCount, VeloraType returnType) implements IrInstruction {}
     record CallSuspend(int apiIndex, int argCount, VeloraType returnType) implements IrInstruction {}
+    record CallMember(String memberName, int argCount, VeloraType returnType) implements IrInstruction {}
     record GetMember(String memberName, VeloraType resultType) implements IrInstruction {}
     record SetMember(String memberName) implements IrInstruction {}
     record CreateList(int elementCount, VeloraType elementType) implements IrInstruction {}
+    record CreateSet(int elementCount, VeloraType elementType) implements IrInstruction {}
     record CreateMap(int entryCount, VeloraType keyType, VeloraType valueType) implements IrInstruction {}
     record GetIndex(VeloraType resultType) implements IrInstruction {}
     record Spawn(int functionIndex, int argCount) implements IrInstruction {}

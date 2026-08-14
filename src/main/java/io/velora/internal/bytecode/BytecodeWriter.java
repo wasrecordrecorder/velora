@@ -34,7 +34,7 @@ public final class BytecodeWriter {
         List<CompiledModule.FieldInitializer> compiledInits = new ArrayList<>();
         for (var fi : module.fieldInitializers()) {
             compiledInits.add(new CompiledModule.FieldInitializer(
-                    fi.fieldIndex(), fi.isStatic(), irValueToScriptValue(fi.initialValue())));
+                    fi.fieldIndex(), fi.isStatic(), fi.initialValue()));
         }
 
         return new CompiledModule(
@@ -42,7 +42,6 @@ public final class BytecodeWriter {
                 sourceHash, registryHash, pool, functions, module.settings(),
                 module.persistentFieldIds(), module.persistentFieldTypes(),
                 module.persistentFieldIndices(), module.persistentFieldIsStatic(),
-                module.requiredPermissions(), module.maximumPermissions(),
                 lifecycleHooks, eventHandlers, compiledInits,
                 module.author(), module.description()
         );
@@ -137,9 +136,11 @@ public final class BytecodeWriter {
             case IrInstruction.Call c -> { code.add(Opcode.CALL.ordinal()); code.add(c.functionIndex()); code.add(c.argCount()); }
             case IrInstruction.CallApi c -> { code.add(Opcode.CALL_API.ordinal()); code.add(c.apiIndex()); code.add(c.argCount()); }
             case IrInstruction.CallSuspend c -> { code.add(Opcode.CALL_SUSPEND.ordinal()); code.add(c.apiIndex()); code.add(c.argCount()); }
+            case IrInstruction.CallMember c -> { code.add(Opcode.CALL_MEMBER.ordinal()); code.add(pool.addString(c.memberName())); code.add(c.argCount()); }
             case IrInstruction.GetMember g -> { code.add(Opcode.GET_MEMBER.ordinal()); code.add(pool.addString(g.memberName())); }
             case IrInstruction.SetMember s -> { code.add(Opcode.SET_MEMBER.ordinal()); code.add(pool.addString(s.memberName())); }
             case IrInstruction.CreateList c -> { code.add(Opcode.CREATE_LIST.ordinal()); code.add(c.elementCount()); }
+            case IrInstruction.CreateSet c -> { code.add(Opcode.CREATE_SET.ordinal()); code.add(c.elementCount()); }
             case IrInstruction.CreateMap c -> { code.add(Opcode.CREATE_MAP.ordinal()); code.add(c.entryCount()); }
             case IrInstruction.GetIndex g -> code.add(Opcode.GET_INDEX.ordinal());
             case IrInstruction.Spawn s -> { code.add(Opcode.SPAWN.ordinal()); code.add(s.functionIndex()); code.add(s.argCount()); }

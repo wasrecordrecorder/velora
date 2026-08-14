@@ -19,8 +19,6 @@ public interface VeloraExtensionContext {
 
     SettingRegistry settings();
 
-    PermissionRegistry permissions();
-
     ConstantRegistry constants();
 
     ScriptTemplateRegistry templates();

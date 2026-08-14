@@ -30,6 +30,8 @@ public interface ScriptManager {
 
     java.util.Map<String, io.velora.api.setting.SettingValue> settingValues(String scriptId);
 
+    java.util.List<io.velora.api.compiler.Diagnostic> diagnostics(String scriptId);
+
     ScriptTransaction beginTransaction(String scriptId);
 
     ScriptServiceEvents events();
@@ -38,9 +40,4 @@ public interface ScriptManager {
 
     void loadEnabled();
 
-    void grantPermissions(String scriptId, io.velora.api.permission.PermissionSet set);
-
-    void revokePermissions(String scriptId, io.velora.api.permission.PermissionSet set);
-
-    boolean hasPermissionGrant(String scriptId, io.velora.api.permission.PermissionSet required);
 }
