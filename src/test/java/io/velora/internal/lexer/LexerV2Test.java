@@ -143,7 +143,8 @@ class LexerV2Test {
 
     @Test
     void removedKeywordsArePlainIdentifiers() {
-        List<Token> tokens = significant("settings entry event void package import private public");
+        List<Token> tokens = significant("settings entry event void package private public");
         assertTrue(tokens.stream().allMatch(token -> token.type() == TokenType.IDENTIFIER));
+        assertEquals(TokenType.KW_IMPORT, significant("import").get(0).type());
     }
 }

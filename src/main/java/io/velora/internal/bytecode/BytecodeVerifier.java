@@ -3,6 +3,8 @@ package io.velora.internal.bytecode;
 import io.velora.api.compiler.Diagnostic;
 import io.velora.api.compiler.DiagnosticCode;
 import io.velora.api.compiler.SourceRange;
+import io.velora.api.function.ApiRegistry;
+import io.velora.api.function.FunctionDescriptor;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -16,7 +18,16 @@ import java.util.Set;
 public final class BytecodeVerifier {
 
     private static final Opcode[] OPCODES = Opcode.values();
+    private final ApiRegistry apiRegistry;
     private static final SourceRange RANGE = SourceRange.of("bc", 0, 0);
+
+    public BytecodeVerifier() {
+        this(null);
+    }
+
+    public BytecodeVerifier(ApiRegistry apiRegistry) {
+        this.apiRegistry = apiRegistry;
+    }
 
     public List<Diagnostic> verify(CompiledModule module) {
         List<Diagnostic> diagnostics = new ArrayList<>();
@@ -135,9 +146,7 @@ public final class BytecodeVerifier {
                     error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Argument count mismatch for " + module.function(operands[0]).name() + " in " + function.name() + " at " + instruction.offset());
                 }
             }
-            case CALL_API, CALL_SUSPEND -> {
-                if (operands[0] < 0 || operands[1] < 0) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Invalid API call operand in " + function.name() + " at " + instruction.offset());
-            }
+            case CALL_API, CALL_SUSPEND -> validateApiCall(function, instruction, diagnostics);
             case CALL_MEMBER -> {
                 validateStringOperand(operands[0], module, function, instruction, diagnostics);
                 if (operands[1] < 0) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Negative member argument count in " + function.name() + " at " + instruction.offset());
@@ -156,6 +165,29 @@ public final class BytecodeVerifier {
             default -> {}
         }
         if (opcode == Opcode.SET_MEMBER) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "SET_MEMBER is not valid for immutable script values in " + function.name());
+    }
+
+    private void validateApiCall(CompiledFunction function, Instruction instruction, List<Diagnostic> diagnostics) {
+        int index = instruction.operands()[0];
+        int argumentCount = instruction.operands()[1];
+        if (index < 0 || argumentCount < 0) {
+            error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Invalid API call operand in " + function.name() + " at " + instruction.offset());
+            return;
+        }
+        if (apiRegistry == null) return;
+        FunctionDescriptor descriptor = apiRegistry.findByIndex(index);
+        if (descriptor == null) {
+            error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "API index " + index + " out of range in " + function.name() + " at " + instruction.offset());
+            return;
+        }
+        int required = (int) descriptor.parameters().stream().filter(parameter -> parameter.required() && !parameter.hasDefault()).count();
+        if (argumentCount < required || argumentCount > descriptor.parameters().size()) {
+            error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Argument count mismatch for " + descriptor.qualifiedName() + " in " + function.name() + " at " + instruction.offset());
+        }
+        boolean suspendOpcode = instruction.opcode() == Opcode.CALL_SUSPEND;
+        if (descriptor.suspending() != suspendOpcode) {
+            error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "API call mode mismatch for " + descriptor.qualifiedName() + " in " + function.name() + " at " + instruction.offset());
+        }
     }
 
     private void validateStringOperand(int index, CompiledModule module, CompiledFunction function, Instruction instruction, List<Diagnostic> diagnostics) {

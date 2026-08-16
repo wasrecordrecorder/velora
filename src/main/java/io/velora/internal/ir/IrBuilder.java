@@ -716,12 +716,11 @@ public final class IrBuilder {
     private int resolveApiIndex(String namespace, String name) {
         ApiRegistry reg = apiRegistry != null ? apiRegistry : resolved.apiRegistry();
         if (reg == null) throw new IllegalStateException("API registry is unavailable");
+        String actual = resolveApiNamespace(namespace);
         List<FunctionDescriptor> all = reg.all();
         for (int i = 0; i < all.size(); i++) {
             FunctionDescriptor fd = all.get(i);
-            if (fd.namespace().equals(namespace) && fd.name().equals(name)) {
-                return i;
-            }
+            if (fd.namespace().equals(actual) && fd.name().equals(name)) return i;
         }
         throw new IllegalStateException("Unresolved API function: " + namespace + "." + name);
     }
@@ -729,14 +728,20 @@ public final class IrBuilder {
     private FunctionDescriptor resolveApiDescriptor(String namespace, String name) {
         ApiRegistry reg = apiRegistry != null ? apiRegistry : resolved.apiRegistry();
         if (reg == null) throw new IllegalStateException("API registry is unavailable");
-        FunctionDescriptor descriptor = reg.find(namespace, name);
+        FunctionDescriptor descriptor = reg.find(resolveApiNamespace(namespace), name);
         if (descriptor == null) throw new IllegalStateException("Unresolved API function: " + namespace + "." + name);
         return descriptor;
     }
 
     private boolean isApiNamespace(String name) {
         ApiRegistry reg = apiRegistry != null ? apiRegistry : resolved.apiRegistry();
-        return reg != null && reg.namespaces().contains(name);
+        return reg != null && (reg.namespaces().contains(name) || resolved.importNamespaces().containsKey(name));
+    }
+
+    private String resolveApiNamespace(String name) {
+        ApiRegistry reg = apiRegistry != null ? apiRegistry : resolved.apiRegistry();
+        if (reg != null && reg.namespaces().contains(name)) return name;
+        return resolved.importNamespaces().get(name);
     }
 
     private boolean isQualifiedHostValue(String namespace, String member) {

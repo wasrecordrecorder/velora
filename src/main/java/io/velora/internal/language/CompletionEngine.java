@@ -3,6 +3,7 @@ package io.velora.internal.language;
 import io.velora.api.event.EventRegistry;
 import io.velora.api.function.ApiRegistry;
 import io.velora.api.language.CompletionItem;
+import io.velora.api.interop.JavaImportRegistry;
 import io.velora.api.registry.ConstantRegistry;
 import io.velora.api.registry.SettingRegistry;
 import io.velora.api.registry.TypeRegistry;
@@ -15,7 +16,7 @@ import java.util.Set;
 
 public final class CompletionEngine {
     private static final List<String> KEYWORDS = List.of(
-            "script", "static", "async", "if", "else", "while", "for", "when", "return", "is", "in",
+            "script", "import", "static", "async", "if", "else", "while", "for", "when", "return", "is", "in",
             "spawn", "true", "false", "null"
     );
     private static final List<String> TYPES = List.of(
@@ -31,20 +32,28 @@ public final class CompletionEngine {
     private CompletionEngine() {}
 
     public static List<CompletionItem> getCompletions(String content, int line, int column) {
-        return getCompletions(content, line, column, null, null, null, null, null);
+        return getCompletions(content, line, column, null, null, null, null, null, null);
     }
 
     public static List<CompletionItem> getCompletions(String content, int line, int column, ApiRegistry apiRegistry,
                                                        TypeRegistry typeRegistry, EventRegistry eventRegistry,
                                                        SettingRegistry settingRegistry, ConstantRegistry constantRegistry) {
+        return getCompletions(content, line, column, apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry, null);
+    }
+
+    public static List<CompletionItem> getCompletions(String content, int line, int column, ApiRegistry apiRegistry,
+                                                       TypeRegistry typeRegistry, EventRegistry eventRegistry,
+                                                       SettingRegistry settingRegistry, ConstantRegistry constantRegistry,
+                                                       JavaImportRegistry javaImportRegistry) {
         String prefix = prefixAt(content, line, column);
         String qualifier = qualifierAt(content, line, column, prefix.length());
         Set<String> seen = new LinkedHashSet<>();
         List<CompletionItem> result = new ArrayList<>();
         if (qualifier != null) {
             if (apiRegistry != null) {
+                String namespace = JavaImportAliases.namespace(content, qualifier, javaImportRegistry);
                 for (var function : apiRegistry.all()) {
-                    if (function.namespace().equals(qualifier) && matches(function.name(), prefix) && seen.add(function.name())) {
+                    if (function.namespace().equals(namespace) && matches(function.name(), prefix) && seen.add(function.name())) {
                         String detail = function.qualifiedName() + "(" + String.join(", ", function.parameters().stream().map(p -> p.name() + ": " + p.type().name()).toList()) + ") -> " + function.returnType().name();
                         result.add(new CompletionItem(function.name(), detail, function.description(), function.name(), CompletionItem.CompletionKind.FUNCTION));
                     }
@@ -73,7 +82,8 @@ public final class CompletionEngine {
         add(result, seen, TYPES, CompletionItem.CompletionKind.TYPE, prefix);
         add(result, seen, BUILTINS, CompletionItem.CompletionKind.FUNCTION, prefix);
         if (typeRegistry != null) add(result, seen, typeRegistry.names().stream().toList(), CompletionItem.CompletionKind.TYPE, prefix);
-        if (apiRegistry != null) add(result, seen, apiRegistry.namespaces().stream().toList(), CompletionItem.CompletionKind.NAMESPACE, prefix);
+        if (apiRegistry != null) add(result, seen, apiRegistry.namespaces().stream().filter(name -> !name.startsWith("__java_")).toList(), CompletionItem.CompletionKind.NAMESPACE, prefix);
+        add(result, seen, JavaImportAliases.resolve(content, javaImportRegistry).keySet().stream().toList(), CompletionItem.CompletionKind.NAMESPACE, prefix);
         if (constantRegistry != null) add(result, seen, constantRegistry.namespaces().stream().toList(), CompletionItem.CompletionKind.NAMESPACE, prefix);
         return List.copyOf(result);
     }

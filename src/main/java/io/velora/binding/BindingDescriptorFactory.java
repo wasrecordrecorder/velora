@@ -13,6 +13,7 @@ import io.velora.binding.annotation.VeloraProperty;
 import io.velora.binding.annotation.VeloraParam;
 
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.lang.reflect.Parameter;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
@@ -37,12 +38,20 @@ public final class BindingDescriptorFactory {
 
     public List<FunctionDescriptor> createDescriptors(Object binding) {
         if (binding == null) throw new BindingValidationException("Binding cannot be null");
+        Class<?> type = binding.getClass();
+        VeloraNamespace namespace = type.getAnnotation(VeloraNamespace.class);
+        if (namespace == null) throw new BindingValidationException("Class " + type.getName() + " is not annotated with @VeloraNamespace");
+        return createDescriptors(type, binding, namespace.value(), false);
+    }
+
+    public List<FunctionDescriptor> createStaticDescriptors(Class<?> type, String namespace) {
+        if (type == null) throw new BindingValidationException("Binding class cannot be null");
+        return createDescriptors(type, null, namespace, true);
+    }
+
+    private List<FunctionDescriptor> createDescriptors(Class<?> type, Object binding, String namespace, boolean staticOnly) {
         List<FunctionDescriptor> descriptors = new ArrayList<>();
-        Class<?> cls = binding.getClass();
-        VeloraNamespace nsAnnotation = cls.getAnnotation(VeloraNamespace.class);
-        if (nsAnnotation == null) throw new BindingValidationException("Class " + cls.getName() + " is not annotated with @VeloraNamespace");
-        String namespace = nsAnnotation.value();
-        Method[] methods = cls.getDeclaredMethods();
+        Method[] methods = type.getDeclaredMethods();
         Arrays.sort(methods, Comparator.comparing(this::exposedName).thenComparing(Method::toGenericString));
         Set<String> names = new HashSet<>();
         for (Method method : methods) {
@@ -50,6 +59,7 @@ public final class BindingDescriptorFactory {
             VeloraProperty property = method.getAnnotation(VeloraProperty.class);
             if (function != null && property != null) throw new BindingValidationException("Method " + method.getName() + " cannot be both @VeloraFunction and @VeloraProperty");
             if (function == null && property == null) continue;
+            if (staticOnly && !Modifier.isStatic(method.getModifiers())) throw new BindingValidationException("Imported method " + type.getName() + "." + method.getName() + " must be static");
             String name = function != null ? function.name() : property.name();
             if (!names.add(name)) throw new BindingValidationException("Duplicate exposed binding name " + namespace + "." + name);
             if (function != null) descriptors.add(createFunctionDescriptor(namespace, binding, method, function));

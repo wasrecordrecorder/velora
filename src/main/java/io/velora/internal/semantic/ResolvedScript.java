@@ -18,6 +18,7 @@ public final class ResolvedScript {
     private final List<ResolvedEventHandler> eventHandlers;
     private final int languageVersion;
     private ApiRegistry apiRegistry;
+    private Map<String, String> importNamespaces = Map.of();
 
     public ResolvedScript(ScriptMetadata metadata, List<SettingDescriptor> settings,
                           Map<String, ResolvedProperty> properties, Map<String, ResolvedFunction> functions,
@@ -42,6 +43,8 @@ public final class ResolvedScript {
     public int languageVersion() { return languageVersion; }
     public ApiRegistry apiRegistry() { return apiRegistry; }
     public void setApiRegistry(ApiRegistry apiRegistry) { this.apiRegistry = apiRegistry; }
+    public Map<String, String> importNamespaces() { return importNamespaces; }
+    public void setImportNamespaces(Map<String, String> importNamespaces) { this.importNamespaces = importNamespaces == null ? Map.of() : Map.copyOf(importNamespaces); }
     public ResolvedFunction lifecycle(LifecycleHook hook) { return lifecycle.get(hook); }
 
     public record ScriptMetadata(String id, String name, String version, String author, String description) {

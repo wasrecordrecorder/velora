@@ -5,6 +5,7 @@ import io.velora.api.event.EventDescriptor;
 import io.velora.api.event.EventRegistry;
 import io.velora.api.function.ApiRegistry;
 import io.velora.api.function.FunctionDescriptor;
+import io.velora.api.interop.JavaImportRegistry;
 import io.velora.api.registry.*;
 import io.velora.api.setting.SettingKind;
 import io.velora.api.type.EnumType;
@@ -32,22 +33,30 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
     private final ApiRegistry apiRegistry;
     private final ConstantRegistry constantRegistry;
     private final EventRegistry eventRegistry;
+    private final JavaImportRegistry javaImportRegistry;
     private final BytecodeCache cache = new BytecodeCache();
     private boolean frozen;
 
     public DefaultScriptCompiler(TypeRegistry typeRegistry, SettingRegistry settingRegistry,
                                  ApiRegistry apiRegistry, ConstantRegistry constantRegistry) {
-        this(typeRegistry, settingRegistry, apiRegistry, constantRegistry, null);
+        this(typeRegistry, settingRegistry, apiRegistry, constantRegistry, null, null);
     }
 
     public DefaultScriptCompiler(TypeRegistry typeRegistry, SettingRegistry settingRegistry,
                                  ApiRegistry apiRegistry, ConstantRegistry constantRegistry,
                                  EventRegistry eventRegistry) {
+        this(typeRegistry, settingRegistry, apiRegistry, constantRegistry, eventRegistry, null);
+    }
+
+    public DefaultScriptCompiler(TypeRegistry typeRegistry, SettingRegistry settingRegistry,
+                                 ApiRegistry apiRegistry, ConstantRegistry constantRegistry,
+                                 EventRegistry eventRegistry, JavaImportRegistry javaImportRegistry) {
         this.typeRegistry = typeRegistry;
         this.settingRegistry = settingRegistry;
         this.apiRegistry = apiRegistry;
         this.constantRegistry = constantRegistry;
         this.eventRegistry = eventRegistry;
+        this.javaImportRegistry = javaImportRegistry;
     }
 
     @Override
@@ -95,37 +104,37 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
         String registryHash = computeRegistryHash();
         CompiledModule cached = cache.get(request.scriptId(), bundle.sourceHash, registryHash);
         if (cached != null && request.mode() != CompileMode.FULL) {
-            return new Compilation(cached, diagnostics, bundle.sourceHash, registryHash);
+            return new Compilation(cached, bundle.remap(diagnostics), bundle.sourceHash, registryHash);
         }
         if (request.mode() == CompileMode.CACHE_ONLY) {
             diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_CACHE_MISS,
                     "No matching cached bytecode available", SourceRange.of("main.vls", 0, 0)));
-            return Compilation.failure(diagnostics);
+            return Compilation.failure(bundle.remap(diagnostics));
         }
 
         LexerResult lexerResult = new Lexer(bundle.source, bundle.filePath).lex();
         diagnostics.addAll(lexerResult.diagnostics());
-        if (hasErrors(diagnostics)) return Compilation.failure(diagnostics);
+        if (hasErrors(diagnostics)) return Compilation.failure(bundle.remap(diagnostics));
 
         ParseResult parseResult = Parser.parse(bundle.source, bundle.filePath);
         diagnostics.addAll(parseResult.diagnostics());
-        if (hasErrors(diagnostics) || parseResult.scriptNode() == null) return Compilation.failure(diagnostics);
+        if (hasErrors(diagnostics) || parseResult.scriptNode() == null) return Compilation.failure(bundle.remap(diagnostics));
 
-        SemanticAnalyzer analyzer = new SemanticAnalyzer(typeRegistry, settingRegistry, apiRegistry, constantRegistry, eventRegistry);
+        SemanticAnalyzer analyzer = new SemanticAnalyzer(typeRegistry, settingRegistry, apiRegistry, constantRegistry, eventRegistry, javaImportRegistry);
         ResolvedScript resolved = analyzer.analyze(parseResult.scriptNode());
         diagnostics.addAll(analyzer.diagnostics());
         validateScriptMetadata(request, parseResult, resolved, diagnostics);
-        if (hasErrors(diagnostics)) return Compilation.failure(diagnostics);
+        if (hasErrors(diagnostics)) return Compilation.failure(bundle.remap(diagnostics));
 
         IrModule irModule = new IrOptimizer().optimize(new IrBuilder(resolved, apiRegistry, constantRegistry, typeRegistry, request.scriptId()).build());
         diagnostics.addAll(new IrVerifier().verify(irModule));
-        if (hasErrors(diagnostics)) return Compilation.failure(diagnostics);
+        if (hasErrors(diagnostics)) return Compilation.failure(bundle.remap(diagnostics));
 
         CompiledModule module = new BytecodeWriter().write(irModule, bundle.sourceHash, registryHash);
-        diagnostics.addAll(new BytecodeVerifier().verify(module));
-        if (hasErrors(diagnostics)) return Compilation.failure(diagnostics);
+        diagnostics.addAll(new BytecodeVerifier(apiRegistry).verify(module));
+        if (hasErrors(diagnostics)) return Compilation.failure(bundle.remap(diagnostics));
         cache.put(request.scriptId(), bundle.sourceHash, registryHash, module);
-        return new Compilation(module, diagnostics, bundle.sourceHash, registryHash);
+        return new Compilation(module, bundle.remap(diagnostics), bundle.sourceHash, registryHash);
     }
 
 
@@ -140,7 +149,7 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
         StringBuilder hashInput = new StringBuilder();
         String mainSource = null;
         String mainPath = null;
-        List<String> helpers = new ArrayList<>();
+        List<SourceFile> helpers = new ArrayList<>();
         List<SourceFile> ordered = sources.stream()
                 .filter(source -> source.relativePath().toLowerCase(Locale.ROOT).endsWith(".vls"))
                 .sorted(Comparator.comparing(source -> normalizedSourcePath(source.relativePath())))
@@ -158,7 +167,7 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
                 mainSource = source.content();
                 mainPath = path;
             } else {
-                helpers.add(source.content());
+                helpers.add(source);
             }
         }
         if (mainSource == null) {
@@ -166,20 +175,47 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
                     sources.isEmpty() ? "No .vls source files provided" : "No script declaration found", SourceRange.of("main.vls", 0, 0)));
             return null;
         }
+        List<SourceSpan> spans = new ArrayList<>();
+        int closingMergedLine = -1;
+        int closingSourceLine = -1;
         if (!helpers.isEmpty()) {
             int lastBrace = mainSource.lastIndexOf('}');
-            StringBuilder merged = new StringBuilder(mainSource.length() + helpers.stream().mapToInt(String::length).sum() + helpers.size() * 2);
+            int capacity = mainSource.length() + helpers.stream().mapToInt(helper -> helper.content().length()).sum() + helpers.size() * 2;
+            StringBuilder merged = new StringBuilder(capacity);
             if (lastBrace >= 0) {
                 merged.append(mainSource, 0, lastBrace);
-                for (String helper : helpers) merged.append('\n').append(helper).append('\n');
+                closingSourceLine = lineAt(mainSource, lastBrace);
+                for (SourceFile helper : helpers) appendHelper(merged, helper, spans, true);
+                closingMergedLine = lineAt(merged, merged.length());
                 merged.append('}');
             } else {
                 merged.append(mainSource);
-                for (String helper : helpers) merged.append('\n').append(helper);
+                for (SourceFile helper : helpers) appendHelper(merged, helper, spans, false);
             }
             mainSource = merged.toString();
         }
-        return new SourceBundle(mainSource, mainPath, SourceHash.compute(hashInput.toString()));
+        return new SourceBundle(mainSource, mainPath, SourceHash.compute(hashInput.toString()), List.copyOf(spans), closingMergedLine, closingSourceLine);
+    }
+
+    private void appendHelper(StringBuilder merged, SourceFile helper, List<SourceSpan> spans, boolean trailingNewline) {
+        merged.append('\n');
+        int startLine = lineAt(merged, merged.length());
+        merged.append(helper.content());
+        int endLine = startLine + countNewlines(helper.content());
+        spans.add(new SourceSpan(startLine, endLine, normalizedSourcePath(helper.relativePath())));
+        if (trailingNewline) merged.append('\n');
+    }
+
+    private int lineAt(CharSequence source, int offset) {
+        int line = 1;
+        for (int i = 0; i < offset; i++) if (source.charAt(i) == '\n') line++;
+        return line;
+    }
+
+    private int countNewlines(CharSequence source) {
+        int count = 0;
+        for (int i = 0; i < source.length(); i++) if (source.charAt(i) == '\n') count++;
+        return count;
     }
 
     @Override
@@ -246,7 +282,32 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
         return parts.isEmpty() ? null : String.join("/", parts);
     }
 
-    private record SourceBundle(String source, String filePath, String sourceHash) {}
+    private record SourceSpan(int startLine, int endLine, String filePath) {
+        private boolean contains(int line) { return line >= startLine && line <= endLine; }
+        private int sourceLine(int line) { return line - startLine + 1; }
+    }
+
+    private record SourceBundle(String source, String filePath, String sourceHash, List<SourceSpan> spans, int closingMergedLine, int closingSourceLine) {
+        private List<Diagnostic> remap(List<Diagnostic> diagnostics) {
+            if (spans.isEmpty()) return List.copyOf(diagnostics);
+            return diagnostics.stream().map(this::remap).toList();
+        }
+
+        private Diagnostic remap(Diagnostic diagnostic) {
+            SourceRange range = diagnostic.range();
+            if (range == null || !filePath.equals(range.filePath())) return diagnostic;
+            for (SourceSpan span : spans) {
+                if (!span.contains(range.startLine())) continue;
+                int start = span.sourceLine(range.startLine());
+                int end = span.contains(range.endLine()) ? span.sourceLine(range.endLine()) : start;
+                return new Diagnostic(diagnostic.severity(), diagnostic.code(), diagnostic.message(), SourceRange.of(span.filePath(), start, range.startColumn(), end, range.endColumn()));
+            }
+            if (range.startLine() == closingMergedLine && closingSourceLine > 0) {
+                return new Diagnostic(diagnostic.severity(), diagnostic.code(), diagnostic.message(), SourceRange.of(filePath, closingSourceLine, range.startColumn(), closingSourceLine, range.endColumn()));
+            }
+            return diagnostic;
+        }
+    }
     private record Compilation(CompiledModule module, List<Diagnostic> diagnostics, String sourceHash, String registryHash) {
         private static Compilation failure(List<Diagnostic> diagnostics) { return new Compilation(null, List.copyOf(diagnostics), null, null); }
     }

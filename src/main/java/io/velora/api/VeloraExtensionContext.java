@@ -3,6 +3,7 @@ package io.velora.api;
 import io.velora.api.category.CategoryRegistry;
 import io.velora.api.event.EventRegistry;
 import io.velora.api.function.ApiRegistry;
+import io.velora.api.interop.JavaImportRegistry;
 import io.velora.api.registry.*;
 import io.velora.api.script.ScriptTemplateRegistry;
 
@@ -20,6 +21,8 @@ public interface VeloraExtensionContext {
     SettingRegistry settings();
 
     ConstantRegistry constants();
+
+    JavaImportRegistry javaImports();
 
     ScriptTemplateRegistry templates();
 

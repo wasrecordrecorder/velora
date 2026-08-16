@@ -17,6 +17,7 @@ public enum TokenType {
 
     // Keywords
     KW_SCRIPT,
+    KW_IMPORT,
     KW_STATIC,
     KW_ASYNC,
     KW_IF,

@@ -204,8 +204,11 @@ class ParserV2Test {
     }
 
     @Test
-    void packageAndImportAreRejected() {
+    void packageIsRejectedAndImportIsAccepted() {
         assertTrue(Parser.parse("package old\n@Script(\"T\")\nscript T {}", "main.vls").hasErrors());
-        assertTrue(Parser.parse("import old.api\n@Script(\"T\")\nscript T {}", "main.vls").hasErrors());
+        ScriptNode node = parse("import old.api\n@Script(\"T\")\nscript T {}");
+        assertEquals(1, node.imports().size());
+        assertEquals("old.api", node.imports().get(0).importName());
+        assertEquals("api", node.imports().get(0).alias());
     }
 }

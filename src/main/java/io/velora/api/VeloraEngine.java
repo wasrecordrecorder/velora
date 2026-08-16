@@ -6,6 +6,7 @@ import io.velora.api.debug.DebugService;
 import io.velora.api.event.EventRegistry;
 import io.velora.api.function.ApiRegistry;
 import io.velora.api.language.LanguageService;
+import io.velora.api.interop.JavaImportRegistry;
 import io.velora.api.registry.*;
 import io.velora.api.script.ScriptManager;
 import io.velora.host.VeloraHost;
@@ -27,6 +28,8 @@ public interface VeloraEngine extends AutoCloseable {
     SettingRegistry settings();
 
     ConstantRegistry constants();
+
+    JavaImportRegistry javaImports();
 
     VeloraExtensionRegistry extensions();
 

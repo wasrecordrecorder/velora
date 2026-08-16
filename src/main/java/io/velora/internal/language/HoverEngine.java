@@ -3,6 +3,7 @@ package io.velora.internal.language;
 import io.velora.api.event.EventRegistry;
 import io.velora.api.function.ApiRegistry;
 import io.velora.api.language.HoverInfo;
+import io.velora.api.interop.JavaImportRegistry;
 import io.velora.api.registry.ConstantRegistry;
 import io.velora.api.registry.TypeRegistry;
 import io.velora.internal.lexer.Lexer;
@@ -42,11 +43,17 @@ public final class HoverEngine {
     private HoverEngine() {}
 
     public static Optional<HoverInfo> getHover(String content, int line, int column, String filePath) {
-        return getHover(content, line, column, filePath, null, null, null, null);
+        return getHover(content, line, column, filePath, null, null, null, null, null);
     }
 
     public static Optional<HoverInfo> getHover(String content, int line, int column, String filePath, ApiRegistry apiRegistry,
                                                TypeRegistry typeRegistry, ConstantRegistry constantRegistry, EventRegistry eventRegistry) {
+        return getHover(content, line, column, filePath, apiRegistry, typeRegistry, constantRegistry, eventRegistry, null);
+    }
+
+    public static Optional<HoverInfo> getHover(String content, int line, int column, String filePath, ApiRegistry apiRegistry,
+                                               TypeRegistry typeRegistry, ConstantRegistry constantRegistry, EventRegistry eventRegistry,
+                                               JavaImportRegistry javaImportRegistry) {
         if (line < 1 || column < 1) return Optional.empty();
         int zeroColumn = column - 1;
         for (Token token : new Lexer(content, filePath).lex().tokens()) {
@@ -55,7 +62,7 @@ public final class HoverEngine {
             if (token.isTrivia() || token.is(TokenType.EOF)) return Optional.empty();
             String text = token.text().startsWith("@") ? token.text().substring(1) : token.text();
             String qualified = qualifiedAt(content, line, token.column(), token.text());
-            String detail = dynamicInfo(text, qualified, apiRegistry, typeRegistry, constantRegistry, eventRegistry);
+            String detail = dynamicInfo(content, text, qualified, apiRegistry, typeRegistry, constantRegistry, eventRegistry, javaImportRegistry);
             if (detail == null) detail = INFO.get(text);
             String shown = qualified != null ? qualified : token.text();
             String body = "```velora\n" + shown + "\n```" + (detail == null ? "" : "\n" + detail);
@@ -64,14 +71,14 @@ public final class HoverEngine {
         return Optional.empty();
     }
 
-    private static String dynamicInfo(String token, String qualified, ApiRegistry apiRegistry, TypeRegistry typeRegistry,
-                                      ConstantRegistry constantRegistry, EventRegistry eventRegistry) {
+    private static String dynamicInfo(String content, String token, String qualified, ApiRegistry apiRegistry, TypeRegistry typeRegistry,
+                                      ConstantRegistry constantRegistry, EventRegistry eventRegistry, JavaImportRegistry javaImportRegistry) {
         if (qualified != null) {
             int dot = qualified.indexOf('.');
             String namespace = qualified.substring(0, dot);
             String member = qualified.substring(dot + 1);
             if (apiRegistry != null) {
-                var function = apiRegistry.find(namespace, member);
+                var function = apiRegistry.find(JavaImportAliases.namespace(content, namespace, javaImportRegistry), member);
                 if (function != null) return function.description() + "\nReturns `" + function.returnType().name() + "`.";
             }
             if (constantRegistry != null) {

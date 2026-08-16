@@ -28,8 +28,9 @@ public final class Parser {
 
     public ParseResult parse() {
         try {
+            List<ImportNode> imports = parseImports();
             List<AnnotationNode> annotations = parseAnnotations();
-            ScriptNode script = parseScript(annotations);
+            ScriptNode script = parseScript(imports, annotations);
             if (script == null) return ParseResult.failure(context.diagnostics());
             context.tokens().skipNewlines();
             if (context.tokens().hasMore()) {
@@ -62,6 +63,28 @@ public final class Parser {
             count++;
         }
         return Token.eof(0, 0, 0);
+    }
+
+
+    private List<ImportNode> parseImports() {
+        List<ImportNode> imports = new ArrayList<>();
+        context.skipTrivia();
+        while (context.check(TokenType.KW_IMPORT)) {
+            Token token = context.advance();
+            Token first = context.expect(TokenType.IDENTIFIER, "Expected Java import name");
+            StringBuilder name = new StringBuilder(first.text());
+            while (context.check(TokenType.DOT)) {
+                context.advance();
+                Token part = context.expect(TokenType.IDENTIFIER, "Expected identifier after '.' in import");
+                name.append('.').append(part.text());
+            }
+            context.match(TokenType.SEMICOLON);
+            String importName = name.toString();
+            String alias = importName.substring(importName.lastIndexOf('.') + 1);
+            imports.add(new ImportNode(context.filePath(), token.line(), token.column(), importName, alias));
+            context.skipTrivia();
+        }
+        return imports;
     }
 
     private List<AnnotationNode> parseAnnotations() {
@@ -252,7 +275,7 @@ public final class Parser {
     /** Represents a range value like 8..128 in setting declarations. */
     public record RangeValue(Number min, Number max) {}
 
-    private ScriptNode parseScript(List<AnnotationNode> annotations) {
+    private ScriptNode parseScript(List<ImportNode> imports, List<AnnotationNode> annotations) {
         context.skipTrivia();
         if (!context.check(TokenType.KW_SCRIPT)) {
             context.error(DiagnosticCode.PARSER_MISSING_TOKEN, "Expected 'script' keyword", context.currentLine(), context.currentColumn());
@@ -276,7 +299,7 @@ public final class Parser {
         SettingBlockNode settingBlock = settings.isEmpty() ? null
                 : new SettingBlockNode(context.filePath(), scriptToken.line(), scriptToken.column(), settings);
         return new ScriptNode(context.filePath(), scriptToken.line(), scriptToken.column(),
-                annotations, scriptName, settingBlock, members);
+                imports, annotations, scriptName, settingBlock, members);
     }
 
     private BlockNode parseScriptBody() {

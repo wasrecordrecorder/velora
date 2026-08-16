@@ -5,6 +5,7 @@ import io.velora.api.compiler.DiagnosticCode;
 import io.velora.api.compiler.DiagnosticSeverity;
 import io.velora.api.compiler.SourceRange;
 import io.velora.api.function.ApiRegistry;
+import io.velora.api.interop.JavaImportRegistry;
 import io.velora.api.event.EventDescriptor;
 import io.velora.api.event.EventRegistry;
 import io.velora.api.function.FunctionDescriptor;
@@ -34,22 +35,31 @@ public final class SemanticAnalyzer {
     private final ApiRegistry apiRegistry;
     private final ConstantRegistry constantRegistry;
     private final EventRegistry eventRegistry;
+    private final JavaImportRegistry javaImportRegistry;
     private final List<Diagnostic> diagnostics = new ArrayList<>();
     private Map<String, ResolvedScript.ResolvedFunction> resolvedFunctions;
+    private Map<String, String> importNamespaces = Map.of();
 
     public SemanticAnalyzer(TypeRegistry typeRegistry, SettingRegistry settingRegistry,
                             ApiRegistry apiRegistry, ConstantRegistry constantRegistry) {
-        this(typeRegistry, settingRegistry, apiRegistry, constantRegistry, null);
+        this(typeRegistry, settingRegistry, apiRegistry, constantRegistry, null, null);
     }
 
     public SemanticAnalyzer(TypeRegistry typeRegistry, SettingRegistry settingRegistry,
                             ApiRegistry apiRegistry, ConstantRegistry constantRegistry,
                             EventRegistry eventRegistry) {
+        this(typeRegistry, settingRegistry, apiRegistry, constantRegistry, eventRegistry, null);
+    }
+
+    public SemanticAnalyzer(TypeRegistry typeRegistry, SettingRegistry settingRegistry,
+                            ApiRegistry apiRegistry, ConstantRegistry constantRegistry,
+                            EventRegistry eventRegistry, JavaImportRegistry javaImportRegistry) {
         this.typeRegistry = typeRegistry;
         this.settingRegistry = settingRegistry;
         this.apiRegistry = apiRegistry;
         this.constantRegistry = constantRegistry;
         this.eventRegistry = eventRegistry;
+        this.javaImportRegistry = javaImportRegistry;
     }
 
     public List<Diagnostic> diagnostics() {
@@ -58,6 +68,7 @@ public final class SemanticAnalyzer {
 
     public ResolvedScript analyze(ScriptNode script) {
         diagnostics.clear();
+        importNamespaces = resolveImports(script);
         validateScriptAnnotations(script);
         ResolvedScript.ScriptMetadata metadata = extractMetadata(script);
         List<SettingDescriptor> settings = buildSettings(script.settingBlock());
@@ -188,6 +199,7 @@ public final class SemanticAnalyzer {
 
         ResolvedScript result = new ResolvedScript(metadata, settings, properties, functions, lifecycle, eventHandlers, 2);
         result.setApiRegistry(apiRegistry);
+        result.setImportNamespaces(importNamespaces);
         return result;
     }
 
@@ -519,7 +531,7 @@ public final class SemanticAnalyzer {
         }
         if (callee instanceof MemberAccessExpressionNode member) {
             if (member.target() instanceof IdentifierExpressionNode namespace && isApiNamespace(namespace.name())) {
-                FunctionDescriptor descriptor = apiRegistry.find(namespace.name(), member.member());
+                FunctionDescriptor descriptor = apiRegistry.find(resolveApiNamespace(namespace.name()), member.member());
                 return descriptor != null ? descriptor.returnType() : null;
             }
             VeloraType receiver = inferExpressionType(member.target(), scope, current);
@@ -543,7 +555,7 @@ public final class SemanticAnalyzer {
             ConstantRegistry.Constant constant = constantRegistry.find(namespace.name(), member.member());
             if (constant != null) return constant.type();
             if (isApiNamespace(namespace.name())) {
-                FunctionDescriptor descriptor = apiRegistry.find(namespace.name(), member.member());
+                FunctionDescriptor descriptor = apiRegistry.find(resolveApiNamespace(namespace.name()), member.member());
                 if (descriptor != null && descriptor.parameters().isEmpty()) return descriptor.returnType();
             }
         }
@@ -800,7 +812,7 @@ public final class SemanticAnalyzer {
                 return mem.isSafeAccess() ? memberType.nullable() : memberType;
             }
             if (mem.target() instanceof IdentifierExpressionNode ns && isApiNamespace(ns.name())) {
-                FunctionDescriptor fd = apiRegistry.find(ns.name(), mem.member());
+                FunctionDescriptor fd = apiRegistry.find(resolveApiNamespace(ns.name()), mem.member());
                 if (fd != null && fd.parameters().isEmpty()) {
                     return fd.returnType();
                 }
@@ -984,7 +996,7 @@ public final class SemanticAnalyzer {
         if (callee instanceof MemberAccessExpressionNode mem) {
             if (mem.target() instanceof IdentifierExpressionNode ns && isApiNamespace(ns.name())) {
                 // API call: namespace.function(args)
-                FunctionDescriptor fd = apiRegistry.find(ns.name(), mem.member());
+                FunctionDescriptor fd = apiRegistry.find(resolveApiNamespace(ns.name()), mem.member());
                 if (fd != null) {
                     List<ExpressionNode> bound = bindArguments(fd.qualifiedName(), args, fd.parameters().stream().map(io.velora.api.function.ParameterDescriptor::name).toList(), fd.parameters().stream().map(io.velora.api.function.ParameterDescriptor::hasDefault).toList(), scope, currentFn, mem.line(), mem.column());
                     for (int i = 0; i < bound.size(); i++) {
@@ -1304,7 +1316,35 @@ public final class SemanticAnalyzer {
     }
 
     private boolean isApiNamespace(String name) {
-        return apiRegistry.namespaces().contains(name);
+        return resolveApiNamespace(name) != null;
+    }
+
+    private String resolveApiNamespace(String name) {
+        if (apiRegistry.namespaces().contains(name)) return name;
+        return importNamespaces.get(name);
+    }
+
+    private Map<String, String> resolveImports(ScriptNode script) {
+        if (script.imports().isEmpty()) return Map.of();
+        Map<String, String> resolved = new LinkedHashMap<>();
+        Set<String> names = new HashSet<>();
+        for (ImportNode imported : script.imports()) {
+            if (!names.add(imported.importName())) {
+                error(DiagnosticCode.SEMANTIC_DUPLICATE_IMPORT, "Duplicate import: " + imported.importName(), imported.line(), imported.column());
+                continue;
+            }
+            if (apiRegistry.namespaces().contains(imported.alias()) || resolved.containsKey(imported.alias())) {
+                error(DiagnosticCode.SEMANTIC_DUPLICATE_IMPORT, "Import alias conflicts with an existing namespace: " + imported.alias(), imported.line(), imported.column());
+                continue;
+            }
+            var descriptor = javaImportRegistry != null ? javaImportRegistry.find(imported.importName()) : null;
+            if (descriptor == null) {
+                error(DiagnosticCode.SEMANTIC_UNKNOWN_IMPORT, "Unknown Java import: " + imported.importName(), imported.line(), imported.column());
+                continue;
+            }
+            resolved.put(imported.alias(), descriptor.namespace());
+        }
+        return Map.copyOf(resolved);
     }
 
     private VeloraType resolveType(TypeNode typeNode, AstNode node) {

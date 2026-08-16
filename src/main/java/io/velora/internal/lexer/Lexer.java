@@ -20,6 +20,7 @@ public final class Lexer {
 
     private static final Map<String, TokenType> KEYWORDS = Map.ofEntries(
             Map.entry("script", TokenType.KW_SCRIPT),
+            Map.entry("import", TokenType.KW_IMPORT),
             Map.entry("async", TokenType.KW_ASYNC),
             Map.entry("static", TokenType.KW_STATIC),
             Map.entry("if", TokenType.KW_IF),

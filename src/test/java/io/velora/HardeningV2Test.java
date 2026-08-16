@@ -166,6 +166,22 @@ class HardeningV2Test {
     }
 
     @Test
+    void bytecodeVerifierValidatesRegisteredApiCalls() {
+        api.namespace("client", ns -> ns.function("value", VeloraTypes.INT, p -> p.required("input", VeloraTypes.INT), ctx -> 1));
+        api.freeze();
+        CompiledModule base = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { int answer() { return 1 } }");
+        CompiledFunction badIndex = new CompiledFunction("answer", 0, 0, 0, 1, false, false,
+                new int[]{Opcode.CALL_API.ordinal(), 99, 0, Opcode.RETURN.ordinal()}, new int[0]);
+        CompiledFunction badArguments = new CompiledFunction("answer", 0, 0, 0, 1, false, false,
+                new int[]{Opcode.CALL_API.ordinal(), 0, 0, Opcode.RETURN.ordinal()}, new int[0]);
+        CompiledFunction badMode = new CompiledFunction("answer", 0, 0, 0, 1, false, false,
+                new int[]{Opcode.TRUE.ordinal(), Opcode.CALL_SUSPEND.ordinal(), 0, 1, Opcode.RETURN.ordinal()}, new int[0]);
+        assertTrue(new BytecodeVerifier(api).verify(withFunction(base, badIndex)).stream().anyMatch(d -> d.message().contains("out of range")));
+        assertTrue(new BytecodeVerifier(api).verify(withFunction(base, badArguments)).stream().anyMatch(d -> d.message().contains("Argument count mismatch")));
+        assertTrue(new BytecodeVerifier(api).verify(withFunction(base, badMode)).stream().anyMatch(d -> d.message().contains("call mode mismatch")));
+    }
+
+    @Test
     void compilerFoldsConstantArithmeticBeforeBytecode() {
         CompiledModule module = compiler().compileToModule(CompileRequest.builder("FoldT")
                 .source("main.vls", "@Script(\"FoldT\")\n@Version(\"1\")\nscript FoldT { int answer() { return 20 + 22 } }").build());
@@ -567,6 +583,18 @@ class HardeningV2Test {
         assertTrue(first.success());
         assertTrue(second.success());
         assertEquals(first.sourceHash(), second.sourceHash());
+    }
+
+    @Test
+    void multiFileDiagnosticsKeepHelperSourcePath() {
+        CompileResult result = compiler().compile(CompileRequest.builder("Multi")
+                .source("main.vls", "@Script(\"Multi\")\n@Version(\"1\")\nscript Multi { int answer() { return helper() } }")
+                .source("lib/helper.vls", "int helper() { return \"wrong\" }")
+                .build());
+        assertFalse(result.success());
+        Diagnostic diagnostic = result.diagnostics().stream().filter(Diagnostic::isError).findFirst().orElseThrow();
+        assertEquals("lib/helper.vls", diagnostic.range().filePath());
+        assertEquals(1, diagnostic.range().startLine());
     }
 
     @Test

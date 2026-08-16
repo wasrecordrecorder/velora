@@ -3,6 +3,7 @@ package io.velora.internal.language;
 import io.velora.api.language.*;
 import io.velora.api.compiler.Diagnostic;
 import io.velora.api.event.EventRegistry;
+import io.velora.api.interop.JavaImportRegistry;
 import io.velora.api.function.ApiRegistry;
 import io.velora.api.registry.ConstantRegistry;
 import io.velora.api.registry.SettingRegistry;
@@ -11,6 +12,7 @@ import io.velora.internal.lexer.Lexer;
 import io.velora.internal.lexer.LexerResult;
 import io.velora.internal.parser.Parser;
 import io.velora.internal.parser.ParseResult;
+import io.velora.internal.semantic.SemanticAnalyzer;
 
 import java.util.*;
 
@@ -23,17 +25,24 @@ public final class DefaultEditorSession implements EditorSession {
     private final EventRegistry eventRegistry;
     private final SettingRegistry settingRegistry;
     private final ConstantRegistry constantRegistry;
+    private final JavaImportRegistry javaImportRegistry;
     private String content = "";
     private long revisionToken = 0;
     private boolean closed = false;
     private EditorSnapshot cachedSnapshot;
 
     public DefaultEditorSession(String scriptId, String filePath) {
-        this(scriptId, filePath, null, null, null, null, null);
+        this(scriptId, filePath, null, null, null, null, null, null);
     }
 
     public DefaultEditorSession(String scriptId, String filePath, ApiRegistry apiRegistry, TypeRegistry typeRegistry,
                                 EventRegistry eventRegistry, SettingRegistry settingRegistry, ConstantRegistry constantRegistry) {
+        this(scriptId, filePath, apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry, null);
+    }
+
+    public DefaultEditorSession(String scriptId, String filePath, ApiRegistry apiRegistry, TypeRegistry typeRegistry,
+                                EventRegistry eventRegistry, SettingRegistry settingRegistry, ConstantRegistry constantRegistry,
+                                JavaImportRegistry javaImportRegistry) {
         this.scriptId = scriptId;
         this.filePath = filePath;
         this.apiRegistry = apiRegistry;
@@ -41,6 +50,7 @@ public final class DefaultEditorSession implements EditorSession {
         this.eventRegistry = eventRegistry;
         this.settingRegistry = settingRegistry;
         this.constantRegistry = constantRegistry;
+        this.javaImportRegistry = javaImportRegistry;
     }
 
     @Override public String scriptId() { return scriptId; }
@@ -66,6 +76,12 @@ public final class DefaultEditorSession implements EditorSession {
         if (diagnostics.stream().noneMatch(Diagnostic::isError)) {
             ParseResult pr = Parser.parse(content, filePath);
             diagnostics.addAll(pr.diagnostics());
+            if (pr.scriptNode() != null && diagnostics.stream().noneMatch(Diagnostic::isError)
+                    && typeRegistry != null && settingRegistry != null && apiRegistry != null && constantRegistry != null) {
+                SemanticAnalyzer analyzer = new SemanticAnalyzer(typeRegistry, settingRegistry, apiRegistry, constantRegistry, eventRegistry, javaImportRegistry);
+                analyzer.analyze(pr.scriptNode());
+                diagnostics.addAll(analyzer.diagnostics());
+            }
         }
         cachedSnapshot = new EditorSnapshot(scriptId, filePath, content,
                 io.velora.internal.source.SourceHash.compute(content), diagnostics, tokens, revisionToken);
@@ -75,19 +91,19 @@ public final class DefaultEditorSession implements EditorSession {
     @Override
     public List<CompletionItem> completions(int line, int column) {
         ensureOpen();
-        return CompletionEngine.getCompletions(content, line, column, apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry);
+        return CompletionEngine.getCompletions(content, line, column, apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry, javaImportRegistry);
     }
 
     @Override
     public Optional<HoverInfo> hover(int line, int column) {
         ensureOpen();
-        return HoverEngine.getHover(content, line, column, filePath, apiRegistry, typeRegistry, constantRegistry, eventRegistry);
+        return HoverEngine.getHover(content, line, column, filePath, apiRegistry, typeRegistry, constantRegistry, eventRegistry, javaImportRegistry);
     }
 
     @Override
     public Optional<SignatureHelp> signatureHelp(int line, int column) {
         ensureOpen();
-        return SignatureHelpEngine.getSignatureHelp(content, line, column, apiRegistry);
+        return SignatureHelpEngine.getSignatureHelp(content, line, column, apiRegistry, javaImportRegistry);
     }
 
     @Override

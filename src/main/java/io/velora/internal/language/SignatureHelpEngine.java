@@ -2,6 +2,7 @@ package io.velora.internal.language;
 
 import io.velora.api.function.ApiRegistry;
 import io.velora.api.language.SignatureHelp;
+import io.velora.api.interop.JavaImportRegistry;
 
 import java.util.List;
 import java.util.Optional;
@@ -10,10 +11,15 @@ public final class SignatureHelpEngine {
     private SignatureHelpEngine() {}
 
     public static Optional<SignatureHelp> getSignatureHelp(String content, int line, int column) {
-        return getSignatureHelp(content, line, column, null);
+        return getSignatureHelp(content, line, column, null, null);
     }
 
     public static Optional<SignatureHelp> getSignatureHelp(String content, int line, int column, ApiRegistry apiRegistry) {
+        return getSignatureHelp(content, line, column, apiRegistry, null);
+    }
+
+    public static Optional<SignatureHelp> getSignatureHelp(String content, int line, int column, ApiRegistry apiRegistry,
+                                                            JavaImportRegistry javaImportRegistry) {
         if (line < 1 || column < 1) return Optional.empty();
         String[] lines = content.split("\\R", -1);
         int lineIndex = line - 1;
@@ -33,7 +39,7 @@ public final class SignatureHelpEngine {
                         int start = end;
                         while (start > 0 && (Character.isJavaIdentifierPart(source.charAt(start - 1)) || source.charAt(start - 1) == '@' || source.charAt(start - 1) == '.')) start--;
                         String name = source.substring(start, end);
-                        return name.isEmpty() ? Optional.empty() : Optional.of(buildSignature(name, commas, apiRegistry));
+                        return name.isEmpty() ? Optional.empty() : Optional.of(buildSignature(content, name, commas, apiRegistry, javaImportRegistry));
                     }
                     parenDepth--;
                 } else if (c == ',' && parenDepth == 0) commas++;
@@ -42,11 +48,11 @@ public final class SignatureHelpEngine {
         return Optional.empty();
     }
 
-    private static SignatureHelp buildSignature(String name, int activeParameter, ApiRegistry apiRegistry) {
+    private static SignatureHelp buildSignature(String content, String name, int activeParameter, ApiRegistry apiRegistry, JavaImportRegistry javaImportRegistry) {
         if (apiRegistry != null) {
             int dot = name.lastIndexOf('.');
             if (dot > 0 && dot + 1 < name.length()) {
-                var descriptor = apiRegistry.find(name.substring(0, dot), name.substring(dot + 1));
+                var descriptor = apiRegistry.find(JavaImportAliases.namespace(content, name.substring(0, dot), javaImportRegistry), name.substring(dot + 1));
                 if (descriptor != null) {
                     List<SignatureHelp.SignatureParameter> parameters = descriptor.parameters().stream()
                             .map(parameter -> new SignatureHelp.SignatureParameter(parameter.name(), parameter.type().name(), parameter.hasDefault() ? "Default: " + parameter.defaultValue() : null))

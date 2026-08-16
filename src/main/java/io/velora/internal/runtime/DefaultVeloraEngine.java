@@ -13,6 +13,7 @@ import io.velora.api.event.EventOverflowPolicy;
 import io.velora.api.function.ApiRegistry;
 import io.velora.api.function.FunctionDescriptor;
 import io.velora.api.language.LanguageService;
+import io.velora.api.interop.JavaImportRegistry;
 import io.velora.api.registry.*;
 import io.velora.api.script.ScriptManager;
 import io.velora.api.setting.SettingKind;
@@ -24,6 +25,7 @@ import io.velora.internal.registry.*;
 import io.velora.internal.script.*;
 import io.velora.internal.event.DefaultEventRegistry;
 import io.velora.internal.language.DefaultLanguageService;
+import io.velora.internal.interop.DefaultJavaImportRegistry;
 import io.velora.internal.scheduler.ScriptScheduler;
 import io.velora.internal.setting.DefaultSettingRegistry;
 import io.velora.internal.security.*;
@@ -40,6 +42,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
     private final DefaultSettingRegistry settingRegistry;
     private final DefaultConstantRegistry constantRegistry;
     private final DefaultApiRegistry apiRegistry;
+    private final DefaultJavaImportRegistry javaImportRegistry;
     private final DefaultExtensionRegistry extensionRegistry;
     private final DefaultEventRegistry eventRegistry;
     private final DefaultScriptTemplateRegistry templateRegistry;
@@ -66,6 +69,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         this.settingRegistry = new DefaultSettingRegistry();
         this.constantRegistry = new DefaultConstantRegistry();
         this.apiRegistry = new DefaultApiRegistry(typeRegistry);
+        this.javaImportRegistry = new DefaultJavaImportRegistry(apiRegistry, typeRegistry);
         registerBuiltInApi();
         registerBuiltInSettings();
         this.extensionRegistry = new DefaultExtensionRegistry();
@@ -185,6 +189,9 @@ public final class DefaultVeloraEngine implements VeloraEngine {
     public ConstantRegistry constants() { return constantRegistry; }
 
     @Override
+    public JavaImportRegistry javaImports() { return javaImportRegistry; }
+
+    @Override
     public VeloraExtensionRegistry extensions() { return extensionRegistry; }
 
     @Override
@@ -194,7 +201,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
     public ScriptCompiler compiler() {
         if (compiler == null) {
             compiler = new DefaultScriptCompiler(typeRegistry, settingRegistry, apiRegistry,
-                    constantRegistry, eventRegistry);
+                    constantRegistry, eventRegistry, javaImportRegistry);
         }
         return compiler;
     }
@@ -207,7 +214,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
             }
             if (compiler == null) {
                 compiler = new DefaultScriptCompiler(typeRegistry, settingRegistry, apiRegistry,
-                        constantRegistry, eventRegistry);
+                        constantRegistry, eventRegistry, javaImportRegistry);
             }
             if (debugService == null) debugService = new DefaultDebugService(logStore, errorStore, profiler, scheduler);
             scriptManager = new DefaultScriptManager(scheduler, compiler, builder.host(), enabledScriptsStore, debugService, templateRegistry);
@@ -221,7 +228,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
     @Override
     public LanguageService language() {
         if (languageService == null) {
-            languageService = new DefaultLanguageService(apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry);
+            languageService = new DefaultLanguageService(apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry, javaImportRegistry);
         }
         return languageService;
     }
@@ -248,6 +255,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
             @Override public TypeRegistry types() { return typeRegistry; }
             @Override public SettingRegistry settings() { return settingRegistry; }
             @Override public ConstantRegistry constants() { return constantRegistry; }
+            @Override public JavaImportRegistry javaImports() { return javaImportRegistry; }
             @Override public io.velora.api.script.ScriptTemplateRegistry templates() { return templateRegistry; }
             @Override public CategoryRegistry categories() { return categoryRegistry; }
         };
@@ -258,6 +266,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
             int typeSnapshot = typeRegistry.all().size();
             int settingSnapshot = settingRegistry.all().size();
             int constantSnapshot = constantRegistry.all().size();
+            int javaImportSnapshot = javaImportRegistry.all().size();
             int templateSnapshot = templateRegistry.all().size();
             try {
                 ext.register(ctx);
@@ -268,6 +277,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
                 typeRegistry.rollbackTo(typeSnapshot);
                 settingRegistry.rollbackTo(settingSnapshot);
                 constantRegistry.rollbackTo(constantSnapshot);
+                javaImportRegistry.rollbackTo(javaImportSnapshot);
                 templateRegistry.rollbackTo(templateSnapshot);
                 throw t;
             }
@@ -275,6 +285,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         typeRegistry.freeze();
         settingRegistry.freeze();
         constantRegistry.freeze();
+        javaImportRegistry.freeze();
         apiRegistry.freeze();
         extensionRegistry.freeze();
         eventRegistry.freeze();
@@ -282,7 +293,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         categoryRegistry.freeze();
         if (compiler == null) {
             compiler = new DefaultScriptCompiler(typeRegistry, settingRegistry, apiRegistry,
-                    constantRegistry, eventRegistry);
+                    constantRegistry, eventRegistry, javaImportRegistry);
         }
         compiler.freeze();
         state = VeloraState.FROZEN;
