@@ -6,6 +6,6 @@ public record JavaImportDescriptor(
         String importName,
         String alias,
         String namespace,
-        String runtimeClassName,
+        Class<?> type,
         Path source
 ) { }

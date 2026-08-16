@@ -8,9 +8,7 @@ public interface JavaImportRegistry {
 
     void register(Path path);
 
-    void register(Path path, JavaClassResolver resolver);
-
-    void register(Path path, ClassLoader classLoader, JavaClassResolver resolver);
+    void register(Path path, ClassLoader classLoader);
 
     JavaImportDescriptor find(String importName);
 

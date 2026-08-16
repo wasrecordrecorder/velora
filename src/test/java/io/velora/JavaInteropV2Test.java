@@ -21,7 +21,6 @@ import io.velora.internal.vm.ScriptValue;
 import io.velora.internal.vm.VirtualMachine;
 import org.junit.jupiter.api.Test;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
@@ -74,40 +73,24 @@ class JavaInteropV2Test {
     }
 
     @Test
-    void sourcePathUsesRuntimeClassResolver() throws Exception {
+    void importDescriptorKeepsRuntimeClassReference() {
         VeloraEngine engine = Velora.builder().host(host()).build();
-        Path source = Files.createTempFile("velora-remap", ".java");
-        try {
-            Files.writeString(source, "package dev.client;\n@VeloraImport(\"client.util.RemappedUtil\")\npublic final class SourceUtil {}\n");
-            engine.javaImports().register(source, name -> {
-                assertEquals("dev.client.SourceUtil", name);
-                return RemappedUtil.class.getName();
-            });
-            var imported = engine.javaImports().find("client.util.RemappedUtil");
-            assertNotNull(imported);
-            assertEquals(RemappedUtil.class.getName(), imported.runtimeClassName());
-            assertEquals(source.toAbsolutePath().normalize(), imported.source());
-        } finally {
-            Files.deleteIfExists(source);
-        }
+        engine.javaImports().register(RemappedUtil.class);
+        var imported = engine.javaImports().find("client.util.RemappedUtil");
+        assertNotNull(imported);
+        assertSame(RemappedUtil.class, imported.type());
+        assertNull(imported.source());
     }
 
     @Test
-    void sourceDirectoryScansJavaImports() throws Exception {
+    void compiledClassFileCanBeRegistered() throws Exception {
         VeloraEngine engine = Velora.builder().host(host()).build();
-        Path directory = Files.createTempDirectory("velora-imports");
-        Path source = directory.resolve("dev/client/SourceUtil.java");
-        try {
-            Files.createDirectories(source.getParent());
-            Files.writeString(source, "package dev.client;\n@VeloraImport(\"client.util.RemappedUtil\")\npublic final class SourceUtil {}\n");
-            engine.javaImports().register(directory, name -> RemappedUtil.class.getName());
-            assertNotNull(engine.javaImports().find("client.util.RemappedUtil"));
-        } finally {
-            Files.deleteIfExists(source);
-            Files.deleteIfExists(source.getParent());
-            Files.deleteIfExists(source.getParent().getParent());
-            Files.deleteIfExists(directory);
-        }
+        Path file = Path.of(RemappedUtil.class.getResource("JavaInteropV2Test$RemappedUtil.class").toURI());
+        engine.javaImports().register(file, RemappedUtil.class.getClassLoader());
+        var imported = engine.javaImports().find("client.util.RemappedUtil");
+        assertNotNull(imported);
+        assertSame(RemappedUtil.class, imported.type());
+        assertEquals(file.toAbsolutePath().normalize(), imported.source());
     }
 
     @Test

@@ -1,6 +1,5 @@
 package io.velora.internal.interop;
 
-import io.velora.api.interop.JavaClassResolver;
 import io.velora.api.interop.JavaImportDescriptor;
 import io.velora.api.interop.JavaImportRegistry;
 import io.velora.api.registry.TypeRegistry;
@@ -12,10 +11,8 @@ import io.velora.internal.registry.DefaultApiRegistry;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -23,14 +20,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.jar.JarFile;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public final class DefaultJavaImportRegistry implements JavaImportRegistry {
-    private static final Pattern PACKAGE = Pattern.compile("(?m)^\\s*package\\s+([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*)\\s*;");
-    private static final Pattern TYPE = Pattern.compile("(?m)^\\s*(?:public\\s+)?(?:(?:abstract|final|sealed|non-sealed|strictfp)\\s+)*(?:class|interface|enum|record)\\s+([A-Za-z_$][\\w$]*)\\b");
-    private static final Pattern IMPORT_ANNOTATION = Pattern.compile("@(?:[A-Za-z_$][\\w$]*\\.)*VeloraImport\\s*\\(");
-
     private final DefaultApiRegistry apiRegistry;
     private final BindingDescriptorFactory factory;
     private final Map<String, JavaImportDescriptor> imports = new LinkedHashMap<>();
@@ -50,25 +41,19 @@ public final class DefaultJavaImportRegistry implements JavaImportRegistry {
 
     @Override
     public void register(Path path) {
-        register(path, defaultClassLoader(), JavaClassResolver.identity());
+        register(path, defaultClassLoader());
     }
 
     @Override
-    public void register(Path path, JavaClassResolver resolver) {
-        register(path, defaultClassLoader(), resolver);
-    }
-
-    @Override
-    public void register(Path path, ClassLoader classLoader, JavaClassResolver resolver) {
+    public void register(Path path, ClassLoader classLoader) {
         checkFrozen();
         if (path == null) throw new IllegalArgumentException("Java import path cannot be null");
         if (classLoader == null) throw new IllegalArgumentException("ClassLoader cannot be null");
-        if (resolver == null) throw new IllegalArgumentException("JavaClassResolver cannot be null");
         Path normalized = path.toAbsolutePath().normalize();
         if (!Files.exists(normalized)) throw new IllegalArgumentException("Java import path does not exist: " + normalized);
         try {
-            if (Files.isDirectory(normalized)) registerDirectory(normalized, classLoader, resolver);
-            else registerFile(normalized, classLoader, resolver);
+            if (Files.isDirectory(normalized)) registerDirectory(normalized, classLoader);
+            else registerFile(normalized, classLoader);
         } catch (IOException e) {
             throw new BindingValidationException("Cannot scan Java import path " + normalized + ": " + e.getMessage());
         }
@@ -103,7 +88,7 @@ public final class DefaultJavaImportRegistry implements JavaImportRegistry {
         }
     }
 
-    private void registerDirectory(Path root, ClassLoader classLoader, JavaClassResolver resolver) throws IOException {
+    private void registerDirectory(Path root, ClassLoader classLoader) throws IOException {
         List<Path> files;
         try (var stream = Files.walk(root)) {
             files = stream.filter(Files::isRegularFile)
@@ -113,28 +98,16 @@ public final class DefaultJavaImportRegistry implements JavaImportRegistry {
         }
         for (Path file : files) {
             String lower = file.getFileName().toString().toLowerCase();
-            if (lower.endsWith(".java")) registerSource(file, classLoader, resolver);
-            else if (lower.endsWith(".class")) registerRuntimeClass(binaryName(root, file), file, classLoader);
+            if (lower.endsWith(".class")) registerRuntimeClass(binaryName(root, file), file, classLoader);
             else if (lower.endsWith(".jar")) registerJar(file, classLoader);
         }
     }
 
-    private void registerFile(Path file, ClassLoader classLoader, JavaClassResolver resolver) throws IOException {
+    private void registerFile(Path file, ClassLoader classLoader) throws IOException {
         String lower = file.getFileName().toString().toLowerCase();
-        if (lower.endsWith(".java")) registerSource(file, classLoader, resolver);
-        else if (lower.endsWith(".class")) registerRuntimeClass(readClassName(file), file, classLoader);
+        if (lower.endsWith(".class")) registerRuntimeClass(readClassName(file), file, classLoader);
         else if (lower.endsWith(".jar")) registerJar(file, classLoader);
-        else throw new IllegalArgumentException("Unsupported Java import file: " + file);
-    }
-
-    private void registerSource(Path source, ClassLoader classLoader, JavaClassResolver resolver) throws IOException {
-        String text = Files.readString(source, StandardCharsets.UTF_8);
-        if (!IMPORT_ANNOTATION.matcher(text).find()) return;
-        String sourceName = sourceClassName(text);
-        if (sourceName == null) return;
-        String runtimeName = resolver.runtimeClassName(sourceName);
-        if (runtimeName == null || runtimeName.isBlank()) throw new BindingValidationException("JavaClassResolver returned an empty class name for " + sourceName);
-        registerRuntimeClass(runtimeName, source, classLoader);
+        else throw new IllegalArgumentException("Java imports accept Class<?>, .class, .jar or a compiled classes directory: " + file);
     }
 
     private void registerJar(Path jar, ClassLoader classLoader) throws IOException {
@@ -175,7 +148,7 @@ public final class DefaultJavaImportRegistry implements JavaImportRegistry {
             var descriptors = factory.createStaticDescriptors(type, namespace);
             if (descriptors.isEmpty()) throw new BindingValidationException("Java import " + importName + " has no @VeloraFunction or @VeloraProperty methods");
             for (var descriptor : descriptors) apiRegistry.register(descriptor);
-            imports.put(importName, new JavaImportDescriptor(importName, alias, namespace, type.getName(), source));
+            imports.put(importName, new JavaImportDescriptor(importName, alias, namespace, type, source));
             importClasses.put(importName, type);
         } catch (Throwable error) {
             apiRegistry.rollbackTo(apiSnapshot);
@@ -199,13 +172,6 @@ public final class DefaultJavaImportRegistry implements JavaImportRegistry {
             if (part.isEmpty() || !(Character.isJavaIdentifierStart(part.charAt(0)))) throw new BindingValidationException("Invalid Java import name: " + name);
             for (int i = 1; i < part.length(); i++) if (!Character.isJavaIdentifierPart(part.charAt(i))) throw new BindingValidationException("Invalid Java import name: " + name);
         }
-    }
-
-    private String sourceClassName(String text) {
-        Matcher type = TYPE.matcher(text);
-        if (!type.find()) return null;
-        Matcher pkg = PACKAGE.matcher(text);
-        return pkg.find() ? pkg.group(1) + "." + type.group(1) : type.group(1);
     }
 
     private String binaryName(Path root, Path file) {
@@ -241,7 +207,7 @@ public final class DefaultJavaImportRegistry implements JavaImportRegistry {
 
     private boolean supportedFile(Path file) {
         String lower = file.getFileName().toString().toLowerCase();
-        return lower.endsWith(".java") || lower.endsWith(".class") || lower.endsWith(".jar");
+        return lower.endsWith(".class") || lower.endsWith(".jar");
     }
 
     private ClassLoader defaultClassLoader() {
