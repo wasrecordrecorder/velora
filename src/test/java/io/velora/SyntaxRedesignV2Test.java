@@ -158,6 +158,7 @@ class SyntaxRedesignV2Test {
         EventDescriptor derived = EventDescriptor.builder("client.packet-receive").payloadType(VeloraTypes.UNIT).build();
         assertEquals("PacketReceive", derived.scriptName());
         assertThrows(IllegalArgumentException.class, () -> EventDescriptor.builder("client.tick").scriptName("client.tick").payloadType(VeloraTypes.UNIT).build());
+        assertThrows(IllegalArgumentException.class, () -> EventDescriptor.builder("client.tick").scriptName("Tick$Internal").payloadType(VeloraTypes.UNIT).build());
         assertThrows(IllegalArgumentException.class, () -> EventDescriptor.builder("client.enable").scriptName("Enable").payloadType(VeloraTypes.UNIT).build());
     }
 

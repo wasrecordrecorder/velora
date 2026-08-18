@@ -7,6 +7,7 @@ public final class CallFrame {
     int ip;
     final int stackBase;
     final int localBase;
+    int line;
     public final ScriptValue[] locals;
 
     public CallFrame(CompiledFunction function, int stackBase, int localBase) {
@@ -21,5 +22,7 @@ public final class CallFrame {
     public int ip() { return ip; }
     public int stackBase() { return stackBase; }
     public int localBase() { return localBase; }
+    public int line() { return line; }
+    public void line(int value) { line = value; }
     public ScriptValue[] locals() { return locals; }
 }

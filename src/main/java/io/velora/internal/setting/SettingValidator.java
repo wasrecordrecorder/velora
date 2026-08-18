@@ -8,6 +8,7 @@ import io.velora.api.type.VeloraTypes;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.Duration;
 import java.util.regex.PatternSyntaxException;
 
 public final class SettingValidator {
@@ -21,7 +22,8 @@ public final class SettingValidator {
         }
         Object normalized;
         try {
-            normalized = normalizeValue(descriptor.type(), value.value());
+            Object source = normalizeValue(value.type(), value.value());
+            normalized = normalizeValue(descriptor.type(), source);
         } catch (RuntimeException e) {
             return SettingValidationResult.invalid(e.getMessage());
         }
@@ -29,7 +31,13 @@ public final class SettingValidator {
             return SettingValidationResult.invalid("Value cannot be null for setting '" + descriptor.id() + "'");
         }
         for (SettingDescriptor.Constraint constraint : descriptor.constraints()) {
-            SettingValidationResult result = validateConstraint(descriptor, constraint, normalized);
+            SettingValidationResult result;
+            try {
+                result = validateConstraint(descriptor, constraint, normalized);
+            } catch (RuntimeException error) {
+                String message = error.getMessage();
+                return SettingValidationResult.invalid(message == null || message.isBlank() ? "Invalid setting constraint" : message);
+            }
             if (!result.isValid()) return result;
         }
         return SettingValidationResult.ok();
@@ -38,17 +46,20 @@ public final class SettingValidator {
     public static SettingValue normalize(SettingDescriptor descriptor, SettingValue value) {
         SettingValidationResult validation = validate(descriptor, value);
         if (!validation.isValid()) throw new IllegalArgumentException(validation.errorMessage());
-        return SettingValue.of(descriptor.type(), normalizeValue(descriptor.type(), value.value()));
+        Object source = normalizeValue(value.type(), value.value());
+        return SettingValue.of(descriptor.type(), normalizeValue(descriptor.type(), source));
     }
 
     private static Object normalizeValue(VeloraType type, Object value) {
         if (value == null) return null;
         VeloraType expected = type.nonNull();
-        if (expected == VeloraTypes.BYTE && value instanceof Number n) return n.byteValue();
-        if (expected == VeloraTypes.INT && value instanceof Number n) return n.intValue();
-        if ((expected == VeloraTypes.LONG || expected == VeloraTypes.DURATION) && value instanceof Number n) return n.longValue();
-        if (expected == VeloraTypes.FLOAT && value instanceof Number n) return n.floatValue();
-        if (expected == VeloraTypes.DOUBLE && value instanceof Number n) return n.doubleValue();
+        if (expected == VeloraTypes.BYTE && value instanceof Byte) return value;
+        if (expected == VeloraTypes.INT && (value instanceof Byte || value instanceof Short || value instanceof Integer)) return ((Number) value).intValue();
+        if (expected == VeloraTypes.LONG && (value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long)) return ((Number) value).longValue();
+        if (expected == VeloraTypes.FLOAT && (value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Float)) return ((Number) value).floatValue();
+        if (expected == VeloraTypes.DOUBLE && value instanceof Number) return ((Number) value).doubleValue();
+        if (expected == VeloraTypes.DURATION && value instanceof Duration duration) return duration.toNanos();
+        if (expected == VeloraTypes.DURATION && (value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long)) return ((Number) value).longValue();
         if (expected == VeloraTypes.BOOLEAN && value instanceof Boolean) return value;
         if (expected == VeloraTypes.CHAR && value instanceof Character) return value;
         if (expected == VeloraTypes.STRING && value instanceof String) return value;
@@ -68,11 +79,13 @@ public final class SettingValidator {
             case MIN_LENGTH -> {
                 if (!(value instanceof String string)) yield SettingValidationResult.invalid("MIN_LENGTH requires a String setting");
                 int min = ((Number) constraint.min()).intValue();
+                if (min < 0) yield SettingValidationResult.invalid("Minimum string length cannot be negative");
                 yield string.length() >= min ? SettingValidationResult.ok() : SettingValidationResult.invalid("String length " + string.length() + " is below min " + min);
             }
             case MAX_LENGTH -> {
                 if (!(value instanceof String string)) yield SettingValidationResult.invalid("MAX_LENGTH requires a String setting");
                 int max = ((Number) constraint.max()).intValue();
+                if (max < 0) yield SettingValidationResult.invalid("Maximum string length cannot be negative");
                 yield string.length() <= max ? SettingValidationResult.ok() : SettingValidationResult.invalid("String length " + string.length() + " exceeds max " + max);
             }
             case VALUES -> {
@@ -102,8 +115,8 @@ public final class SettingValidator {
 
     private static SettingValidationResult validateStep(SettingDescriptor descriptor, Object value, Object stepValue) {
         if (!(value instanceof Number number) || !(stepValue instanceof Number stepNumber)) return SettingValidationResult.invalid("STEP requires numeric values");
-        BigDecimal step = decimal(stepNumber).abs();
-        if (step.signum() == 0) return SettingValidationResult.invalid("Step must be greater than zero");
+        BigDecimal step = decimal(stepNumber);
+        if (step.signum() <= 0) return SettingValidationResult.invalid("Step must be greater than zero");
         BigDecimal base = BigDecimal.ZERO;
         for (SettingDescriptor.Constraint constraint : descriptor.constraints()) {
             if ((constraint.kind() == SettingDescriptor.Constraint.Kind.RANGE || constraint.kind() == SettingDescriptor.Constraint.Kind.MIN) && constraint.min() instanceof Number min) {

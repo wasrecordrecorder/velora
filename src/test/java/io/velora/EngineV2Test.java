@@ -68,6 +68,35 @@ class EngineV2Test {
     }
 
     @Test
+    void builderRejectsIncompleteHostContractsImmediately() {
+        VeloraHost base = simpleHost();
+        VeloraHost invalid = new VeloraHost() {
+            @Override public String id() { return base.id(); }
+            @Override public String version() { return base.version(); }
+            @Override public MainThreadExecutor mainThread() { return base.mainThread(); }
+            @Override public WorkerExecutor workers() { return base.workers(); }
+            @Override public VeloraClock clock() { return base.clock(); }
+            @Override public VeloraLogger logger() { return null; }
+            @Override public VeloraFileSystem fileSystem() { return null; }
+        };
+        VeloraException error = assertThrows(VeloraException.class, () -> Velora.builder().host(invalid).build());
+        assertTrue(error.getMessage().contains("logger"));
+        assertThrows(NullPointerException.class, () -> Velora.builder().limits(null));
+    }
+
+    @Test
+    void settingRegistryConvenienceBuilderExposesFullKindMetadata() {
+        VeloraEngine engine = Velora.builder().host(simpleHost()).build();
+        SettingEditorDescriptor editor = SettingEditorDescriptor.of("client.mode");
+        engine.settings().register("Mode", kind -> kind.resultType(VeloraTypes.STRING).categoryId("client").editor(editor).documentation("Mode setting"));
+        SettingKind kind = engine.settings().find("Mode");
+        assertEquals("client", kind.categoryId());
+        assertSame(editor, kind.editor().orElseThrow());
+        assertEquals("Mode setting", kind.documentation().orElseThrow());
+        engine.close();
+    }
+
+    @Test
     @DisplayName("Velora.version returns version string")
     void versionString() {
         assertNotNull(Velora.version());
@@ -246,6 +275,31 @@ class EngineV2Test {
     }
 
     // === VeloraState enum ===
+
+    @Test
+    void closeDetachesAndClearsEventRuntime() {
+        VeloraEngine engine = Velora.builder().host(simpleHost()).build();
+        var key = io.velora.api.event.EventKey.of("engine.close.event", Integer.class);
+        engine.events().register(io.velora.api.event.EventDescriptor.builder(key).scriptName("CloseEvent").payloadType(VeloraTypes.INT).build());
+        engine.freeze();
+        engine.events().emitSafe(key, 1);
+        var events = (io.velora.internal.event.DefaultEventRegistry) engine.events();
+        assertEquals(1, events.queueDepth(key.id()));
+        engine.close();
+        assertEquals(0, events.queueDepth(key.id()));
+        assertThrows(IllegalStateException.class, () -> events.emitSafe(key, 2));
+    }
+
+    @Test
+    void closedEngineCannotRecreateOperationalServices() {
+        VeloraEngine engine = Velora.builder().host(simpleHost()).build();
+        engine.close();
+        assertThrows(IllegalStateException.class, engine::compiler);
+        assertThrows(IllegalStateException.class, engine::scripts);
+        assertThrows(IllegalStateException.class, engine::language);
+        assertThrows(IllegalStateException.class, engine::debug);
+        assertEquals(VeloraState.CLOSED, engine.state());
+    }
 
     @Test
     @DisplayName("VeloraState has all expected states")

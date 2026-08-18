@@ -102,7 +102,7 @@ public final class BindingDescriptorFactory {
             }
             VeloraParam named = parameter.getAnnotation(VeloraParam.class);
             VeloraType parameterType = resolveAnnotatedType(named != null ? named.type() : "", parameter.getParameterizedType(), method, false);
-            String parameterName = named != null ? named.value() : parameter.isNamePresent() ? parameter.getName() : "arg" + scriptArgIndex;
+            String parameterName = named != null ? named.value() : "arg" + scriptArgIndex;
             if (!isIdentifier(parameterName)) throw new BindingValidationException("Invalid script parameter name '" + parameterName + "' in " + method.getName());
             builder.parameter(parameterName, parameterType);
             scriptArgIndex++;
@@ -163,14 +163,18 @@ public final class BindingDescriptorFactory {
     private VeloraType resolveAnnotatedType(String override, Type javaType, Method method, boolean allowVoid) {
         if (override == null || override.isBlank()) return javaTypeToVelora(javaType, method, allowVoid);
         if (typeRegistry == null) throw new BindingValidationException("Type override '" + override + "' requires a TypeRegistry in " + method.getName());
-        VeloraType type = typeRegistry.find(override.trim());
+        String name = override.trim();
+        boolean nullable = name.endsWith("?");
+        if (nullable) name = name.substring(0, name.length() - 1).trim();
+        VeloraType type = typeRegistry.find(name);
         if (type == null) throw new BindingValidationException("Unknown Velora type '" + override + "' in " + method.getName());
         if (type == VeloraTypes.UNIT && !allowVoid) throw new BindingValidationException("Unit is not valid for a script parameter in " + method.getName());
         Class<?> actual = rawClass(javaType);
         if (actual == null || !sameJavaType(actual, type.javaClass())) {
             throw new BindingValidationException("Velora type " + type.name() + " uses Java type " + type.javaClass().getTypeName() + ", not " + javaType.getTypeName() + " in " + method.getName());
         }
-        return type.nonNull();
+        if (nullable && actual.isPrimitive()) throw new BindingValidationException("Nullable Velora type requires a nullable Java carrier in " + method.getName());
+        return nullable ? type.nullable() : type.nonNull();
     }
 
     private Class<?> rawClass(Type type) {
@@ -202,7 +206,11 @@ public final class BindingDescriptorFactory {
             Type raw = parameterized.getRawType();
             Type[] args = parameterized.getActualTypeArguments();
             if (raw == List.class && args.length == 1) return VeloraTypes.list(javaTypeToVelora(args[0], method, false));
-            if (raw == Set.class && args.length == 1) return VeloraTypes.set(javaTypeToVelora(args[0], method, false));
+            if (raw == Set.class && args.length == 1) {
+                VeloraType element = javaTypeToVelora(args[0], method, false);
+                if (!element.isHashable()) throw new BindingValidationException("Set element type " + element.name() + " is not hashable in " + method.getName());
+                return VeloraTypes.set(element);
+            }
             if (raw == Map.class && args.length == 2) {
                 VeloraType key = javaTypeToVelora(args[0], method, false);
                 if (!key.isHashable()) throw new BindingValidationException("Map key type " + key.name() + " is not hashable in " + method.getName());

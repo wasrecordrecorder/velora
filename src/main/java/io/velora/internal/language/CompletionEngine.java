@@ -8,6 +8,9 @@ import io.velora.api.registry.ConstantRegistry;
 import io.velora.api.registry.SettingRegistry;
 import io.velora.api.registry.TypeRegistry;
 import io.velora.api.type.EnumType;
+import io.velora.internal.semantic.ResolvedScript;
+import io.velora.internal.lexer.Lexer;
+import io.velora.internal.lexer.TokenType;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -32,19 +35,27 @@ public final class CompletionEngine {
     private CompletionEngine() {}
 
     public static List<CompletionItem> getCompletions(String content, int line, int column) {
-        return getCompletions(content, line, column, null, null, null, null, null, null);
+        return getCompletions(content, line, column, null, null, null, null, null, null, null);
     }
 
     public static List<CompletionItem> getCompletions(String content, int line, int column, ApiRegistry apiRegistry,
                                                        TypeRegistry typeRegistry, EventRegistry eventRegistry,
                                                        SettingRegistry settingRegistry, ConstantRegistry constantRegistry) {
-        return getCompletions(content, line, column, apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry, null);
+        return getCompletions(content, line, column, apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry, null, null);
     }
 
     public static List<CompletionItem> getCompletions(String content, int line, int column, ApiRegistry apiRegistry,
                                                        TypeRegistry typeRegistry, EventRegistry eventRegistry,
                                                        SettingRegistry settingRegistry, ConstantRegistry constantRegistry,
                                                        JavaImportRegistry javaImportRegistry) {
+        return getCompletions(content, line, column, apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry, javaImportRegistry, null);
+    }
+
+    public static List<CompletionItem> getCompletions(String content, int line, int column, ApiRegistry apiRegistry,
+                                                       TypeRegistry typeRegistry, EventRegistry eventRegistry,
+                                                       SettingRegistry settingRegistry, ConstantRegistry constantRegistry,
+                                                       JavaImportRegistry javaImportRegistry, ResolvedScript resolved) {
+        if (blockedContext(content, line, column)) return List.of();
         String prefix = prefixAt(content, line, column);
         String qualifier = qualifierAt(content, line, column, prefix.length());
         Set<String> seen = new LinkedHashSet<>();
@@ -81,6 +92,20 @@ public final class CompletionEngine {
         add(result, seen, KEYWORDS, CompletionItem.CompletionKind.KEYWORD, prefix);
         add(result, seen, TYPES, CompletionItem.CompletionKind.TYPE, prefix);
         add(result, seen, BUILTINS, CompletionItem.CompletionKind.FUNCTION, prefix);
+        if (resolved != null) {
+            for (var setting : resolved.settings()) {
+                if (matches(setting.id(), prefix) && seen.add(setting.id())) result.add(new CompletionItem(setting.id(), setting.type().name(), setting.description().orElse(null), setting.id(), CompletionItem.CompletionKind.SETTING));
+            }
+            for (var property : resolved.properties().values()) {
+                if (matches(property.name(), prefix) && seen.add(property.name())) result.add(new CompletionItem(property.name(), property.type().name(), property.persistent() ? "Persistent" : null, property.name(), property.isConst() ? CompletionItem.CompletionKind.CONSTANT : CompletionItem.CompletionKind.PROPERTY));
+            }
+            for (var function : resolved.functions().values()) {
+                if (matches(function.name(), prefix) && seen.add(function.name())) {
+                    String detail = function.name() + "(" + String.join(", ", function.parameters().stream().map(parameter -> parameter.name() + ": " + parameter.type().name()).toList()) + ") -> " + function.returnType().name();
+                    result.add(new CompletionItem(function.name(), detail, null, function.name(), CompletionItem.CompletionKind.FUNCTION));
+                }
+            }
+        }
         if (typeRegistry != null) add(result, seen, typeRegistry.names().stream().toList(), CompletionItem.CompletionKind.TYPE, prefix);
         if (apiRegistry != null) add(result, seen, apiRegistry.namespaces().stream().filter(name -> !name.startsWith("__java_")).toList(), CompletionItem.CompletionKind.NAMESPACE, prefix);
         add(result, seen, JavaImportAliases.resolve(content, javaImportRegistry).keySet().stream().toList(), CompletionItem.CompletionKind.NAMESPACE, prefix);
@@ -104,6 +129,30 @@ public final class CompletionEngine {
 
     private static boolean matches(String value, String prefix) {
         return prefix.isEmpty() || value.regionMatches(true, 0, prefix, 0, prefix.length());
+    }
+
+    private static boolean blockedContext(String content, int line, int column) {
+        int offset = cursorOffset(content, line, column);
+        if (offset < 0) return true;
+        for (var token : new Lexer(content, "completion.vls").lex().tokens()) {
+            if (offset < token.offset() || offset >= token.offset() + token.length()) continue;
+            if (token.is(TokenType.COMMENT) || token.is(TokenType.STRING) || token.is(TokenType.STRING_INTERP)) return true;
+        }
+        return false;
+    }
+
+    private static int cursorOffset(String content, int line, int column) {
+        if (line < 1 || column < 1) return -1;
+        int currentLine = 1;
+        int lineStart = 0;
+        for (int i = 0; i < content.length() && currentLine < line; i++) {
+            if (content.charAt(i) == '\n') { currentLine++; lineStart = i + 1; }
+        }
+        if (currentLine != line) return -1;
+        int lineEnd = content.indexOf('\n', lineStart);
+        if (lineEnd < 0) lineEnd = content.length();
+        if (lineEnd > lineStart && content.charAt(lineEnd - 1) == '\r') lineEnd--;
+        return Math.min(lineStart + column - 1, lineEnd);
     }
 
     private static String prefixAt(String content, int line, int column) {

@@ -34,6 +34,12 @@ tasks.compileJava {
     options.encoding = "UTF-8"
 }
 
+tasks.jar {
+    manifest {
+        attributes["Main-Class"] = "io.velora.cli.VeloraCli"
+    }
+}
+
 tasks.javadoc {
     options.encoding = "UTF-8"
     (options as CoreJavadocOptions).addStringOption("Xdoclint:none", "-quiet")

@@ -240,11 +240,22 @@ public final class Lexer {
                     column++;
                 }
                 int depth = 1;
+                char nestedQuote = 0;
+                boolean escaped = false;
                 while (pos < length && depth > 0) {
                     char cc = source.charAt(pos);
                     sb.append(cc);
-                    if (cc == '{') depth++;
-                    else if (cc == '}') depth--;
+                    if (nestedQuote != 0) {
+                        if (escaped) escaped = false;
+                        else if (cc == '\\') escaped = true;
+                        else if (cc == nestedQuote) nestedQuote = 0;
+                    } else if (cc == '"' || cc == '\'') {
+                        nestedQuote = cc;
+                    } else if (cc == '{') {
+                        depth++;
+                    } else if (cc == '}') {
+                        depth--;
+                    }
                     if (cc == '\n') { line++; column = 1; } else { column++; }
                     pos++;
                 }

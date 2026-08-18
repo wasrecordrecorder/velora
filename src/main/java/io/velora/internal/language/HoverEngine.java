@@ -9,6 +9,7 @@ import io.velora.api.registry.TypeRegistry;
 import io.velora.internal.lexer.Lexer;
 import io.velora.internal.lexer.Token;
 import io.velora.internal.lexer.TokenType;
+import io.velora.internal.semantic.ResolvedScript;
 
 import java.util.Map;
 import java.util.Optional;
@@ -43,17 +44,23 @@ public final class HoverEngine {
     private HoverEngine() {}
 
     public static Optional<HoverInfo> getHover(String content, int line, int column, String filePath) {
-        return getHover(content, line, column, filePath, null, null, null, null, null);
+        return getHover(content, line, column, filePath, null, null, null, null, null, null);
     }
 
     public static Optional<HoverInfo> getHover(String content, int line, int column, String filePath, ApiRegistry apiRegistry,
                                                TypeRegistry typeRegistry, ConstantRegistry constantRegistry, EventRegistry eventRegistry) {
-        return getHover(content, line, column, filePath, apiRegistry, typeRegistry, constantRegistry, eventRegistry, null);
+        return getHover(content, line, column, filePath, apiRegistry, typeRegistry, constantRegistry, eventRegistry, null, null);
     }
 
     public static Optional<HoverInfo> getHover(String content, int line, int column, String filePath, ApiRegistry apiRegistry,
                                                TypeRegistry typeRegistry, ConstantRegistry constantRegistry, EventRegistry eventRegistry,
                                                JavaImportRegistry javaImportRegistry) {
+        return getHover(content, line, column, filePath, apiRegistry, typeRegistry, constantRegistry, eventRegistry, javaImportRegistry, null);
+    }
+
+    public static Optional<HoverInfo> getHover(String content, int line, int column, String filePath, ApiRegistry apiRegistry,
+                                               TypeRegistry typeRegistry, ConstantRegistry constantRegistry, EventRegistry eventRegistry,
+                                               JavaImportRegistry javaImportRegistry, ResolvedScript resolved) {
         if (line < 1 || column < 1) return Optional.empty();
         int zeroColumn = column - 1;
         for (Token token : new Lexer(content, filePath).lex().tokens()) {
@@ -62,7 +69,7 @@ public final class HoverEngine {
             if (token.isTrivia() || token.is(TokenType.EOF)) return Optional.empty();
             String text = token.text().startsWith("@") ? token.text().substring(1) : token.text();
             String qualified = qualifiedAt(content, line, token.column(), token.text());
-            String detail = dynamicInfo(content, text, qualified, apiRegistry, typeRegistry, constantRegistry, eventRegistry, javaImportRegistry);
+            String detail = dynamicInfo(content, text, qualified, apiRegistry, typeRegistry, constantRegistry, eventRegistry, javaImportRegistry, resolved);
             if (detail == null) detail = INFO.get(text);
             String shown = qualified != null ? qualified : token.text();
             String body = "```velora\n" + shown + "\n```" + (detail == null ? "" : "\n" + detail);
@@ -72,7 +79,7 @@ public final class HoverEngine {
     }
 
     private static String dynamicInfo(String content, String token, String qualified, ApiRegistry apiRegistry, TypeRegistry typeRegistry,
-                                      ConstantRegistry constantRegistry, EventRegistry eventRegistry, JavaImportRegistry javaImportRegistry) {
+                                      ConstantRegistry constantRegistry, EventRegistry eventRegistry, JavaImportRegistry javaImportRegistry, ResolvedScript resolved) {
         if (qualified != null) {
             int dot = qualified.indexOf('.');
             String namespace = qualified.substring(0, dot);
@@ -85,6 +92,13 @@ public final class HoverEngine {
                 var constant = constantRegistry.find(namespace, member);
                 if (constant != null) return "Constant `" + constant.type().name() + "`.";
             }
+        }
+        if (resolved != null) {
+            var property = resolved.properties().get(token);
+            if (property != null) return (property.isConst() ? "Constant" : "Property") + " `" + property.type().name() + "`." + (property.persistent() ? " Persistent." : "");
+            for (var setting : resolved.settings()) if (setting.id().equals(token)) return "Setting `" + setting.type().name() + "`." + setting.description().filter(value -> !value.isBlank()).map(value -> "\n" + value).orElse("");
+            var function = resolved.functions().get(token);
+            if (function != null) return "Function `" + function.name() + "(" + String.join(", ", function.parameters().stream().map(parameter -> parameter.name() + ": " + parameter.type().name()).toList()) + ") -> " + function.returnType().name() + "`.";
         }
         if (eventRegistry != null) {
             for (var event : eventRegistry.all()) {

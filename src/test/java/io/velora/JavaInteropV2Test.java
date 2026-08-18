@@ -5,6 +5,7 @@ import io.velora.api.VeloraEngine;
 import io.velora.api.compiler.CompileRequest;
 import io.velora.api.compiler.DiagnosticCode;
 import io.velora.api.language.EditorSession;
+import io.velora.binding.BindingValidationException;
 import io.velora.binding.annotation.VeloraFunction;
 import io.velora.binding.annotation.VeloraImport;
 import io.velora.binding.annotation.VeloraParam;
@@ -38,6 +39,27 @@ class JavaInteropV2Test {
         public static int answer() {
             return 42;
         }
+
+        @VeloraFunction(name = "maybe", returnType = "String?")
+        public static String maybe() {
+            return null;
+        }
+
+        @VeloraFunction(name = "isNull")
+        public static boolean isNull(@VeloraParam(value = "value", type = "String?") String value) {
+            return value == null;
+        }
+    }
+
+    static final class PlainUtil {
+        public static int value() { return 1; }
+    }
+
+
+    @VeloraImport("client.$Bad")
+    static final class InvalidImportName {
+        @VeloraFunction(name = "value")
+        public static int value() { return 1; }
     }
 
     @VeloraImport("client.util.RemappedUtil")
@@ -46,6 +68,16 @@ class JavaInteropV2Test {
         public static int value() {
             return 7;
         }
+    }
+
+    @Test
+    void explicitJavaImportWithoutExportAnnotationFailsFast() {
+        VeloraEngine engine = Velora.builder().host(host()).build();
+        assertThrows(BindingValidationException.class, () -> engine.javaImports().register(PlainUtil.class));
+        assertThrows(IllegalArgumentException.class, () -> engine.javaImports().register((Class<?>) null));
+        assertThrows(BindingValidationException.class, () -> engine.javaImports().register(InvalidImportName.class));
+        assertTrue(engine.javaImports().all().isEmpty());
+        engine.close();
     }
 
     @Test
@@ -73,6 +105,21 @@ class JavaInteropV2Test {
     }
 
     @Test
+    void annotatedJavaImportsSupportNullableTypeOverrides() {
+        VeloraEngine engine = Velora.builder().host(host()).build();
+        engine.javaImports().register(MathUtil.class);
+        engine.freeze();
+        CompileRequest request = CompileRequest.builder("nullable").source("main.vls", "import client.util.MathUtil\n@Script(\"Nullable\")\nscript Nullable { boolean answer() { String? value = MathUtil.maybe() return MathUtil.isNull(value) } }").build();
+        var result = engine.compiler().compile(request);
+        assertTrue(result.success(), result.diagnostics().toString());
+        var module = ((DefaultScriptCompiler) engine.compiler()).compileToModule(request);
+        var execution = new VirtualMachine(engine.api(), List.of(), 100_000).execute(module, module.functionByName("answer").index(), new ScriptValue[0]);
+        assertTrue(execution.success(), String.valueOf(execution.error()));
+        assertEquals(true, execution.returnValue().boxed());
+        engine.close();
+    }
+
+    @Test
     void importDescriptorKeepsRuntimeClassReference() {
         VeloraEngine engine = Velora.builder().host(host()).build();
         engine.javaImports().register(RemappedUtil.class);
@@ -91,6 +138,70 @@ class JavaInteropV2Test {
         assertNotNull(imported);
         assertSame(RemappedUtil.class, imported.type());
         assertEquals(file.toAbsolutePath().normalize(), imported.source());
+    }
+
+    @Test
+    void compiledDirectoryLoadsExportsWithoutLinkingUnrelatedClasses() throws Exception {
+        Path root = java.nio.file.Files.createTempDirectory("velora-java-import-");
+        Path source = root.resolve("source/ext");
+        Path classes = root.resolve("classes");
+        java.nio.file.Files.createDirectories(source);
+        java.nio.file.Files.writeString(source.resolve("Missing.java"), "package ext; public class Missing {}");
+        java.nio.file.Files.writeString(source.resolve("Unrelated.java"), "package ext; public class Unrelated extends Missing {}");
+        java.nio.file.Files.writeString(source.resolve("External.java"), "package ext; import io.velora.binding.annotation.*; @VeloraImport(\"client.util.External\") public class External { @VeloraFunction(name=\"value\") public static int value() { return 73; } }");
+        var compiler = javax.tools.ToolProvider.getSystemJavaCompiler();
+        assertNotNull(compiler);
+        int exit = compiler.run(null, null, null, "-classpath", System.getProperty("java.class.path"), "-d", classes.toString(),
+                source.resolve("Missing.java").toString(), source.resolve("Unrelated.java").toString(), source.resolve("External.java").toString());
+        assertEquals(0, exit);
+        java.nio.file.Files.delete(classes.resolve("ext/Missing.class"));
+
+        VeloraEngine engine = Velora.builder().host(host()).build();
+        engine.javaImports().register(classes);
+        var imported = engine.javaImports().find("client.util.External");
+        assertNotNull(imported);
+        assertEquals("ext.External", imported.type().getName());
+        engine.freeze();
+        CompileRequest request = CompileRequest.builder("external").source("main.vls", "import client.util.External\n@Script(\"ExternalScript\")\n@Version(\"1\")\nscript ExternalScript { int answer() { return External.value() } }").build();
+        var result = engine.compiler().compile(request);
+        assertTrue(result.success(), result.diagnostics().toString());
+        var module = ((DefaultScriptCompiler) engine.compiler()).compileToModule(request);
+        var execution = new VirtualMachine(engine.api(), List.of(), 100_000).execute(module, module.functionByName("answer").index(), new ScriptValue[0]);
+        assertTrue(execution.success(), String.valueOf(execution.error()));
+        assertEquals(73, ((Number) execution.returnValue().boxed()).intValue());
+        engine.close();
+    }
+
+    @Test
+    void malformedClassFileIsRejectedAsBindingValidationError() throws Exception {
+        Path file = java.nio.file.Files.createTempFile("velora-malformed-", ".class");
+        try (var out = new java.io.DataOutputStream(java.nio.file.Files.newOutputStream(file))) {
+            out.writeInt(0xCAFEBABE);
+            out.writeShort(0);
+            out.writeShort(65);
+            out.writeShort(1);
+            out.writeShort(0);
+            out.writeShort(65535);
+            out.writeShort(0);
+        }
+        VeloraEngine engine = Velora.builder().host(host()).build();
+        assertThrows(BindingValidationException.class, () -> engine.javaImports().register(file));
+        assertTrue(engine.javaImports().all().isEmpty());
+        engine.close();
+    }
+
+    @Test
+    void editorToolingResolvesFormattedImportsWithTrailingComments() {
+        VeloraEngine engine = Velora.builder().host(host()).build();
+        engine.javaImports().register(MathUtil.class);
+        engine.freeze();
+        String source = "import client.util.MathUtil; // utility\n@Script(\"Tools\")\nscript Tools {\n    Int answer() { return MathUtil.s }\n}";
+        try (EditorSession editor = engine.language().openEditor("tools", "main.vls")) {
+            editor.updateText(source);
+            String line = "    Int answer() { return MathUtil.s }";
+            assertTrue(editor.completions(4, line.indexOf("MathUtil.s") + "MathUtil.s".length() + 1).stream().anyMatch(item -> item.label().equals("sum")));
+        }
+        engine.close();
     }
 
     @Test

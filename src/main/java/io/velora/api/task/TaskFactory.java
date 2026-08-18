@@ -27,7 +27,9 @@ public final class TaskFactory {
                 callbacks = new ArrayList<>(cancelCallbacks);
                 cancelCallbacks.clear();
             }
-            for (Runnable callback : callbacks) callback.run();
+            for (Runnable callback : callbacks) {
+                try { callback.run(); } catch (Throwable ignored) {}
+            }
             return true;
         }
 
@@ -94,7 +96,9 @@ public final class TaskFactory {
                 callbacks = new ArrayList<>(listeners);
                 listeners.clear();
             }
-            for (TaskListener<T> listener : callbacks) listener.onComplete(this);
+            for (TaskListener<T> listener : callbacks) {
+                try { listener.onComplete(this); } catch (Throwable ignored) {}
+            }
             return true;
         }
     }

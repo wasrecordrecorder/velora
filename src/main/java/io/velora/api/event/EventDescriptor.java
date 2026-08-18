@@ -137,8 +137,8 @@ public final class EventDescriptor {
         }
 
         private static boolean isScriptIdentifier(String value) {
-            if (value == null || value.isEmpty() || !Character.isJavaIdentifierStart(value.charAt(0))) return false;
-            for (int i = 1; i < value.length(); i++) if (!Character.isJavaIdentifierPart(value.charAt(i))) return false;
+            if (value == null || value.isEmpty() || !(Character.isLetter(value.charAt(0)) || value.charAt(0) == '_')) return false;
+            for (int i = 1; i < value.length(); i++) if (!Character.isLetterOrDigit(value.charAt(i)) && value.charAt(i) != '_') return false;
             return true;
         }
 

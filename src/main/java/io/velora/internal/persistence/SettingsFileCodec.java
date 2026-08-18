@@ -1,13 +1,17 @@
 package io.velora.internal.persistence;
 
+import io.velora.api.setting.SettingDescriptor;
 import io.velora.api.setting.SettingValue;
+import io.velora.api.type.EnumType;
 import io.velora.api.type.VeloraType;
 import io.velora.api.type.VeloraTypes;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 
 public final class SettingsFileCodec {
@@ -24,6 +28,15 @@ public final class SettingsFileCodec {
     }
 
     public static Map<String, SettingValue> decode(String content) {
+        return decode(content, List.of());
+    }
+
+    public static Map<String, SettingValue> decode(String content, List<SettingDescriptor> descriptors) {
+        Map<String, SettingDescriptor> schema = new LinkedHashMap<>();
+        for (SettingDescriptor descriptor : descriptors) {
+            schema.put(descriptor.id(), descriptor);
+            descriptor.idAlias().ifPresent(alias -> schema.putIfAbsent(alias, descriptor));
+        }
         Map<String, SettingValue> result = new LinkedHashMap<>();
         if (content == null || content.isEmpty()) return result;
         for (String rawLine : content.split("\\R", -1)) {
@@ -34,7 +47,7 @@ public final class SettingsFileCodec {
             String key = line.substring(0, equals).trim();
             String encoded = line.substring(equals + 1).trim();
             try {
-                result.put(key, encoded.startsWith("!2|") ? decodeV2(encoded) : decodeLegacy(encoded));
+                result.put(key, encoded.startsWith("!2|") ? decodeV2(encoded, schema.get(key)) : decodeLegacy(encoded));
             } catch (RuntimeException ignored) {}
         }
         return result;
@@ -48,16 +61,29 @@ public final class SettingsFileCodec {
         if (type == VeloraTypes.STRING) payload = base64((String) raw);
         else if (type == VeloraTypes.CHAR) payload = Integer.toString((Character) raw);
         else if (type == VeloraTypes.UUID) payload = raw.toString();
+        else if (type instanceof EnumType enumType) payload = enumConstantName(enumType, raw);
         else payload = String.valueOf(raw);
         return "!2|" + type.name() + "|" + payload;
     }
 
-    private static SettingValue decodeV2(String encoded) {
+    private static SettingValue decodeV2(String encoded, SettingDescriptor descriptor) {
         String[] parts = encoded.split("\\|", 3);
         if (parts.length != 3) throw new IllegalArgumentException("Invalid settings value");
-        VeloraType type = typeByName(parts[1]);
+        VeloraType type;
+        try {
+            type = typeByName(parts[1]);
+        } catch (IllegalArgumentException error) {
+            VeloraType declared = descriptor != null ? descriptor.type().nonNull() : null;
+            if (!(declared instanceof EnumType) || !declared.name().equals(parts[1])) throw error;
+            type = declared;
+        }
         String payload = parts[2];
         if (payload.equals("~")) return SettingValue.of(type.nullable(), null);
+        if (type instanceof EnumType enumType) {
+            EnumType.Constant constant = enumType.constant(payload);
+            if (constant == null) throw new IllegalArgumentException("Unknown enum setting value " + payload + " for " + enumType.name());
+            return SettingValue.of(descriptor != null ? descriptor.type() : enumType, constant.value());
+        }
         Object value = switch (type.nonNull().name()) {
             case "Byte" -> Byte.parseByte(payload);
             case "Int" -> Integer.parseInt(payload);
@@ -84,6 +110,13 @@ public final class SettingsFileCodec {
         try { return SettingValue.ofDouble(Double.parseDouble(value)); }
         catch (NumberFormatException ignored) {}
         return SettingValue.ofString(value);
+    }
+
+    private static String enumConstantName(EnumType type, Object value) {
+        for (EnumType.Constant constant : type.constants()) {
+            if (Objects.equals(constant.value(), value) || value instanceof Enum<?> javaEnum && javaEnum.name().equals(constant.name())) return constant.name();
+        }
+        throw new IllegalArgumentException("Unknown enum setting value for " + type.name() + ": " + value);
     }
 
     private static VeloraType typeByName(String name) {

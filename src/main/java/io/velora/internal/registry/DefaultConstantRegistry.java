@@ -2,6 +2,7 @@ package io.velora.internal.registry;
 
 import io.velora.api.registry.ConstantRegistry;
 import io.velora.api.type.VeloraType;
+import io.velora.internal.vm.VirtualMachine;
 
 import java.util.*;
 
@@ -17,6 +18,11 @@ public final class DefaultConstantRegistry implements ConstantRegistry {
         Objects.requireNonNull(type, "type");
         if (!isIdentifier(namespace)) throw new IllegalArgumentException("Constant namespace must be a script identifier: " + namespace);
         if (!isIdentifier(member)) throw new IllegalArgumentException("Constant member must be a script identifier: " + member);
+        try {
+            VirtualMachine.javaToValue(type, value);
+        } catch (RuntimeException error) {
+            throw new IllegalArgumentException("Constant " + namespace + "." + member + " does not match type " + type.name(), error);
+        }
         Map<String, Constant> values = byNamespace.computeIfAbsent(namespace, ignored -> new LinkedHashMap<>());
         if (values.containsKey(member)) throw new IllegalStateException("Constant already registered: " + namespace + "." + member);
         Constant constant = new Constant(namespace, member, type, value);

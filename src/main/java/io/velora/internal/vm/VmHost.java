@@ -7,6 +7,7 @@ import io.velora.api.type.VeloraType;
 
 public interface VmHost {
     long nanoTime();
+    boolean isMainThread();
     boolean isCancelled(long fiberId);
     long spawnFiber(String scriptId, int functionIndex, ScriptValue[] args, long parentId);
     void sleepFiber(long fiberId, long wakeupNanos);
@@ -20,4 +21,5 @@ public interface VmHost {
     void storeField(int fieldIndex, ScriptValue value);
     ScriptValue loadStatic(int fieldIndex);
     void storeStatic(int fieldIndex, ScriptValue value);
+    void commitStateMutation(long fiberId);
 }

@@ -363,10 +363,21 @@ public final class ExpressionParser {
                 i += 2; // skip ${
                 int depth = 1;
                 int start = i;
+                char nestedQuote = 0;
+                boolean escaped = false;
                 while (i < body.length() && depth > 0) {
                     char cc = body.charAt(i);
-                    if (cc == '{') depth++;
-                    else if (cc == '}') depth--;
+                    if (nestedQuote != 0) {
+                        if (escaped) escaped = false;
+                        else if (cc == '\\') escaped = true;
+                        else if (cc == nestedQuote) nestedQuote = 0;
+                    } else if (cc == '"' || cc == '\'') {
+                        nestedQuote = cc;
+                    } else if (cc == '{') {
+                        depth++;
+                    } else if (cc == '}') {
+                        depth--;
+                    }
                     if (depth > 0) i++;
                 }
                 String exprSource = body.substring(start, i);
@@ -407,13 +418,22 @@ public final class ExpressionParser {
         try {
             Lexer subLexer = new Lexer(source, context.filePath() + ":interp");
             var subResult = subLexer.lex();
+            if (subResult.diagnostics().stream().anyMatch(io.velora.api.compiler.Diagnostic::isError)) {
+                context.error(io.velora.api.compiler.DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Invalid interpolation expression", line, column);
+                return new LiteralExpressionNode(context.filePath(), line, column, "", LiteralExpressionNode.LiteralKind.STRING);
+            }
             TokenStream subStream = new TokenStream(subResult.tokens());
             ParserContext subContext = new ParserContext(subStream, context.filePath());
-            ExpressionParser subParser = new ExpressionParser(subContext);
-            return subParser.parseExpression();
-        } catch (Exception e) {
+            ExpressionNode expression = new ExpressionParser(subContext).parseExpression();
+            subContext.skipTrivia();
+            if (subContext.hasErrors() || !subStream.isEof()) {
+                context.error(io.velora.api.compiler.DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Invalid interpolation expression", line, column);
+                return new LiteralExpressionNode(context.filePath(), line, column, "", LiteralExpressionNode.LiteralKind.STRING);
+            }
+            return expression;
+        } catch (RuntimeException e) {
             context.error(io.velora.api.compiler.DiagnosticCode.PARSER_UNEXPECTED_TOKEN,
-                    "Invalid interpolation expression: " + e.getMessage(), line, column);
+                    "Invalid interpolation expression: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()), line, column);
             return new LiteralExpressionNode(context.filePath(), line, column, "", LiteralExpressionNode.LiteralKind.STRING);
         }
     }

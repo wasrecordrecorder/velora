@@ -21,6 +21,7 @@ public final class DefaultEventRegistry implements EventRegistry {
     private final AtomicInteger coalescedEvents = new AtomicInteger();
     private final VeloraHost host;
     private boolean frozen;
+    private volatile boolean closed;
     private EventDispatcherCallback dispatcher;
     private Consumer<String> overflowHandler;
 
@@ -54,6 +55,7 @@ public final class DefaultEventRegistry implements EventRegistry {
 
     @Override
     public <T> void emitSafe(EventKey<T> key, T payload) {
+        if (closed) throw new IllegalStateException("EventRegistry is closed");
         Objects.requireNonNull(key);
         EventDescriptor descriptor = find(key.id());
         if (descriptor == null) {
@@ -80,8 +82,17 @@ public final class DefaultEventRegistry implements EventRegistry {
         if (declared != Void.class && !declared.isAssignableFrom(keyType) && !keyType.isAssignableFrom(declared)) {
             throw new IllegalArgumentException("Event key payload type " + keyType.getTypeName() + " does not match registered Velora type " + descriptor.payloadType().name());
         }
+        validateRegisteredPayload(descriptor, payload);
     }
 
+
+    private void validateRegisteredPayload(EventDescriptor descriptor, Object payload) {
+        if (payload == null) return;
+        Class<?> declared = boxed(descriptor.payloadType().javaClass());
+        if (declared != Void.class && !declared.isInstance(payload)) {
+            throw new IllegalArgumentException("Payload for " + descriptor.id() + " must match registered Velora type " + descriptor.payloadType().name() + ", got " + payload.getClass().getTypeName());
+        }
+    }
 
     private long nanoTime() {
         return host != null && host.clock() != null ? host.clock().nanoTime() : System.nanoTime();
@@ -102,12 +113,20 @@ public final class DefaultEventRegistry implements EventRegistry {
 
     @Override
     public <T> void emitOnMain(EventKey<T> key, PayloadFactory<T> payloadFactory) {
+        if (closed) throw new IllegalStateException("EventRegistry is closed");
         Objects.requireNonNull(payloadFactory);
         if (host == null) {
             emitSafe(key, payloadFactory.create());
             return;
         }
-        host.mainThread().execute(() -> emitSafe(key, payloadFactory.create()));
+        host.mainThread().execute(() -> {
+            if (closed) return;
+            try {
+                emitSafe(key, payloadFactory.create());
+            } catch (IllegalStateException error) {
+                if (!closed) throw error;
+            }
+        });
     }
 
     @Override
@@ -166,6 +185,15 @@ public final class DefaultEventRegistry implements EventRegistry {
     public int queueDepth(String eventId) {
         EventQueue queue = queues.get(eventId);
         return queue != null ? queue.size() : 0;
+    }
+
+    public void close() {
+        closed = true;
+        dispatcher = null;
+        overflowHandler = null;
+        queues.clear();
+        totalQueueDepth.set(0);
+        diagnosticListeners.clear();
     }
 
     private void diagnostic(String eventId, EventDiagnostic.Type type) {
@@ -228,8 +256,10 @@ public final class DefaultEventRegistry implements EventRegistry {
                     diagnostic(descriptor.id(), EventDiagnostic.Type.COALESCED);
                 }
                 case COALESCE -> {
-                    PendingEvent previous = values.pollLast();
+                    PendingEvent previous = values.peekLast();
                     Object payload = previous == null ? event.payload() : descriptor.coalescer().apply(previous.payload(), event.payload());
+                    validateRegisteredPayload(descriptor, payload);
+                    if (previous != null) values.pollLast();
                     values.addLast(new PendingEvent(event.eventId(), payload, event.timestamp()));
                     coalescedEvents.incrementAndGet();
                     diagnostic(descriptor.id(), EventDiagnostic.Type.COALESCED);

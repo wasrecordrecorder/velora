@@ -36,7 +36,7 @@ public final class DefaultDebugService implements DebugService {
         var resources = scheduler.resources(scriptId);
         return new ProfilerSnapshot(scriptId, scheduler.tickTimeNanos(scriptId), scheduler.instructionsForScript(scriptId),
                 scheduler.totalApiCost(scriptId), resources.memoryUsed(), resources.fibers(), resources.tasks(),
-                resources.eventQueueSize() + base.eventQueueDepth(), base.droppedEvents(), scheduler.apiCalls(scriptId), scheduler.failures(scriptId),
+                base.eventQueueDepth(), base.droppedEvents(), scheduler.apiCalls(scriptId), scheduler.failures(scriptId),
                 scheduler.cancellations(scriptId), base.coalescedEvents(), base.maxQueueDepth());
     }
 

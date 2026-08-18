@@ -13,6 +13,7 @@ import io.velora.internal.lexer.LexerResult;
 import io.velora.internal.parser.Parser;
 import io.velora.internal.parser.ParseResult;
 import io.velora.internal.semantic.SemanticAnalyzer;
+import io.velora.internal.semantic.ResolvedScript;
 
 import java.util.*;
 
@@ -30,6 +31,7 @@ public final class DefaultEditorSession implements EditorSession {
     private long revisionToken = 0;
     private boolean closed = false;
     private EditorSnapshot cachedSnapshot;
+    private ResolvedScript cachedResolved;
 
     public DefaultEditorSession(String scriptId, String filePath) {
         this(scriptId, filePath, null, null, null, null, null, null);
@@ -64,6 +66,7 @@ public final class DefaultEditorSession implements EditorSession {
         content = next;
         revisionToken++;
         cachedSnapshot = null;
+        cachedResolved = null;
     }
 
     @Override
@@ -79,7 +82,7 @@ public final class DefaultEditorSession implements EditorSession {
             if (pr.scriptNode() != null && diagnostics.stream().noneMatch(Diagnostic::isError)
                     && typeRegistry != null && settingRegistry != null && apiRegistry != null && constantRegistry != null) {
                 SemanticAnalyzer analyzer = new SemanticAnalyzer(typeRegistry, settingRegistry, apiRegistry, constantRegistry, eventRegistry, javaImportRegistry);
-                analyzer.analyze(pr.scriptNode());
+                cachedResolved = analyzer.analyze(pr.scriptNode());
                 diagnostics.addAll(analyzer.diagnostics());
             }
         }
@@ -91,13 +94,15 @@ public final class DefaultEditorSession implements EditorSession {
     @Override
     public List<CompletionItem> completions(int line, int column) {
         ensureOpen();
-        return CompletionEngine.getCompletions(content, line, column, apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry, javaImportRegistry);
+        snapshot();
+        return CompletionEngine.getCompletions(content, line, column, apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry, javaImportRegistry, cachedResolved);
     }
 
     @Override
     public Optional<HoverInfo> hover(int line, int column) {
         ensureOpen();
-        return HoverEngine.getHover(content, line, column, filePath, apiRegistry, typeRegistry, constantRegistry, eventRegistry, javaImportRegistry);
+        snapshot();
+        return HoverEngine.getHover(content, line, column, filePath, apiRegistry, typeRegistry, constantRegistry, eventRegistry, javaImportRegistry, cachedResolved);
     }
 
     @Override
@@ -125,7 +130,7 @@ public final class DefaultEditorSession implements EditorSession {
     }
 
     @Override
-    public void close() { closed = true; cachedSnapshot = null; }
+    public void close() { closed = true; cachedSnapshot = null; cachedResolved = null; }
     public boolean isClosed() { return closed; }
     private void ensureOpen() { if (closed) throw new IllegalStateException("Editor session is closed"); }
 }

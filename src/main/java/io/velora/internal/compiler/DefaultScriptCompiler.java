@@ -156,7 +156,7 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
                 .toList();
         for (SourceFile source : ordered) {
             String path = normalizedSourcePath(source.relativePath());
-            hashInput.append(path).append('\0').append(source.contentHash()).append('\0');
+            hashInput.append(path).append('\0').append(SourceHash.compute(source.content())).append('\0');
             boolean declaresScript = new Lexer(source.content(), path).lex().tokens().stream().anyMatch(token -> token.type() == TokenType.KW_SCRIPT);
             if (declaresScript) {
                 if (mainSource != null) {
@@ -176,46 +176,70 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             return null;
         }
         List<SourceSpan> spans = new ArrayList<>();
-        int closingMergedLine = -1;
-        int closingSourceLine = -1;
         if (!helpers.isEmpty()) {
-            int lastBrace = mainSource.lastIndexOf('}');
+            int closingBrace = scriptClosingBrace(mainSource, mainPath);
             int capacity = mainSource.length() + helpers.stream().mapToInt(helper -> helper.content().length()).sum() + helpers.size() * 2;
             StringBuilder merged = new StringBuilder(capacity);
-            if (lastBrace >= 0) {
-                merged.append(mainSource, 0, lastBrace);
-                closingSourceLine = lineAt(mainSource, lastBrace);
-                for (SourceFile helper : helpers) appendHelper(merged, helper, spans, true);
-                closingMergedLine = lineAt(merged, merged.length());
-                merged.append('}');
+            if (closingBrace >= 0) {
+                int insertion = lineInsertionOffset(mainSource, closingBrace);
+                merged.append(mainSource, 0, insertion);
+                if (!merged.isEmpty() && merged.charAt(merged.length() - 1) != '\n') merged.append('\n');
+                for (SourceFile helper : helpers) appendHelper(merged, helper, spans);
+                int suffixStartLine = lineAt(merged, merged.length());
+                int sourceStartLine = lineAt(mainSource, insertion);
+                merged.append(mainSource, insertion, mainSource.length());
+                spans.add(new SourceSpan(suffixStartLine, lineAt(merged, merged.length()) + 1, mainPath, sourceStartLine));
             } else {
                 merged.append(mainSource);
-                for (SourceFile helper : helpers) appendHelper(merged, helper, spans, false);
+                if (!merged.isEmpty() && merged.charAt(merged.length() - 1) != '\n') merged.append('\n');
+                for (SourceFile helper : helpers) appendHelper(merged, helper, spans);
             }
             mainSource = merged.toString();
         }
-        return new SourceBundle(mainSource, mainPath, SourceHash.compute(hashInput.toString()), List.copyOf(spans), closingMergedLine, closingSourceLine);
+        return new SourceBundle(mainSource, mainPath, SourceHash.compute(hashInput.toString()), List.copyOf(spans));
     }
 
-    private void appendHelper(StringBuilder merged, SourceFile helper, List<SourceSpan> spans, boolean trailingNewline) {
-        merged.append('\n');
+    private int scriptClosingBrace(String source, String filePath) {
+        List<io.velora.internal.lexer.Token> tokens = new Lexer(source, filePath).lex().tokens();
+        int script = -1;
+        for (int i = 0; i < tokens.size(); i++) {
+            if (tokens.get(i).type() == TokenType.KW_SCRIPT) {
+                script = i;
+                break;
+            }
+        }
+        if (script < 0) return -1;
+        int depth = 0;
+        boolean opened = false;
+        for (int i = script + 1; i < tokens.size(); i++) {
+            var token = tokens.get(i);
+            if (token.type() == TokenType.LBRACE) {
+                depth++;
+                opened = true;
+            } else if (token.type() == TokenType.RBRACE && opened && --depth == 0) {
+                return token.offset();
+            }
+        }
+        return -1;
+    }
+
+    private int lineInsertionOffset(String source, int offset) {
+        int lineStart = source.lastIndexOf('\n', Math.max(0, offset - 1)) + 1;
+        for (int i = lineStart; i < offset; i++) if (!Character.isWhitespace(source.charAt(i))) return offset;
+        return lineStart;
+    }
+
+    private void appendHelper(StringBuilder merged, SourceFile helper, List<SourceSpan> spans) {
         int startLine = lineAt(merged, merged.length());
         merged.append(helper.content());
-        int endLine = startLine + countNewlines(helper.content());
-        spans.add(new SourceSpan(startLine, endLine, normalizedSourcePath(helper.relativePath())));
-        if (trailingNewline) merged.append('\n');
+        if (merged.isEmpty() || merged.charAt(merged.length() - 1) != '\n') merged.append('\n');
+        spans.add(new SourceSpan(startLine, lineAt(merged, merged.length()), normalizedSourcePath(helper.relativePath()), 1));
     }
 
     private int lineAt(CharSequence source, int offset) {
         int line = 1;
         for (int i = 0; i < offset; i++) if (source.charAt(i) == '\n') line++;
         return line;
-    }
-
-    private int countNewlines(CharSequence source) {
-        int count = 0;
-        for (int i = 0; i < source.length(); i++) if (source.charAt(i) == '\n') count++;
-        return count;
     }
 
     @Override
@@ -282,12 +306,12 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
         return parts.isEmpty() ? null : String.join("/", parts);
     }
 
-    private record SourceSpan(int startLine, int endLine, String filePath) {
-        private boolean contains(int line) { return line >= startLine && line <= endLine; }
-        private int sourceLine(int line) { return line - startLine + 1; }
+    private record SourceSpan(int startLine, int endLineExclusive, String filePath, int sourceStartLine) {
+        private boolean contains(int line) { return line >= startLine && line < endLineExclusive; }
+        private int sourceLine(int line) { return sourceStartLine + line - startLine; }
     }
 
-    private record SourceBundle(String source, String filePath, String sourceHash, List<SourceSpan> spans, int closingMergedLine, int closingSourceLine) {
+    private record SourceBundle(String source, String filePath, String sourceHash, List<SourceSpan> spans) {
         private List<Diagnostic> remap(List<Diagnostic> diagnostics) {
             if (spans.isEmpty()) return List.copyOf(diagnostics);
             return diagnostics.stream().map(this::remap).toList();
@@ -301,9 +325,6 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
                 int start = span.sourceLine(range.startLine());
                 int end = span.contains(range.endLine()) ? span.sourceLine(range.endLine()) : start;
                 return new Diagnostic(diagnostic.severity(), diagnostic.code(), diagnostic.message(), SourceRange.of(span.filePath(), start, range.startColumn(), end, range.endColumn()));
-            }
-            if (range.startLine() == closingMergedLine && closingSourceLine > 0) {
-                return new Diagnostic(diagnostic.severity(), diagnostic.code(), diagnostic.message(), SourceRange.of(filePath, closingSourceLine, range.startColumn(), closingSourceLine, range.endColumn()));
             }
             return diagnostic;
         }
@@ -388,7 +409,7 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
 
     public static CompiledModule deserializeBytecode(byte[] data,
                                                       List<io.velora.api.setting.SettingDescriptor> settings) {
-        if (data == null || data.length == 0) return null;
+        if (data == null || data.length == 0 || data.length > 64 * 1024 * 1024) return null;
         try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(data))) {
             if (!"VLCB".equals(in.readUTF())) return null;
             int format = in.readInt();
@@ -402,6 +423,7 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             String registryHash = readString(in, format);
 
             int poolSize = readCount(in, 1_000_000);
+            requireRemaining(in, poolSize, 4);
             ConstantPool pool = new ConstantPool();
             ConstantPool.Tag[] tags = ConstantPool.Tag.values();
             for (int i = 0; i < poolSize; i++) {
@@ -420,6 +442,7 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             }
 
             int functionCount = readCount(in, 100_000);
+            requireRemaining(in, functionCount, 28);
             List<CompiledFunction> functions = new ArrayList<>(functionCount);
             for (int i = 0; i < functionCount; i++) {
                 String name = readString(in, format);
@@ -430,9 +453,11 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
                 boolean suspending = in.readBoolean();
                 boolean lifecycle = in.readBoolean();
                 int codeLength = readCount(in, 16_000_000);
+                requireRemaining(in, codeLength, Integer.BYTES);
                 int[] code = new int[codeLength];
                 for (int j = 0; j < codeLength; j++) code[j] = in.readInt();
                 int lineLength = readCount(in, 16_000_000);
+                requireRemaining(in, lineLength, Integer.BYTES);
                 int[] lines = new int[lineLength];
                 for (int j = 0; j < lineLength; j++) lines[j] = in.readInt();
                 functions.add(new CompiledFunction(name, index, parameterCount, localCount, maxStack, suspending, lifecycle, code, lines));
@@ -441,14 +466,17 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             List<String> persistentFieldIds = readStrings(in, format, 1_000_000);
             List<String> persistentFieldTypes = readStrings(in, format, 1_000_000);
             int indexCount = readCount(in, 1_000_000);
+            requireRemaining(in, indexCount, Integer.BYTES);
             List<Integer> persistentFieldIndices = new ArrayList<>(indexCount);
             for (int i = 0; i < indexCount; i++) persistentFieldIndices.add(in.readInt());
             int staticCount = readCount(in, 1_000_000);
+            requireRemaining(in, staticCount, 1);
             List<Boolean> persistentFieldIsStatic = new ArrayList<>(staticCount);
             for (int i = 0; i < staticCount; i++) persistentFieldIsStatic.add(in.readBoolean());
             List<String> lifecycleHooks = readStrings(in, format, 100_000);
 
             int handlerCount = readCount(in, 1_000_000);
+            requireRemaining(in, handlerCount, 9);
             List<CompiledModule.EventHandlerInfo> eventHandlers = new ArrayList<>(handlerCount);
             for (int i = 0; i < handlerCount; i++) {
                 eventHandlers.add(new CompiledModule.EventHandlerInfo(readString(in, format), readString(in, format), in.readInt(), in.readBoolean()));
@@ -459,13 +487,15 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             String description = null;
             if (format >= 2) {
                 int initializerCount = readCount(in, 1_000_000);
+                requireRemaining(in, initializerCount, 6);
                 for (int i = 0; i < initializerCount; i++) {
-                    initializers.add(new CompiledModule.FieldInitializer(in.readInt(), in.readBoolean(), readValue(in)));
+                    initializers.add(new CompiledModule.FieldInitializer(in.readInt(), in.readBoolean(), readValue(in, 0)));
                 }
                 author = emptyToNull(readString(in, format));
                 description = emptyToNull(readString(in, format));
             }
 
+            if (in.available() != 0) return null;
             CompiledModule module = new CompiledModule(scriptId, scriptName, version, languageVersion,
                     sourceHash, registryHash, pool, functions, settings,
                     persistentFieldIds, persistentFieldTypes, persistentFieldIndices, persistentFieldIsStatic,
@@ -483,6 +513,7 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
 
     private static List<String> readStrings(DataInputStream in, int format, int maxCount) throws IOException {
         int count = readCount(in, maxCount);
+        requireRemaining(in, count, format == 1 ? 2 : Integer.BYTES);
         List<String> values = new ArrayList<>(count);
         for (int i = 0; i < count; i++) values.add(readString(in, format));
         return values;
@@ -497,6 +528,7 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
     private static String readString(DataInputStream in, int format) throws IOException {
         if (format == 1) return in.readUTF();
         int length = readCount(in, 16_000_000);
+        if (length > in.available()) throw new EOFException();
         byte[] bytes = in.readNBytes(length);
         if (bytes.length != length) throw new EOFException();
         return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
@@ -506,6 +538,10 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
         int count = in.readInt();
         if (count < 0 || count > max) throw new IOException("Invalid count: " + count);
         return count;
+    }
+
+    private static void requireRemaining(DataInputStream in, int count, int minimumBytes) throws IOException {
+        if ((long) count * minimumBytes > in.available()) throw new EOFException();
     }
 
     private static void writeValue(DataOutputStream out, ScriptValue value) throws IOException {
@@ -539,7 +575,8 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
         throw new IllegalArgumentException("Unsupported field initializer value: " + value.getClass().getSimpleName());
     }
 
-    private static ScriptValue readValue(DataInputStream in) throws IOException {
+    private static ScriptValue readValue(DataInputStream in, int depth) throws IOException {
+        if (depth > 64) throw new IOException("Initializer nesting is too deep");
         return switch (in.readUnsignedByte()) {
             case 0 -> PrimitiveValue.nullValue();
             case 1 -> PrimitiveValue.of(in.readInt());
@@ -552,20 +589,23 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             case 8 -> new StringValue(readString(in, 2));
             case 9 -> {
                 int count = readCount(in, 1_000_000);
+                requireRemaining(in, count, 1);
                 List<ScriptValue> values = new ArrayList<>(count);
-                for (int i = 0; i < count; i++) values.add(readValue(in));
+                for (int i = 0; i < count; i++) values.add(readValue(in, depth + 1));
                 yield new ListValue(values);
             }
             case 10 -> {
                 int count = readCount(in, 1_000_000);
+                requireRemaining(in, count, 1);
                 Set<ScriptValue> values = new LinkedHashSet<>();
-                for (int i = 0; i < count; i++) values.add(readValue(in));
+                for (int i = 0; i < count; i++) values.add(readValue(in, depth + 1));
                 yield new SetValue(values);
             }
             case 11 -> {
                 int count = readCount(in, 1_000_000);
+                requireRemaining(in, count, 2);
                 Map<ScriptValue, ScriptValue> values = new LinkedHashMap<>();
-                for (int i = 0; i < count; i++) values.put(readValue(in), readValue(in));
+                for (int i = 0; i < count; i++) values.put(readValue(in, depth + 1), readValue(in, depth + 1));
                 yield new MapValue(values);
             }
             default -> throw new IOException("Invalid initializer value tag");

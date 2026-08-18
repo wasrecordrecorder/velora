@@ -17,9 +17,58 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.*;
 
 class EventRuntimeV2Test {
+    @Test
+    void emittedPayloadMustMatchRegisteredVeloraType() {
+        DefaultEventRegistry events = new DefaultEventRegistry();
+        events.register(EventDescriptor.builder("runtime.text").scriptName("Text").payloadType(VeloraTypes.STRING).build());
+        EventKey<Object> broadKey = EventKey.of("runtime.text", Object.class);
+        assertDoesNotThrow(() -> events.emitSafe(broadKey, "ok"));
+        assertThrows(IllegalArgumentException.class, () -> events.emitSafe(broadKey, 42));
+    }
+
+    @Test
+    void coalescerFailureDoesNotCorruptQueuedEvent() {
+        DefaultEventRegistry events = new DefaultEventRegistry();
+        events.register(EventDescriptor.builder("runtime.coalesce-failure")
+                .scriptName("CoalesceFailure")
+                .payloadType(VeloraTypes.INT)
+                .queueLimit(1)
+                .overflowPolicy(EventOverflowPolicy.COALESCE)
+                .coalescer((left, right) -> { throw new IllegalStateException("boom"); })
+                .build());
+        List<Integer> delivered = new ArrayList<>();
+        events.setDispatcher((eventId, payload) -> delivered.add((Integer) payload));
+        EventKey<Integer> key = EventKey.of("runtime.coalesce-failure", Integer.class);
+        events.emitSafe(key, 1);
+        assertThrows(IllegalStateException.class, () -> events.emitSafe(key, 2));
+        assertEquals(1, events.totalQueueDepth());
+        events.dispatchPending();
+        assertEquals(List.of(1), delivered);
+        assertEquals(0, events.totalQueueDepth());
+    }
+
+    @Test
+    void coalescerCannotProduceWrongPayloadType() {
+        DefaultEventRegistry events = new DefaultEventRegistry();
+        events.register(EventDescriptor.builder("runtime.coalesce-type")
+                .scriptName("CoalesceType")
+                .payloadType(VeloraTypes.INT)
+                .queueLimit(1)
+                .overflowPolicy(EventOverflowPolicy.COALESCE)
+                .coalescer((left, right) -> "bad")
+                .build());
+        List<Integer> delivered = new ArrayList<>();
+        events.setDispatcher((eventId, payload) -> delivered.add((Integer) payload));
+        EventKey<Integer> key = EventKey.of("runtime.coalesce-type", Integer.class);
+        events.emitSafe(key, 1);
+        assertThrows(IllegalArgumentException.class, () -> events.emitSafe(key, 2));
+        events.dispatchPending();
+        assertEquals(List.of(1), delivered);
+    }
+
     @Test
     void everyOverflowPolicyHasDeterministicQueueSemantics() {
         assertOverflow(EventOverflowPolicy.DROP_NEWEST, List.of(1, 2), false);
@@ -36,6 +85,43 @@ class EventRuntimeV2Test {
         assertConcurrency(EventConcurrency.RESTART, List.of(3));
         assertConcurrency(EventConcurrency.QUEUE, List.of(1, 2, 3));
         assertConcurrency(EventConcurrency.PARALLEL, List.of(1, 2, 3));
+    }
+
+    @Test
+    void queuedMainThreadEmissionIsDroppedAfterRegistryClose() {
+        List<Runnable> mainActions = new ArrayList<>();
+        VeloraHost host = new VeloraHost() {
+            @Override public String id() { return "event-close"; }
+            @Override public String version() { return "1"; }
+            @Override public MainThreadExecutor mainThread() { return new MainThreadExecutor() {
+                @Override public boolean isMainThread() { return false; }
+                @Override public void execute(Runnable action) { mainActions.add(action); }
+            }; }
+            @Override public WorkerExecutor workers() { return new WorkerExecutor() {
+                @Override public void execute(Runnable action) { action.run(); }
+                @Override public void shutdown() {}
+            }; }
+            @Override public VeloraClock clock() { return new VeloraClock() {
+                @Override public long nanoTime() { return System.nanoTime(); }
+                @Override public long currentTimeMillis() { return System.currentTimeMillis(); }
+            }; }
+            @Override public VeloraLogger logger() { return new VeloraLogger() {
+                @Override public void debug(String message) {}
+                @Override public void info(String message) {}
+                @Override public void warn(String message) {}
+                @Override public void error(String message, Throwable error) {}
+            }; }
+            @Override public VeloraFileSystem fileSystem() { return null; }
+        };
+        DefaultEventRegistry events = new DefaultEventRegistry(host);
+        events.register(EventDescriptor.builder("runtime.close").scriptName("CloseEvent").payloadType(VeloraTypes.INT).build());
+        int[] created = {0};
+        events.emitOnMain(EventKey.of("runtime.close", Integer.class), () -> ++created[0]);
+        assertEquals(1, mainActions.size());
+        events.close();
+        assertDoesNotThrow(mainActions.getFirst()::run);
+        assertEquals(0, created[0]);
+        assertEquals(0, events.totalQueueDepth());
     }
 
     @Test
@@ -249,6 +335,61 @@ class EventRuntimeV2Test {
         engine.tick();
         assertEquals(2L, output.stream().filter("unit-event"::equals).count());
         assertEquals(List.of(), engine.debug().errors("unit-queue"));
+        engine.close();
+    }
+
+    @Test
+    void restartReplacesRunningHandlerAtFiberLimit() throws Exception {
+        java.nio.file.Path root = java.nio.file.Files.createTempDirectory("velora-event-restart-");
+        List<Integer> recorded = new ArrayList<>();
+        VeloraHost host = new VeloraHost() {
+            @Override public String id() { return "event-restart"; }
+            @Override public String version() { return "1"; }
+            @Override public MainThreadExecutor mainThread() { return new MainThreadExecutor() {
+                @Override public boolean isMainThread() { return true; }
+                @Override public void execute(Runnable action) { action.run(); }
+            }; }
+            @Override public WorkerExecutor workers() { return new WorkerExecutor() {
+                @Override public void execute(Runnable action) { action.run(); }
+                @Override public void shutdown() {}
+            }; }
+            @Override public VeloraClock clock() { return new VeloraClock() {
+                @Override public long nanoTime() { return System.nanoTime(); }
+                @Override public long currentTimeMillis() { return System.currentTimeMillis(); }
+            }; }
+            @Override public VeloraLogger logger() { return new VeloraLogger() {
+                @Override public void debug(String message) {}
+                @Override public void info(String message) {}
+                @Override public void warn(String message) {}
+                @Override public void error(String message, Throwable error) {}
+            }; }
+            @Override public VeloraFileSystem fileSystem() { return VeloraFileSystem.local(root); }
+        };
+        var limits = io.velora.api.VeloraLimits.builder().maxFibersPerScript(1).build();
+        io.velora.api.VeloraEngine engine = io.velora.api.Velora.builder().host(host).limits(limits).build();
+        engine.api().namespace("probe", ns -> ns.function("record", VeloraTypes.UNIT, p -> p.required("value", VeloraTypes.INT), ctx -> {
+            recorded.add(ctx.argument(0, int.class));
+            return null;
+        }));
+        engine.events().register(EventDescriptor.builder("runtime.restart")
+                .scriptName("RestartEvent")
+                .payloadType(VeloraTypes.INT)
+                .defaultConcurrency(EventConcurrency.RESTART)
+                .build());
+        engine.freeze();
+        String source = "@Script(\"RestartScript\")\n@Version(\"1\")\nscript RestartScript { @RestartEvent async RestartEvent(int value) { delay(15.milliseconds)\n probe.record(value) } }";
+        assertEquals(true, engine.scripts().create(io.velora.api.script.ScriptCreateRequest.builder("restart", "RestartScript").file("main.vls", source).build()).success());
+        assertEquals(true, engine.scripts().enable("restart").success());
+        EventKey<Integer> key = EventKey.of("runtime.restart", Integer.class);
+        engine.events().emitSafe(key, 1);
+        engine.tick();
+        engine.events().emitSafe(key, 2);
+        engine.tick();
+        engine.tick();
+        Thread.sleep(20);
+        engine.tick();
+        assertEquals(List.of(2), recorded);
+        assertEquals(1L, engine.debug().profiler("restart").cancellations());
         engine.close();
     }
 

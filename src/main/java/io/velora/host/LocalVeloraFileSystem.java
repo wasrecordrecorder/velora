@@ -48,8 +48,8 @@ public final class LocalVeloraFileSystem implements VeloraFileSystem {
                 String scriptId = scriptDir.getFileName().toString();
                 if (!isScriptId(scriptId)) continue;
                 try (var files = Files.walk(scriptDir)) {
-                    for (Path file : files.filter(Files::isRegularFile).filter(path -> isSource(scriptDir, path)).toList()) {
-                        BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
+                    for (Path file : files.filter(path -> Files.isRegularFile(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)).filter(path -> !Files.isSymbolicLink(path)).filter(path -> isSource(scriptDir, path)).toList()) {
+                        BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class, java.nio.file.LinkOption.NOFOLLOW_LINKS);
                         result.add(new ScriptFileEntry(scriptId, relative(scriptDir, file), attrs.size(), attrs.lastModifiedTime().toMillis() * 1_000_000L));
                     }
                 }
@@ -77,7 +77,7 @@ public final class LocalVeloraFileSystem implements VeloraFileSystem {
     }
 
     @Override
-    public FileRevision writeAtomic(String scriptId, String relativePath, String content, FileRevision expectedRevision) {
+    public synchronized FileRevision writeAtomic(String scriptId, String relativePath, String content, FileRevision expectedRevision) {
         Objects.requireNonNull(content, "content");
         String path = normalizeSourcePath(relativePath);
         if (!matches(scriptId, path, expectedRevision)) throw new IllegalStateException("Revision conflict for " + scriptId + "/" + path);
@@ -104,7 +104,7 @@ public final class LocalVeloraFileSystem implements VeloraFileSystem {
     }
 
     @Override
-    public void writeDataAtomic(String scriptId, String key, byte[] data) {
+    public synchronized void writeDataAtomic(String scriptId, String key, byte[] data) {
         writeAtomic(dataPath(scriptId, key), Objects.requireNonNull(data, "data"));
     }
 
@@ -114,7 +114,7 @@ public final class LocalVeloraFileSystem implements VeloraFileSystem {
     }
 
     @Override
-    public void deleteScript(String scriptId) {
+    public synchronized void deleteScript(String scriptId) {
         Path dir = scriptDir(scriptId);
         if (!Files.exists(dir)) return;
         try {
@@ -301,6 +301,12 @@ public final class LocalVeloraFileSystem implements VeloraFileSystem {
 
         @Override
         public boolean commit() {
+            synchronized (LocalVeloraFileSystem.this) {
+                return commitLocked();
+            }
+        }
+
+        private boolean commitLocked() {
             ensureOpen();
             for (Map.Entry<String, FileRevision> check : checks.entrySet()) if (!matches(scriptId, check.getKey(), check.getValue())) return false;
             for (Map.Entry<String, Write> write : writes.entrySet()) if (!matches(scriptId, write.getKey(), write.getValue().expected())) return false;
@@ -340,7 +346,7 @@ public final class LocalVeloraFileSystem implements VeloraFileSystem {
                 committed = true;
                 cleanup(transactionRoot);
                 return true;
-            } catch (Throwable error) {
+            } catch (IOException | RuntimeException error) {
                 try {
                     Set<String> affected = new LinkedHashSet<>(deletes);
                     affected.addAll(writes.keySet());
@@ -356,7 +362,7 @@ public final class LocalVeloraFileSystem implements VeloraFileSystem {
                             Files.deleteIfExists(target);
                         }
                     }
-                } catch (IOException rollbackError) {
+                } catch (IOException | RuntimeException rollbackError) {
                     error.addSuppressed(rollbackError);
                 }
                 cleanup(transactionRoot);

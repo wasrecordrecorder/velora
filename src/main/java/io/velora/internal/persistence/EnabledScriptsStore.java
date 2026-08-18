@@ -1,12 +1,15 @@
 package io.velora.internal.persistence;
 
 import io.velora.host.VeloraFileSystem;
-import java.util.*;
+
+import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashSet;
+import java.util.Set;
 
 public final class EnabledScriptsStore {
+    private static final String ENABLED_FILE = "enabled.velora";
     private final Set<String> enabled = new LinkedHashSet<>();
     private final VeloraFileSystem fileSystem;
-    private static final String ENABLED_FILE = "enabled.velora";
 
     public EnabledScriptsStore() {
         this(null);
@@ -16,58 +19,55 @@ public final class EnabledScriptsStore {
         this.fileSystem = fileSystem;
     }
 
-    public void enable(String scriptId) {
+    public synchronized boolean enable(String scriptId) {
         enabled.add(scriptId);
-        persist();
+        return persist();
     }
 
-    public void disable(String scriptId) {
+    public synchronized boolean disable(String scriptId) {
         enabled.remove(scriptId);
-        persist();
+        return persist();
     }
 
-    public boolean isEnabled(String scriptId) {
+    public synchronized boolean isEnabled(String scriptId) {
         return enabled.contains(scriptId);
     }
 
-    public Set<String> enabledScripts() {
+    public synchronized Set<String> enabledScripts() {
         return Set.copyOf(enabled);
     }
 
-    public void clear() {
+    public synchronized boolean clear() {
         enabled.clear();
-        persist();
+        return persist();
     }
 
-    public void load() {
-        if (fileSystem == null) return;
+    public synchronized boolean load() {
+        if (fileSystem == null) return true;
         try {
             byte[] data = fileSystem.readData("", ENABLED_FILE);
+            Set<String> loaded = new LinkedHashSet<>();
             if (data != null && data.length > 0) {
-                String content = new String(data, java.nio.charset.StandardCharsets.UTF_8);
-                for (String line : content.split("\n")) {
+                for (String line : new String(data, StandardCharsets.UTF_8).split("\n")) {
                     String id = line.trim();
-                    if (!id.isEmpty()) {
-                        enabled.add(id);
-                    }
+                    if (!id.isEmpty()) loaded.add(id);
                 }
             }
-        } catch (Throwable ignored) {
-            // best-effort load
+            enabled.clear();
+            enabled.addAll(loaded);
+            return true;
+        } catch (RuntimeException ignored) {
+            return false;
         }
     }
 
-    private void persist() {
-        if (fileSystem == null) return;
+    private boolean persist() {
+        if (fileSystem == null) return true;
         try {
-            StringBuilder sb = new StringBuilder();
-            for (String id : enabled) {
-                if (sb.length() > 0) sb.append("\n");
-                sb.append(id);
-            }
-            fileSystem.writeDataAtomic("", ENABLED_FILE, sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        } catch (Throwable ignored) {
-            // best-effort persist
+            fileSystem.writeDataAtomic("", ENABLED_FILE, String.join("\n", enabled).getBytes(StandardCharsets.UTF_8));
+            return true;
+        } catch (RuntimeException ignored) {
+            return false;
         }
     }
 }

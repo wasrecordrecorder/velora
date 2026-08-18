@@ -62,19 +62,19 @@ public final class BytecodeWriter {
 
     private CompiledFunction compileFunction(IrFunction fn, ConstantPool pool) {
         List<Integer> code = new ArrayList<>();
-        List<Integer> lineOffsets = new ArrayList<>();
-        List<Integer> lineNumbers = new ArrayList<>();
-
         Map<Integer, Integer> instrIndexToOffset = new HashMap<>();
+        Map<Integer, Integer> linesByOffset = new HashMap<>();
         int instrIndex = 0;
+        int currentLine = 0;
         for (IrBlock block : fn.blocks()) {
             for (IrInstruction instr : block.instructions()) {
                 int offset = code.size();
                 instrIndexToOffset.put(instrIndex, offset);
-                writeInstruction(instr, code, pool);
                 if (instr instanceof IrInstruction.Line line) {
-                    lineOffsets.add(offset);
-                    lineNumbers.add(line.lineNumber());
+                    currentLine = line.lineNumber();
+                } else {
+                    writeInstruction(instr, code, pool);
+                    if (currentLine > 0) linesByOffset.put(offset, currentLine);
                 }
                 instrIndex++;
             }
@@ -96,8 +96,8 @@ public final class BytecodeWriter {
         }
 
         int[] codeArray = code.stream().mapToInt(Integer::intValue).toArray();
-        int[] lineOffsetsArray = lineOffsets.stream().mapToInt(Integer::intValue).toArray();
-        int[] lineNumbersArray = lineNumbers.stream().mapToInt(Integer::intValue).toArray();
+        int[] lineNumbersArray = new int[codeArray.length];
+        for (var entry : linesByOffset.entrySet()) lineNumbersArray[entry.getKey()] = entry.getValue();
 
         return new CompiledFunction(fn.name(), fn.index(), fn.parameters().size(),
                 fn.localCount(), fn.maxStack(), fn.suspending(), fn.isLifecycle(),

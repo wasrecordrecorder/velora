@@ -13,6 +13,11 @@ public record CompileResult(
     public CompileResult {
         java.util.Objects.requireNonNull(scriptId);
         diagnostics = diagnostics == null ? List.of() : List.copyOf(diagnostics);
+        bytecode = bytecode == null ? null : bytecode.clone();
+    }
+
+    public byte[] bytecode() {
+        return bytecode == null ? null : bytecode.clone();
     }
 
     public static CompileResult success(String scriptId, byte[] bytecode, String registryHash, String sourceHash) {

@@ -24,6 +24,7 @@ import io.velora.internal.vm.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
 
 public final class ScriptScheduler implements VmHost {
@@ -50,6 +51,7 @@ public final class ScriptScheduler implements VmHost {
     private final Map<String, Set<Long>> fibersByScript = new HashMap<>();
     private final Map<String, Map<Long, VeloraTask<?>>> tasksByScript = new HashMap<>();
     private final Map<String, ResourceCounter> resourcesByScript = new HashMap<>();
+    private final Map<String, Long> persistentMemoryByScript = new HashMap<>();
     private final Map<String, Integer> apiCostByScript = new HashMap<>();
     private final Map<String, Long> totalApiCostByScript = new HashMap<>();
     private final Map<String, Long> apiCallsByScript = new HashMap<>();
@@ -63,6 +65,7 @@ public final class ScriptScheduler implements VmHost {
     private final ConstantRegistry constantRegistry;
     private final TypeRegistry typeRegistry;
     private final LongSupplier nanoTime;
+    private final BooleanSupplier mainThread;
     private long currentFiberId;
     private long currentTickNanos;
 
@@ -83,6 +86,10 @@ public final class ScriptScheduler implements VmHost {
     }
 
     public ScriptScheduler(VeloraLimits limits, ApiRegistry apiRegistry, RuntimeErrorStore errorStore, WorkerExecutor workerExecutor, ConstantRegistry constantRegistry, TypeRegistry typeRegistry, LongSupplier nanoTime) {
+        this(limits, apiRegistry, errorStore, workerExecutor, constantRegistry, typeRegistry, nanoTime, () -> true);
+    }
+
+    public ScriptScheduler(VeloraLimits limits, ApiRegistry apiRegistry, RuntimeErrorStore errorStore, WorkerExecutor workerExecutor, ConstantRegistry constantRegistry, TypeRegistry typeRegistry, LongSupplier nanoTime, BooleanSupplier mainThread) {
         this.limits = limits;
         this.apiRegistry = apiRegistry;
         this.errorStore = errorStore;
@@ -90,6 +97,7 @@ public final class ScriptScheduler implements VmHost {
         this.constantRegistry = constantRegistry;
         this.typeRegistry = typeRegistry;
         this.nanoTime = Objects.requireNonNull(nanoTime);
+        this.mainThread = Objects.requireNonNull(mainThread);
         this.budget = new SchedulerBudget(limits);
     }
 
@@ -110,11 +118,10 @@ public final class ScriptScheduler implements VmHost {
     private ScriptFiber spawnInternal(String scriptId, int functionIndex, ScriptValue[] args, long parentId, boolean pending, boolean eventFiber) {
         ResourceCounter counter = resourcesByScript.computeIfAbsent(scriptId, key -> new ResourceCounter());
         if (limits.maxFibersPerScript() > 0 && counter.fibers() >= limits.maxFibersPerScript()) return null;
-        if (eventFiber && limits.maxEventQueuePerScript() > 0 && counter.eventQueueSize() >= limits.maxEventQueuePerScript()) return null;
         long memory;
         try { memory = estimateValues(args) + 256L; }
         catch (ResourceLimitViolation ignored) { return null; }
-        if (limits.memoryPerScript() > 0 && counter.memoryUsed() + memory > limits.memoryPerScript()) return null;
+        if (exceedsMemory(counter.memoryUsed(), memory)) return null;
         ScriptFiber fiber = new ScriptFiber(nextFiberId++, scriptId, functionIndex, args, nanoTime.getAsLong());
         fiber.parentId(parentId);
         fiber.eventFiber(eventFiber);
@@ -123,24 +130,22 @@ public final class ScriptScheduler implements VmHost {
         fibersByScript.computeIfAbsent(scriptId, key -> new HashSet<>()).add(fiber.id());
         counter.reserveFiber();
         counter.reserveMemory(memory);
-        if (eventFiber) counter.reserveEvent();
         if (parentId >= 0) cancellationTree.addChild(parentId, fiber.id());
         if (pending) pendingQueue.add(fiber); else readyQueue.add(fiber);
         return fiber;
     }
 
-    public void spawnFiberAndAwait(String scriptId, int functionIndex, ScriptValue[] args,
-                                     Map<String, CompiledModule> modules,
-                                     Map<String, List<io.velora.api.setting.SettingDescriptor>> settings) {
+    public ScriptFiber spawnFiberAndAwait(String scriptId, int functionIndex, ScriptValue[] args,
+                                            Map<String, CompiledModule> modules,
+                                            Map<String, List<io.velora.api.setting.SettingDescriptor>> settings) {
         ScriptFiber fiber = spawnFiber(scriptId, functionIndex, args);
-        if (fiber == null) return;
-        while (fiber.state() != FiberState.COMPLETED && fiber.state() != FiberState.FAILED && fiber.state() != FiberState.CANCELLED) {
-            tick(nanoTime.getAsLong(), modules, settings);
-        }
+        if (fiber == null) return null;
+        while (!fiber.isDone()) tick(nanoTime.getAsLong(), modules, settings);
+        return fiber;
     }
 
-    public void spawnFiberAndAwait(String scriptId, int functionIndex, ScriptValue[] args) {
-        spawnFiberAndAwait(scriptId, functionIndex, args, Map.of(), Map.of());
+    public ScriptFiber spawnFiberAndAwait(String scriptId, int functionIndex, ScriptValue[] args) {
+        return spawnFiberAndAwait(scriptId, functionIndex, args, Map.of(), Map.of());
     }
 
     public void cancelFiber(long fiberId) {
@@ -161,6 +166,11 @@ public final class ScriptScheduler implements VmHost {
     @Override
     public long nanoTime() {
         return nanoTime.getAsLong();
+    }
+
+    @Override
+    public boolean isMainThread() {
+        return mainThread.getAsBoolean();
     }
 
     @Override
@@ -195,9 +205,6 @@ public final class ScriptScheduler implements VmHost {
         ResourceCounter counter = resourcesByScript.computeIfAbsent(scriptId, key -> new ResourceCounter());
         if (limits.maxTasksPerScript() > 0 && counter.tasks() >= limits.maxTasksPerScript()) return 0;
         long taskId = nextTaskId--;
-        counter.reserveTask();
-        awaitFiber(fiberId, taskId);
-        tasksByScript.computeIfAbsent(scriptId, key -> new HashMap<>()).put(taskId, task);
         task.onComplete(completed -> {
             try {
                 if (completed.state() == TaskState.SUCCEEDED) {
@@ -212,6 +219,9 @@ public final class ScriptScheduler implements VmHost {
                 completionQueue.offer(taskId, false, PrimitiveValue.nullValue(), error);
             }
         });
+        counter.reserveTask();
+        tasksByScript.computeIfAbsent(scriptId, key -> new HashMap<>()).put(taskId, task);
+        awaitFiber(fiberId, taskId);
         return taskId;
     }
 
@@ -283,8 +293,9 @@ public final class ScriptScheduler implements VmHost {
 
     private boolean consumeApiCost(String scriptId, int cost) {
         int used = apiCostByScript.getOrDefault(scriptId, 0);
-        if (limits.apiCostPerScriptTick() > 0 && used + cost > limits.apiCostPerScriptTick()) return false;
-        apiCostByScript.put(scriptId, used + cost);
+        long next = (long) used + cost;
+        if (next > limits.apiCostPerScriptTick()) return false;
+        apiCostByScript.put(scriptId, (int) next);
         totalApiCostByScript.merge(scriptId, (long) cost, Long::sum);
         return true;
     }
@@ -318,6 +329,7 @@ public final class ScriptScheduler implements VmHost {
         initializedScripts.remove(scriptId);
         settingStores.remove(scriptId);
         resourcesByScript.remove(scriptId);
+        persistentMemoryByScript.remove(scriptId);
         apiCostByScript.remove(scriptId);
         tickTimeByScript.remove(scriptId);
     }
@@ -450,9 +462,7 @@ public final class ScriptScheduler implements VmHost {
             }
             if (fiber.pendingApiCost() > 0) {
                 if (!consumeApiCost(fiber.scriptId(), fiber.pendingApiCost())) {
-                    fiber.error(new RuntimeException("API cost limit exceeded"));
-                    fiber.state(FiberState.FAILED);
-                    completionQueue.offer(fiber.id(), false, PrimitiveValue.nullValue(), fiber.error());
+                    failFiber(fiber, new RuntimeException("API cost limit exceeded"), io.velora.api.compiler.DiagnosticCode.RUNTIME_RESOURCE_LIMIT, savedLine(fiber));
                     terminalFibers.add(fiber);
                     drainCompletions();
                     continue;
@@ -462,13 +472,7 @@ public final class ScriptScheduler implements VmHost {
 
             CompiledModule module = modules.get(fiber.scriptId());
             if (module == null) {
-                fiber.error(new IllegalStateException("Compiled module not found"));
-                fiber.state(FiberState.FAILED);
-                completionQueue.offer(fiber.id(), false, PrimitiveValue.nullValue(), fiber.error());
-                errorStore.record(fiber.scriptId(), new io.velora.api.debug.RuntimeError(
-                        fiber.scriptId(), fiber.id(), fiber.functionName(),
-                        io.velora.api.compiler.DiagnosticCode.RUNTIME_API_ERROR.name(),
-                        fiber.error().getMessage(), "", nanoTime.getAsLong()));
+                failFiber(fiber, new IllegalStateException("Compiled module not found"), io.velora.api.compiler.DiagnosticCode.RUNTIME_API_ERROR, savedLine(fiber));
                 terminalFibers.add(fiber);
                 drainCompletions();
                 continue;
@@ -481,16 +485,14 @@ public final class ScriptScheduler implements VmHost {
                     Map<Integer, ScriptValue> statFields = scriptStaticFields.computeIfAbsent(fiber.scriptId(), k -> new HashMap<>());
                     for (CompiledModule.FieldInitializer fi : module.fieldInitializers()) {
                         if (fi.isStatic()) {
-                            if (!statFields.containsKey(fi.fieldIndex())) storeValue(scriptStaticFields, fiber.scriptId(), fi.fieldIndex(), fi.initialValue());
+                            if (!statFields.containsKey(fi.fieldIndex())) storeValue(scriptStaticFields, fiber.scriptId(), fi.fieldIndex(), VirtualMachine.copyValue(fi.initialValue()));
                         } else if (!instFields.containsKey(fi.fieldIndex())) {
-                            storeValue(scriptInstanceFields, fiber.scriptId(), fi.fieldIndex(), fi.initialValue());
+                            storeValue(scriptInstanceFields, fiber.scriptId(), fi.fieldIndex(), VirtualMachine.copyValue(fi.initialValue()));
                         }
                     }
                     initializedScripts.add(fiber.scriptId());
                 } catch (ResourceLimitViolation violation) {
-                    fiber.error(violation);
-                    fiber.state(FiberState.FAILED);
-                    completionQueue.offer(fiber.id(), false, PrimitiveValue.nullValue(), violation);
+                    failFiber(fiber, violation, io.velora.api.compiler.DiagnosticCode.RUNTIME_RESOURCE_LIMIT, savedLine(fiber));
                     terminalFibers.add(fiber);
                     drainCompletions();
                     continue;
@@ -518,9 +520,7 @@ public final class ScriptScheduler implements VmHost {
             } else {
                 CompiledFunction fn = module.function(fiber.functionIndex());
                 if (fn == null) {
-                    fiber.error(new IllegalStateException("Function not found: " + fiber.functionIndex()));
-                    fiber.state(FiberState.FAILED);
-                    completionQueue.offer(fiber.id(), false, PrimitiveValue.nullValue(), fiber.error());
+                    failFiber(fiber, new IllegalStateException("Function not found: " + fiber.functionIndex()), io.velora.api.compiler.DiagnosticCode.RUNTIME_API_ERROR, 0);
                     terminalFibers.add(fiber);
                     drainCompletions();
                     continue;
@@ -567,15 +567,7 @@ public final class ScriptScheduler implements VmHost {
                     case INSTRUCTION_LIMIT -> {
                         fiber.incrementInstructionLimits();
                         if (fiber.consecutiveInstructionLimits() >= 5) {
-                            fiber.error(new RuntimeException("Runaway script: instruction limit exceeded 5 consecutive times"));
-                            fiber.state(FiberState.FAILED);
-                            completionQueue.offer(fiber.id(), false, PrimitiveValue.nullValue(), fiber.error());
-                            String funcName = module.function(fiber.functionIndex()) != null ? module.function(fiber.functionIndex()).name() : "unknown";
-                            errorStore.record(fiber.scriptId(), new io.velora.api.debug.RuntimeError(
-                                    fiber.scriptId(), fiber.id(), funcName,
-                                    io.velora.api.compiler.DiagnosticCode.RUNTIME_RESOURCE_LIMIT.name(),
-                                    "Runaway script: instruction limit exceeded 5 consecutive times", "", nanoTime.getAsLong()
-                            ));
+                            failFiber(fiber, new RuntimeException("Runaway script: instruction limit exceeded 5 consecutive times"), io.velora.api.compiler.DiagnosticCode.RUNTIME_RESOURCE_LIMIT, currentLine(callStack));
                         } else {
                             fiber.state(FiberState.READY);
                             readyQueue.add(fiber);
@@ -587,14 +579,7 @@ public final class ScriptScheduler implements VmHost {
                 fiber.state(FiberState.COMPLETED);
                 completionQueue.offer(fiber.id(), true, result.returnValue(), null);
             } else {
-                fiber.error(new RuntimeException(result.error().message()));
-                fiber.state(FiberState.FAILED);
-                completionQueue.offer(fiber.id(), false, PrimitiveValue.nullValue(), fiber.error());
-                // Record error to debug store
-                String funcName = module.function(fiber.functionIndex()) != null ? module.function(fiber.functionIndex()).name() : "unknown";
-                errorStore.record(fiber.scriptId(), new io.velora.api.debug.RuntimeError(
-                        fiber.scriptId(), fiber.id(), funcName, result.error().code().name(), result.error().message(), "", nanoTime.getAsLong()
-                ));
+                failFiber(fiber, new RuntimeException(result.error().message()), result.error().code(), result.error().line());
             }
 
             drainCompletions();
@@ -634,7 +619,7 @@ public final class ScriptScheduler implements VmHost {
                 try {
                     long memory = estimateValue(record.result(), 0);
                     ResourceCounter counter = resourcesByScript.computeIfAbsent(awaiting.scriptId(), key -> new ResourceCounter());
-                    if (limits.memoryPerScript() > 0 && counter.memoryUsed() + memory > limits.memoryPerScript()) throw new ResourceLimitViolation("Script memory limit exceeded");
+                    if (exceedsMemory(counter.memoryUsed(), memory)) throw new ResourceLimitViolation("Script memory limit exceeded");
                     counter.reserveMemory(memory);
                     awaiting.reservedMemory(awaiting.reservedMemory() + memory);
                     awaiting.savedStack().push(record.result());
@@ -661,10 +646,29 @@ public final class ScriptScheduler implements VmHost {
     }
 
     private void failAwaitingFiber(ScriptFiber fiber, Throwable error) {
+        failFiber(fiber, error, io.velora.api.compiler.DiagnosticCode.RUNTIME_API_ERROR, savedLine(fiber));
+        retireFiber(fiber);
+    }
+
+    private void failFiber(ScriptFiber fiber, Throwable error, io.velora.api.compiler.DiagnosticCode code, int line) {
         fiber.error(error);
         fiber.state(FiberState.FAILED);
         completionQueue.offer(fiber.id(), false, PrimitiveValue.nullValue(), error);
-        retireFiber(fiber);
+        errorStore.record(fiber.scriptId(), new io.velora.api.debug.RuntimeError(
+                fiber.scriptId(), fiber.id(), fiber.functionName(), code.name(), message(error), line, "", nanoTime.getAsLong()));
+    }
+
+    private int savedLine(ScriptFiber fiber) {
+        return currentLine(fiber.savedCallStack());
+    }
+
+    private int currentLine(Deque<CallFrame> callStack) {
+        CallFrame frame = callStack != null ? callStack.peek() : null;
+        return frame != null ? frame.line() : 0;
+    }
+
+    private String message(Throwable error) {
+        return error.getMessage() != null ? error.getMessage() : error.getClass().getSimpleName();
     }
 
     private void retireFiber(ScriptFiber fiber) {
@@ -695,7 +699,6 @@ public final class ScriptScheduler implements VmHost {
         if (counter != null) {
             counter.releaseFiber();
             counter.releaseMemory(fiber.reservedMemory());
-            if (fiber.eventFiber()) counter.releaseEvent();
             if (counter.fibers() == 0 && counter.tasks() == 0 && counter.memoryUsed() == 0 && counter.eventQueueSize() == 0) resourcesByScript.remove(fiber.scriptId());
         }
     }
@@ -703,22 +706,59 @@ public final class ScriptScheduler implements VmHost {
     private void storeValue(Map<String, Map<Integer, ScriptValue>> storage, String scriptId, int index, ScriptValue value) {
         Map<Integer, ScriptValue> values = storage.computeIfAbsent(scriptId, key -> new HashMap<>());
         ScriptValue previous = values.get(index);
-        long before = estimateValue(previous, 0);
+        long before = previous != null ? estimateValue(previous, 0) : 0;
         long after = estimateValue(value, 0);
         ResourceCounter counter = resourcesByScript.computeIfAbsent(scriptId, key -> new ResourceCounter());
         long delta = after - before;
-        if (delta > 0 && limits.memoryPerScript() > 0 && counter.memoryUsed() + delta > limits.memoryPerScript()) throw new ResourceLimitViolation("Script memory limit exceeded");
+        if (delta > 0 && exceedsMemory(counter.memoryUsed(), delta)) throw new ResourceLimitViolation("Script memory limit exceeded");
         values.put(index, value);
+        adjustPersistentMemory(scriptId, counter, delta);
+    }
+
+    @Override
+    public void commitStateMutation(long fiberId) {
+        ScriptFiber fiber = fibersById.get(fiberId);
+        if (fiber == null) return;
+        String scriptId = fiber.scriptId();
+        long current = persistentMemory(scriptId);
+        long previous = persistentMemoryByScript.getOrDefault(scriptId, 0L);
+        long delta = current - previous;
+        ResourceCounter counter = resourcesByScript.computeIfAbsent(scriptId, key -> new ResourceCounter());
+        if (delta > 0 && exceedsMemory(counter.memoryUsed(), delta)) throw new ResourceLimitViolation("Script memory limit exceeded");
+        adjustPersistentMemory(scriptId, counter, delta);
+    }
+
+    private long persistentMemory(String scriptId) {
+        long total = 0;
+        Map<Integer, ScriptValue> instance = scriptInstanceFields.get(scriptId);
+        if (instance != null) for (ScriptValue value : instance.values()) total = safeAdd(total, estimateValue(value, 0));
+        Map<Integer, ScriptValue> statics = scriptStaticFields.get(scriptId);
+        if (statics != null) for (ScriptValue value : statics.values()) total = safeAdd(total, estimateValue(value, 0));
+        return total;
+    }
+
+    private void adjustPersistentMemory(String scriptId, ResourceCounter counter, long delta) {
+        long current = persistentMemoryByScript.getOrDefault(scriptId, 0L);
+        long next = safeAdd(current, delta);
+        if (next < 0) throw new ResourceLimitViolation("Script memory accounting underflow");
         if (delta > 0) counter.reserveMemory(delta); else if (delta < 0) counter.releaseMemory(-delta);
+        if (next == 0) persistentMemoryByScript.remove(scriptId); else persistentMemoryByScript.put(scriptId, next);
     }
 
     private long estimateValues(ScriptValue[] values) {
         long total = 0;
-        for (ScriptValue value : values) total += estimateValue(value, 0);
+        IdentityHashMap<ScriptValue, Boolean> active = new IdentityHashMap<>();
+        IdentityHashMap<ScriptValue, Long> estimates = new IdentityHashMap<>();
+        for (ScriptValue value : values) total = safeAdd(total, estimateValue(value, 0, active, estimates));
         return total;
     }
 
     private long estimateValue(ScriptValue value, int depth) {
+        return estimateValue(value, depth, new IdentityHashMap<>(), new IdentityHashMap<>());
+    }
+
+    private long estimateValue(ScriptValue value, int depth, IdentityHashMap<ScriptValue, Boolean> active,
+                               IdentityHashMap<ScriptValue, Long> estimates) {
         if (value == null || value.isNull()) return 8;
         if (depth > limits.maxCollectionDepth()) throw new ResourceLimitViolation("Collection depth limit exceeded");
         if (value instanceof StringValue string) {
@@ -726,31 +766,52 @@ public final class ScriptScheduler implements VmHost {
             return 40L + string.value().length() * 2L;
         }
         if (value instanceof PrimitiveValue) return 24;
-        if (value instanceof ListValue list) {
-            if (limits.maxCollectionElements() > 0 && list.elements().size() > limits.maxCollectionElements()) throw new ResourceLimitViolation("Collection element limit exceeded");
-            long total = 40L + list.elements().size() * 8L;
-            for (ScriptValue element : list.elements()) total += estimateValue(element, depth + 1);
-            return total;
-        }
-        if (value instanceof MapValue map) {
-            if (limits.maxCollectionElements() > 0 && map.entries().size() > limits.maxCollectionElements()) throw new ResourceLimitViolation("Collection element limit exceeded");
-            long total = 64L + map.entries().size() * 24L;
-            for (var entry : map.entries().entrySet()) total += estimateValue(entry.getKey(), depth + 1) + estimateValue(entry.getValue(), depth + 1);
-            return total;
-        }
-        if (value instanceof SetValue set) {
-            if (limits.maxCollectionElements() > 0 && set.elements().size() > limits.maxCollectionElements()) throw new ResourceLimitViolation("Collection element limit exceeded");
-            long total = 48L + set.elements().size() * 16L;
-            for (ScriptValue element : set.elements()) total += estimateValue(element, depth + 1);
-            return total;
-        }
-        if (value instanceof StructValue struct) {
-            if (limits.maxCollectionElements() > 0 && struct.fields().size() > limits.maxCollectionElements()) throw new ResourceLimitViolation("Collection element limit exceeded");
-            long total = 64L + struct.fields().size() * 24L;
-            for (ScriptValue field : struct.fields().values()) total += estimateValue(field, depth + 1);
-            return total;
+        Long cached = estimates.get(value);
+        if (cached != null) return cached;
+        if (value instanceof ListValue || value instanceof MapValue || value instanceof SetValue || value instanceof StructValue) {
+            if (active.put(value, Boolean.TRUE) != null) throw new ResourceLimitViolation("Cyclic values are not supported");
+            try {
+                long total;
+                if (value instanceof ListValue list) {
+                    if (limits.maxCollectionElements() > 0 && list.elements().size() > limits.maxCollectionElements()) throw new ResourceLimitViolation("Collection element limit exceeded");
+                    total = 40L + list.elements().size() * 8L;
+                    for (ScriptValue element : list.elements()) total = safeAdd(total, estimateValue(element, depth + 1, active, estimates));
+                } else if (value instanceof MapValue map) {
+                    if (limits.maxCollectionElements() > 0 && map.entries().size() > limits.maxCollectionElements()) throw new ResourceLimitViolation("Collection element limit exceeded");
+                    total = 64L + map.entries().size() * 24L;
+                    for (var entry : map.entries().entrySet()) total = safeAdd(total, safeAdd(
+                            estimateValue(entry.getKey(), depth + 1, active, estimates),
+                            estimateValue(entry.getValue(), depth + 1, active, estimates)));
+                } else if (value instanceof SetValue set) {
+                    if (limits.maxCollectionElements() > 0 && set.elements().size() > limits.maxCollectionElements()) throw new ResourceLimitViolation("Collection element limit exceeded");
+                    total = 48L + set.elements().size() * 16L;
+                    for (ScriptValue element : set.elements()) total = safeAdd(total, estimateValue(element, depth + 1, active, estimates));
+                } else {
+                    StructValue struct = (StructValue) value;
+                    if (limits.maxCollectionElements() > 0 && struct.fields().size() > limits.maxCollectionElements()) throw new ResourceLimitViolation("Collection element limit exceeded");
+                    total = 64L + struct.fields().size() * 24L;
+                    for (ScriptValue field : struct.fields().values()) total = safeAdd(total, estimateValue(field, depth + 1, active, estimates));
+                }
+                estimates.put(value, total);
+                return total;
+            } finally {
+                active.remove(value);
+            }
         }
         return 64;
+    }
+
+    private boolean exceedsMemory(long used, long additional) {
+        long limit = limits.memoryPerScript();
+        return additional < 0 || used < 0 || used > limit || additional > limit - used;
+    }
+
+    private long safeAdd(long left, long right) {
+        try {
+            return Math.addExact(left, right);
+        } catch (ArithmeticException ignored) {
+            throw new ResourceLimitViolation("Script memory estimate overflow");
+        }
     }
 
     public List<ScriptFiber> fibersForScript(String scriptId) {

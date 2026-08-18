@@ -17,6 +17,8 @@ import io.velora.host.FileTransaction;
 import io.velora.host.SourceSnapshot;
 import io.velora.host.VeloraFileSystem;
 import io.velora.host.VeloraHost;
+import io.velora.internal.bytecode.CompiledModule;
+import io.velora.internal.compiler.DefaultScriptCompiler;
 import io.velora.internal.persistence.SettingsFileCodec;
 import io.velora.internal.setting.SettingStore;
 import io.velora.internal.setting.SettingValidator;
@@ -124,11 +126,14 @@ public final class ScriptTransactionImpl implements ScriptTransaction {
         ScriptTransactionResult revisionCheck = validateRevisions(fs);
         if (revisionCheck != null) return revisionCheck;
 
-        CompileResult compilation = validateSources(fs);
+        SourceValidation sourceValidation = validateSources(fs);
+        CompileResult compilation = sourceValidation != null ? sourceValidation.result() : null;
         if (compilation != null && !compilation.success()) {
             return ScriptTransactionResult.conflict(scriptId, ConflictReason.COMPILE_ERROR, compilation.diagnostics().toString());
         }
-        if (!validateSettings()) {
+        SettingStore targetSettings = mode != CommitMode.COMMIT_WITHOUT_RELOAD && sourceValidation != null && sourceValidation.module() != null
+                ? migratedStore(sourceValidation.module()) : settingStore;
+        if (!validateSettings(targetSettings)) {
             return ScriptTransactionResult.conflict(scriptId, ConflictReason.SETTING_MIGRATION_CONFLICT, "Setting validation failed");
         }
         if (mode == CommitMode.VALIDATE_ONLY) return ScriptTransactionResult.success(scriptId);
@@ -145,8 +150,8 @@ public final class ScriptTransactionImpl implements ScriptTransaction {
                 if (commitResult != null) return commitResult;
                 refreshSources();
             }
-            applySettings();
-            persistSettings();
+            applySettings(targetSettings);
+            persistSettings(targetSettings);
 
             if (mode == CommitMode.RELOAD_IF_VALID && reloadCallback != null) {
                 ScriptOperationResult reload = reloadCallback.get();
@@ -184,7 +189,7 @@ public final class ScriptTransactionImpl implements ScriptTransaction {
         return null;
     }
 
-    private CompileResult validateSources(VeloraFileSystem fs) {
+    private SourceValidation validateSources(VeloraFileSystem fs) {
         if (writes.isEmpty() && deletes.isEmpty()) return null;
         Map<String, String> candidate = new LinkedHashMap<>();
         if (fs != null) {
@@ -202,21 +207,31 @@ public final class ScriptTransactionImpl implements ScriptTransaction {
                 .sorted(Map.Entry.comparingByKey())
                 .map(entry -> new SourceFile(entry.getKey(), entry.getValue(), null))
                 .toList();
-        if (sources.isEmpty()) {
-            return compiler.compile(CompileRequest.builder(scriptId)
-                    .source("main.vls", "")
-                    .mode(CompileMode.FULL)
-                    .build());
+        CompileRequest request = sources.isEmpty()
+                ? CompileRequest.builder(scriptId).source("main.vls", "").mode(CompileMode.FULL).build()
+                : CompileRequest.builder(scriptId).sources(sources).mode(CompileMode.FULL).build();
+        CompileResult result = compiler.compile(request);
+        CompiledModule module = null;
+        if (result.success() && compiler instanceof DefaultScriptCompiler defaultCompiler) {
+            CompileRequest cached = new CompileRequest(request.scriptId(), request.sources(), CompileMode.INCREMENTAL, request.languageVersion(), request.options());
+            module = defaultCompiler.compileToModule(cached);
         }
-        return compiler.compile(CompileRequest.builder(scriptId).sources(sources).mode(CompileMode.FULL).build());
+        return new SourceValidation(result, module);
     }
 
     private ScriptTransactionResult commitSources(VeloraFileSystem fs) {
         FileTransaction tx = fs.beginTransaction(scriptId);
         try {
             for (Map.Entry<String, String> entry : writes.entrySet()) {
-                SourceSnapshot current = fs.readSource(scriptId, entry.getKey());
-                tx.write(entry.getKey(), entry.getValue(), current != null ? current.revision() : null);
+                String expectedHash = expectedRevisions.get(entry.getKey());
+                FileRevision expected;
+                if (expectedHash != null) {
+                    expected = new FileRevision(scriptId, entry.getKey(), expectedHash, -1);
+                } else {
+                    SourceSnapshot current = fs.readSource(scriptId, entry.getKey());
+                    expected = current != null ? current.revision() : null;
+                }
+                tx.write(entry.getKey(), entry.getValue(), expected);
             }
             for (String path : deletes) {
                 SourceSnapshot current = fs.readSource(scriptId, path);
@@ -225,7 +240,7 @@ public final class ScriptTransactionImpl implements ScriptTransaction {
             }
             if (!tx.commit()) {
                 tx.rollback();
-                return ScriptTransactionResult.failure(scriptId, "File transaction commit failed");
+                return ScriptTransactionResult.conflict(scriptId, ConflictReason.SOURCE_REVISION_CONFLICT, "Source changed before transaction commit");
             }
             return null;
         } catch (Throwable t) {
@@ -248,7 +263,7 @@ public final class ScriptTransactionImpl implements ScriptTransaction {
         if (settingStore != null) settingStore.applySnapshot(settings);
         if (fs != null && (!writes.isEmpty() || !deletes.isEmpty())) restoreSources(fs, sources);
         try {
-            persistSettings();
+            persistSettings(settingStore);
         } catch (Throwable t) {
             logRollbackFailure("settings", t);
         }
@@ -258,15 +273,37 @@ public final class ScriptTransactionImpl implements ScriptTransaction {
     private void restoreSources(VeloraFileSystem fs, Map<String, SourceSnapshot> sources) {
         FileTransaction tx = fs.beginTransaction(scriptId);
         try {
-            Map<String, SourceSnapshot> current = snapshotSources(fs);
-            for (Map.Entry<String, SourceSnapshot> entry : current.entrySet()) {
-                if (sources.containsKey(entry.getKey())) continue;
-                tx.validateExpectedRevision(entry.getKey(), entry.getValue().revision());
-                tx.delete(entry.getKey());
+            boolean changed = false;
+            for (Map.Entry<String, String> entry : writes.entrySet()) {
+                String path = entry.getKey();
+                SourceSnapshot current = fs.readSource(scriptId, path);
+                if (current == null || !Objects.equals(current.content(), entry.getValue())) {
+                    logRollbackFailure("sources", new IllegalStateException("Source changed after commit: " + path));
+                    continue;
+                }
+                SourceSnapshot original = sources.get(path);
+                if (original != null) tx.write(path, original.content(), current.revision());
+                else {
+                    tx.validateExpectedRevision(path, current.revision());
+                    tx.delete(path);
+                }
+                changed = true;
             }
-            for (Map.Entry<String, SourceSnapshot> entry : sources.entrySet()) {
-                SourceSnapshot now = current.get(entry.getKey());
-                tx.write(entry.getKey(), entry.getValue().content(), now != null ? now.revision() : null);
+            for (String path : deletes) {
+                SourceSnapshot current = fs.readSource(scriptId, path);
+                if (current != null) {
+                    logRollbackFailure("sources", new IllegalStateException("Deleted source was recreated after commit: " + path));
+                    continue;
+                }
+                SourceSnapshot original = sources.get(path);
+                if (original != null) {
+                    tx.write(path, original.content(), null);
+                    changed = true;
+                }
+            }
+            if (!changed) {
+                tx.rollback();
+                return;
             }
             if (!tx.commit()) {
                 tx.rollback();
@@ -278,27 +315,36 @@ public final class ScriptTransactionImpl implements ScriptTransaction {
         }
     }
 
-    private void applySettings() {
-        if (settingUpdates.isEmpty()) return;
-        if (settingStore == null) throw new IllegalStateException("Setting store is unavailable");
-        for (Map.Entry<String, SettingValue> entry : settingUpdates.entrySet()) settingStore.set(entry.getKey(), entry.getValue());
+    private SettingStore migratedStore(CompiledModule module) {
+        SettingStore migrated = new SettingStore(module.settings());
+        if (settingStore != null) migrated.applySnapshot(settingStore.snapshot());
+        return migrated;
     }
 
-    private void persistSettings() {
-        if (settingUpdates.isEmpty() || host == null || host.fileSystem() == null || settingStore == null) return;
-        String encoded = SettingsFileCodec.encode(settingStore.snapshot());
+    private void applySettings(SettingStore store) {
+        if (settingUpdates.isEmpty()) return;
+        if (store == null) throw new IllegalStateException("Setting store is unavailable");
+        for (Map.Entry<String, SettingValue> entry : settingUpdates.entrySet()) store.set(entry.getKey(), entry.getValue());
+    }
+
+    private void persistSettings(SettingStore store) {
+        if (settingUpdates.isEmpty() || host == null || host.fileSystem() == null || store == null) return;
+        String encoded = SettingsFileCodec.encode(store.snapshot());
         host.fileSystem().writeDataAtomic(scriptId, "settings.velora", encoded.getBytes(StandardCharsets.UTF_8));
     }
 
-    private boolean validateSettings() {
+    private boolean validateSettings(SettingStore store) {
         if (settingUpdates.isEmpty()) return true;
-        if (settingSchema == null || settingStore == null) return false;
+        if (store == null) return false;
+        SettingSchema schema = new SettingSchema(store.descriptors());
         for (Map.Entry<String, SettingValue> entry : settingUpdates.entrySet()) {
-            Optional<SettingDescriptor> descriptor = settingSchema.find(entry.getKey());
+            Optional<SettingDescriptor> descriptor = schema.find(entry.getKey());
             if (descriptor.isEmpty() || !SettingValidator.validate(descriptor.get(), entry.getValue()).isValid()) return false;
         }
         return true;
     }
+
+    private record SourceValidation(CompileResult result, CompiledModule module) {}
 
     private void refreshSources() {
         if (sourceRefresh != null) sourceRefresh.run();

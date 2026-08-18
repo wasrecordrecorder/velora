@@ -6,6 +6,7 @@ public record RuntimeError(
         String functionName,
         String errorType,
         String message,
+        int line,
         String stackTrace,
         long timestampNanos
 ) {
@@ -15,7 +16,11 @@ public record RuntimeError(
         java.util.Objects.requireNonNull(message);
     }
 
+    public RuntimeError(String scriptId, long fiberId, String functionName, String errorType, String message, String stackTrace, long timestampNanos) {
+        this(scriptId, fiberId, functionName, errorType, message, 0, stackTrace, timestampNanos);
+    }
+
     public static RuntimeError of(String scriptId, long fiberId, String errorType, String message, String stackTrace) {
-        return new RuntimeError(scriptId, fiberId, null, errorType, message, stackTrace, System.nanoTime());
+        return new RuntimeError(scriptId, fiberId, null, errorType, message, 0, stackTrace, System.nanoTime());
     }
 }

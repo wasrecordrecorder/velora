@@ -136,6 +136,13 @@ class EndToEndV2Test {
     // === Arithmetic ===
 
     @Test
+    @DisplayName("Long comparisons preserve integer precision")
+    void longComparisonPrecision() {
+        CompiledModule m = compile("@Script(\"T\")\n@Version(\"1\")\nscript T {\n    boolean answer() { return 9007199254740992L < 9007199254740993L }\n}");
+        assertTrue(asBool(execute(m, 0)));
+    }
+
+    @Test
     @DisplayName("Multiplication")
     void multiplication() {
         CompiledModule m = compile("@Script(\"T\")\n@Version(\"1\")\nscript T {\n    int answer() { return 6 * 7 }\n}");
@@ -404,6 +411,20 @@ class EndToEndV2Test {
     void interpolationExpression() {
         CompiledModule m = compile("@Script(\"T\")\n@Version(\"1\")\nscript T {\n    String answer() { return \"${6 * 7}\" }\n}");
         assertEquals("42", asString(execute(m, 0)));
+    }
+
+    @Test
+    @DisplayName("String interpolation rejects trailing expression tokens")
+    void interpolationRejectsTrailingTokens() {
+        ParseResult result = Parser.parse("@Script(\"T\")\nscript T { String answer() { return \"${1 2}\" } }", "main.vls");
+        assertTrue(result.diagnostics().stream().anyMatch(d -> d.code() == io.velora.api.compiler.DiagnosticCode.PARSER_UNEXPECTED_TOKEN));
+    }
+
+    @Test
+    @DisplayName("String interpolation ignores braces inside nested strings")
+    void interpolationNestedStringBrace() {
+        CompiledModule m = compile("@Script(\"T\")\n@Version(\"1\")\nscript T {\n    String answer() { return \"${\"}\"}\" }\n}");
+        assertEquals("}", asString(execute(m, 0)));
     }
 
     @Test

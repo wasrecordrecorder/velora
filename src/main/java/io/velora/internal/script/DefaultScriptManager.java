@@ -9,6 +9,8 @@ import io.velora.host.VeloraHost;
 import io.velora.host.SourceSnapshot;
 import io.velora.internal.bytecode.CompiledModule;
 import io.velora.internal.compiler.DefaultScriptCompiler;
+import io.velora.internal.scheduler.FiberState;
+import io.velora.internal.scheduler.ScriptFiber;
 import io.velora.internal.scheduler.ScriptScheduler;
 import io.velora.internal.setting.SettingStore;
 import io.velora.internal.persistence.EnabledScriptsStore;
@@ -148,7 +150,7 @@ public final class DefaultScriptManager implements ScriptManager {
             ScriptOperationResult unloaded = unload(scriptId);
             if (!unloaded.success()) return unloaded;
         }
-        if (enabledScriptsStore != null) enabledScriptsStore.disable(scriptId);
+        persistEnabledState(scriptId, false);
         try {
             host.fileSystem().deleteScript(scriptId);
         } catch (Throwable error) {
@@ -163,51 +165,46 @@ public final class DefaultScriptManager implements ScriptManager {
         ScriptInstance instance = repository.get(scriptId);
         if (instance == null) return ScriptOperationResult.failure(scriptId, "Script not found");
         if (instance.enabled()) return ScriptOperationResult.failure(scriptId, "Script already enabled");
-        
-        if (instance.compiledModule() == null) {
-            return ScriptOperationResult.failure(scriptId, "Script not compiled");
-        }
-        
-        // Load persistent fields before enabling
+        if (instance.compiledModule() == null) return ScriptOperationResult.failure(scriptId, "Script not compiled");
+
         loadPersistentFields(instance);
-        
         ScriptRuntime runtime = new ScriptRuntime(instance, scheduler);
         runtimes.put(scriptId, runtime);
         instance.statusMachine().transition(ScriptStatus.ENABLING);
         serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.STATUS_CHANGED, scriptId, ScriptStatus.ENABLING));
-        
+
         CompiledModule module = instance.compiledModule();
-        Map<String, CompiledModule> mods = schedulerModules();
-        Map<String, List<io.velora.api.setting.SettingDescriptor>> sets = schedulerSettings();
-        if (instance.settingStore() != null) {
-            scheduler.setSettingStore(scriptId, instance.settingStore());
-        }
-        // Only call ON_LOAD and ON_ENABLE synchronously during enable.
-        // ON_RUN is spawned asynchronously by runtime.start().
-        for (String hook : module.lifecycleHooks()) {
-            if (hook.equals("ON_DISABLE") || hook.equals("ON_UNLOAD") || hook.equals("ON_RUN")) continue;
-            int fnIdx = findFunctionIndex(module, hook);
-            if (fnIdx >= 0) {
-                scheduler.spawnFiberAndAwait(instance.scriptId(), fnIdx, new ScriptValue[0], mods, sets);
+        if (instance.settingStore() != null) scheduler.setSettingStore(scriptId, instance.settingStore());
+        if (!instance.loadHookCompleted()) {
+            if (module.lifecycleHooks().contains("ON_LOAD")) {
+                Throwable failure = invokeLifecycle(instance, module, "ON_LOAD");
+                if (failure != null) return failEnable(instance, runtime, "ON_LOAD", failure);
             }
+            instance.loadHookCompleted(true);
         }
-        
-        if (!runtime.start()) {
-            runtimes.remove(scriptId);
-            scheduler.stopScript(scriptId);
-            RuntimeException error = new RuntimeException("Unable to start script: runtime resource limit rejected ON_RUN");
-            instance.lastError(error);
-            instance.statusMachine().transition(ScriptStatus.FAILED);
-            if (enabledScriptsStore != null) enabledScriptsStore.disable(scriptId);
-            serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.RUNTIME_ERROR, scriptId, error.getMessage()));
-            return ScriptOperationResult.failure(scriptId, error.getMessage(), error);
+        if (module.lifecycleHooks().contains("ON_ENABLE")) {
+            Throwable failure = invokeLifecycle(instance, module, "ON_ENABLE");
+            if (failure != null) return failEnable(instance, runtime, "ON_ENABLE", failure);
         }
+
+        if (!runtime.start()) return failEnable(instance, runtime, "ON_RUN", new IllegalStateException("Runtime resource limit rejected ON_RUN"));
         instance.statusMachine().transition(ScriptStatus.ENABLED);
-        if (enabledScriptsStore != null) enabledScriptsStore.enable(scriptId);
+        persistEnabledState(scriptId, true);
         serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.ENABLED, scriptId, ScriptStatus.ENABLED));
         return ScriptOperationResult.success(scriptId, ScriptStatus.ENABLED);
     }
-    
+
+    private ScriptOperationResult failEnable(ScriptInstance instance, ScriptRuntime runtime, String hook, Throwable failure) {
+        runtimes.remove(instance.scriptId());
+        runtime.stop();
+        String message = lifecycleMessage(hook, failure);
+        instance.lastError(failure);
+        instance.statusMachine().transition(ScriptStatus.FAILED);
+        persistEnabledState(instance.scriptId(), false);
+        serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.RUNTIME_ERROR, instance.scriptId(), message));
+        return ScriptOperationResult.failure(instance.scriptId(), message, failure);
+    }
+
     private int findFunctionIndex(CompiledModule module, String name) {
         for (int i = 0; i < module.functions().size(); i++) {
             if (module.function(i).name().equals(name)) return i;
@@ -220,28 +217,23 @@ public final class DefaultScriptManager implements ScriptManager {
         ScriptInstance instance = repository.get(scriptId);
         if (instance == null) return ScriptOperationResult.failure(scriptId, "Script not found");
         ScriptRuntime runtime = runtimes.remove(scriptId);
+        Throwable lifecycleFailure = null;
         if (runtime != null) {
             CompiledModule module = instance.compiledModule();
-            if (module != null) {
-                if (instance.settingStore() != null) {
-                    scheduler.setSettingStore(scriptId, instance.settingStore());
-                }
-                int fnIdx = findFunctionIndex(module, "ON_DISABLE");
-                if (fnIdx >= 0) {
-                    scheduler.spawnFiberAndAwait(instance.scriptId(), fnIdx, new ScriptValue[0], schedulerModules(), schedulerSettings());
-                }
-            }
+            if (module != null) lifecycleFailure = invokeLifecycle(instance, module, "ON_DISABLE");
             runtime.stop();
         }
-        // Save persistent fields before disabling
         boolean saveOk = savePersistentFields(instance);
         instance.statusMachine().transition(ScriptStatus.DISABLING);
         instance.statusMachine().transition(ScriptStatus.DISABLED);
-        if (enabledScriptsStore != null) enabledScriptsStore.disable(scriptId);
+        persistEnabledState(scriptId, false);
         serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.DISABLED, scriptId, ScriptStatus.DISABLED));
-        if (!saveOk) {
-            return ScriptOperationResult.failure(scriptId, "State persistence failed");
+        if (lifecycleFailure != null) {
+            String message = lifecycleMessage("ON_DISABLE", lifecycleFailure);
+            recordLifecycleFailure(instance, message, lifecycleFailure);
+            return ScriptOperationResult.failure(scriptId, message, lifecycleFailure);
         }
+        if (!saveOk) return ScriptOperationResult.failure(scriptId, "State persistence failed");
         return ScriptOperationResult.success(scriptId, ScriptStatus.DISABLED);
     }
 
@@ -268,6 +260,8 @@ public final class DefaultScriptManager implements ScriptManager {
         SettingStore oldSettings = instance.settingStore();
         ScriptDescriptor oldDescriptor = instance.descriptor();
         long oldRevision = instance.revision();
+        boolean oldLoadHookCompleted = instance.loadHookCompleted();
+        boolean oldUnloadCompleted = false;
 
         if (wasEnabled) {
             ScriptOperationResult disabled = disable(scriptId);
@@ -276,10 +270,20 @@ public final class DefaultScriptManager implements ScriptManager {
                 return ScriptOperationResult.failure(scriptId, "Failed to disable current script before reload: " + disabled.message(), disabled.cause());
             }
         }
-        if (oldModule != null) invokeLifecycle(instance, oldModule, "ON_UNLOAD");
+        if (oldModule != null && oldLoadHookCompleted) {
+            Throwable failure = invokeLifecycle(instance, oldModule, "ON_UNLOAD");
+            if (failure != null) {
+                String message = lifecycleMessage("ON_UNLOAD", failure);
+                recordLifecycleFailure(instance, message, failure);
+                if (wasEnabled) enable(scriptId);
+                return ScriptOperationResult.failure(scriptId, message, failure);
+            }
+            oldUnloadCompleted = true;
+        }
 
         instance.statusMachine().transition(ScriptStatus.RELOADING);
         instance.compiledModule(candidate);
+        instance.loadHookCompleted(false);
         instance.settingStore(createSettingStore(candidate));
         loadSettingsFromDisk(instance);
         long newRevision = oldRevision + 1;
@@ -292,6 +296,7 @@ public final class DefaultScriptManager implements ScriptManager {
             ScriptOperationResult enabled = enable(scriptId);
             if (!enabled.success()) {
                 instance.compiledModule(oldModule);
+                instance.loadHookCompleted(oldUnloadCompleted ? false : oldLoadHookCompleted);
                 instance.settingStore(oldSettings);
                 instance.revision(oldRevision);
                 instance.descriptor(oldDescriptor);
@@ -306,11 +311,24 @@ public final class DefaultScriptManager implements ScriptManager {
         return ScriptOperationResult.success(scriptId, instance.status());
     }
 
-    private void invokeLifecycle(ScriptInstance instance, CompiledModule module, String hook) {
+    private Throwable invokeLifecycle(ScriptInstance instance, CompiledModule module, String hook) {
         int functionIndex = findFunctionIndex(module, hook);
-        if (functionIndex < 0) return;
+        if (functionIndex < 0) return null;
         if (instance.settingStore() != null) scheduler.setSettingStore(instance.scriptId(), instance.settingStore());
-        scheduler.spawnFiberAndAwait(instance.scriptId(), functionIndex, new ScriptValue[0], schedulerModules(), schedulerSettings());
+        ScriptFiber fiber = scheduler.spawnFiberAndAwait(instance.scriptId(), functionIndex, new ScriptValue[0], schedulerModules(), schedulerSettings());
+        if (fiber == null) return new IllegalStateException("Runtime resource limit rejected " + hook);
+        if (fiber.state() == FiberState.COMPLETED) return null;
+        return fiber.error() != null ? fiber.error() : new IllegalStateException(hook + " ended with " + fiber.state());
+    }
+
+    private String lifecycleMessage(String hook, Throwable failure) {
+        String detail = failure.getMessage();
+        return hook + " lifecycle failed" + (detail == null || detail.isBlank() ? "" : ": " + detail);
+    }
+
+    private void recordLifecycleFailure(ScriptInstance instance, String message, Throwable failure) {
+        instance.lastError(failure);
+        serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.RUNTIME_ERROR, instance.scriptId(), message));
     }
 
     private Map<String, CompiledModule> schedulerModules() {
@@ -342,31 +360,23 @@ public final class DefaultScriptManager implements ScriptManager {
     public ScriptOperationResult unload(String scriptId) {
         ScriptInstance instance = repository.get(scriptId);
         if (instance == null) return ScriptOperationResult.failure(scriptId, "Script not found");
-        // Stop runtime and save persistent fields, but do NOT update enabledScriptsStore
-        // (unload is engine shutdown, not user-initiated disable)
         ScriptRuntime runtime = runtimes.remove(scriptId);
+        Throwable failure = null;
+        String failedHook = null;
+        CompiledModule module = instance.compiledModule();
         if (runtime != null) {
-            CompiledModule module = instance.compiledModule();
             if (module != null) {
-                if (instance.settingStore() != null) {
-                    scheduler.setSettingStore(scriptId, instance.settingStore());
-                }
-                int fnIdx = findFunctionIndex(module, "ON_DISABLE");
-                if (fnIdx >= 0) {
-                    scheduler.spawnFiberAndAwait(instance.scriptId(), fnIdx, new ScriptValue[0], schedulerModules(), schedulerSettings());
-                }
+                failure = invokeLifecycle(instance, module, "ON_DISABLE");
+                if (failure != null) failedHook = "ON_DISABLE";
             }
             runtime.stop();
         }
-        savePersistentFields(instance);
-        CompiledModule module = instance.compiledModule();
-        if (module != null) {
-            if (instance.settingStore() != null) {
-                scheduler.setSettingStore(scriptId, instance.settingStore());
-            }
-            int fnIdx = findFunctionIndex(module, "ON_UNLOAD");
-            if (fnIdx >= 0) {
-                scheduler.spawnFiberAndAwait(instance.scriptId(), fnIdx, new ScriptValue[0], schedulerModules(), schedulerSettings());
+        boolean saveOk = savePersistentFields(instance);
+        if (module != null && instance.loadHookCompleted()) {
+            Throwable unloadFailure = invokeLifecycle(instance, module, "ON_UNLOAD");
+            if (failure == null && unloadFailure != null) {
+                failure = unloadFailure;
+                failedHook = "ON_UNLOAD";
             }
         }
         scheduler.cleanupScript(scriptId);
@@ -375,6 +385,12 @@ public final class DefaultScriptManager implements ScriptManager {
         runtimes.remove(scriptId);
         revisionManager.clear(scriptId);
         serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.STATUS_CHANGED, scriptId, ScriptStatus.UNLOADED));
+        if (failure != null) {
+            String message = lifecycleMessage(failedHook, failure);
+            recordLifecycleFailure(instance, message, failure);
+            return ScriptOperationResult.failure(scriptId, message, failure);
+        }
+        if (!saveOk) return ScriptOperationResult.failure(scriptId, "State persistence failed");
         return ScriptOperationResult.success(scriptId, ScriptStatus.UNLOADED);
     }
 
@@ -427,7 +443,7 @@ public final class DefaultScriptManager implements ScriptManager {
 
     @Override
     public void discover() {
-        if (enabledScriptsStore != null) enabledScriptsStore.load();
+        loadEnabledState();
         if (host == null || host.fileSystem() == null) return;
         Map<String, List<ScriptFileEntry>> scripts = new LinkedHashMap<>();
         for (ScriptFileEntry entry : host.fileSystem().listScripts()) {
@@ -487,11 +503,13 @@ public final class DefaultScriptManager implements ScriptManager {
         CompiledModule module = attempt.module();
         if (module == null) {
             instance.compiledModule(null);
+            instance.loadHookCompleted(false);
             instance.statusMachine().transition(ScriptStatus.FAILED);
             updateDiagnosticCounts(instance, attempt.diagnostics(), ScriptStatus.FAILED);
             return;
         }
         instance.compiledModule(module);
+        instance.loadHookCompleted(false);
         instance.settingStore(createSettingStore(module));
         instance.revision(1);
         loadSettingsFromDisk(instance);
@@ -536,7 +554,7 @@ public final class DefaultScriptManager implements ScriptManager {
             byte[] data = fs.readData(instance.scriptId(), "settings.velora");
             if (data != null && data.length > 0) {
                 String content = new String(data, java.nio.charset.StandardCharsets.UTF_8);
-                var loaded = io.velora.internal.persistence.SettingsFileCodec.decode(content);
+                var loaded = io.velora.internal.persistence.SettingsFileCodec.decode(content, instance.settingStore().descriptors());
                 int applied = instance.settingStore().applySnapshot(loaded);
                 if (applied != loaded.size() && host.logger() != null) host.logger().warn("Ignored invalid persisted settings for " + instance.scriptId());
             }
@@ -649,7 +667,7 @@ public final class DefaultScriptManager implements ScriptManager {
         RuntimeException error = new RuntimeException(message);
         instance.lastError(error);
         instance.statusMachine().transition(ScriptStatus.FAILED);
-        if (enabledScriptsStore != null) enabledScriptsStore.disable(scriptId);
+        persistEnabledState(scriptId, false);
         serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.RUNTIME_ERROR, scriptId, message));
     }
 
@@ -669,7 +687,11 @@ public final class DefaultScriptManager implements ScriptManager {
         }
 
         @Override public String id() { return instance.scriptId(); }
-        @Override public ScriptDescriptor descriptor() { return instance.descriptor(); }
+        @Override public ScriptDescriptor descriptor() {
+            ScriptDescriptor descriptor = instance.descriptor();
+            return new ScriptDescriptor(descriptor.id(), descriptor.name(), descriptor.version(), descriptor.author(), descriptor.description(),
+                    instance.status(), instance.enabled(), descriptor.sourceFiles(), descriptor.activeRevision(), descriptor.errorCount(), descriptor.warningCount(), descriptor.lastReloadTimeNanos());
+        }
         @Override public ScriptStatus status() { return instance.status(); }
         @Override public boolean enabled() { return instance.enabled(); }
         @Override public ScriptOperationResult enable() { return DefaultScriptManager.this.enable(instance.scriptId()); }
@@ -682,12 +704,12 @@ public final class DefaultScriptManager implements ScriptManager {
         @Override public io.velora.api.debug.DebugSnapshot debug() { return debugService != null ? debugService.snapshot(instance.scriptId()) : io.velora.api.debug.DebugSnapshot.empty(instance.scriptId()); }
     }
 
-    private static final class ScriptServiceEventsImpl implements ScriptServiceEvents {
-        private final java.util.List<java.util.function.Consumer<ScriptServiceEvent>> listeners = new java.util.ArrayList<>();
+    private final class ScriptServiceEventsImpl implements ScriptServiceEvents {
+        private final java.util.List<java.util.function.Consumer<ScriptServiceEvent>> listeners = new java.util.concurrent.CopyOnWriteArrayList<>();
 
         @Override
         public void subscribe(java.util.function.Consumer<ScriptServiceEvent> listener) {
-            listeners.add(listener);
+            listeners.add(Objects.requireNonNull(listener, "listener"));
         }
 
         @Override
@@ -696,9 +718,29 @@ public final class DefaultScriptManager implements ScriptManager {
         }
 
         void fire(ScriptServiceEvents.ScriptServiceEvent event) {
-            for (var l : listeners) l.accept(event);
+            for (var listener : listeners) {
+                try {
+                    listener.accept(event);
+                } catch (RuntimeException error) {
+                    if (host != null && host.logger() != null) host.logger().error("Script service listener failed", error);
+                }
+            }
         }
     }
+    private void persistEnabledState(String scriptId, boolean enabled) {
+        if (enabledScriptsStore == null) return;
+        boolean persisted = enabled ? enabledScriptsStore.enable(scriptId) : enabledScriptsStore.disable(scriptId);
+        if (!persisted && host != null && host.logger() != null) {
+            host.logger().warn("Failed to persist auto-enable state for " + scriptId);
+        }
+    }
+
+    private void loadEnabledState() {
+        if (enabledScriptsStore != null && !enabledScriptsStore.load() && host != null && host.logger() != null) {
+            host.logger().warn("Failed to load auto-enable state");
+        }
+    }
+
     private long nanoTime() { return host != null && host.clock() != null ? host.clock().nanoTime() : System.nanoTime(); }
 
 }

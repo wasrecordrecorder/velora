@@ -2,6 +2,7 @@ package io.velora.api.task;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Source side of a {@link CancellationToken}. Created per fiber / task tree and
@@ -12,15 +13,15 @@ public final class CancellationSource implements CancellationToken {
     private volatile boolean cancelled;
     private final List<Runnable> callbacks = new ArrayList<>();
     private final CancellationSource parent;
-    private final Runnable parentUnsubscribe;
+    private final Runnable parentCallback;
 
     private CancellationSource(CancellationSource parent) {
         this.parent = parent;
         if (parent != null) {
-            this.parentUnsubscribe = this::doCancel;
-            parent.onCancel(this.parentUnsubscribe);
+            this.parentCallback = this::doCancel;
+            parent.onCancel(parentCallback);
         } else {
-            this.parentUnsubscribe = null;
+            this.parentCallback = null;
         }
     }
 
@@ -31,7 +32,7 @@ public final class CancellationSource implements CancellationToken {
 
     /** Create a child linked to {@code parent}; cancelling the parent cancels the child. */
     public static CancellationSource childOf(CancellationSource parent) {
-        return new CancellationSource(parent);
+        return new CancellationSource(Objects.requireNonNull(parent));
     }
 
     @Override
@@ -40,39 +41,41 @@ public final class CancellationSource implements CancellationToken {
     }
 
     @Override
-    public synchronized void onCancel(Runnable callback) {
-        if (cancelled) {
-            callback.run();
-            return;
+    public void onCancel(Runnable callback) {
+        Objects.requireNonNull(callback);
+        synchronized (this) {
+            if (!cancelled) {
+                callbacks.add(callback);
+                return;
+            }
         }
-        callbacks.add(callback);
+        callback.run();
     }
 
     /** Request cancellation. Idempotent. */
-    public synchronized boolean cancel() {
-        if (cancelled) {
-            return false;
-        }
-        doCancel();
-        return true;
+    public boolean cancel() {
+        return doCancel();
     }
 
-    private void doCancel() {
+    private boolean doCancel() {
         List<Runnable> toRun;
         synchronized (this) {
-            if (cancelled) {
-                return;
-            }
+            if (cancelled) return false;
             cancelled = true;
             toRun = new ArrayList<>(callbacks);
             callbacks.clear();
         }
-        for (Runnable r : toRun) {
+        if (parent != null) parent.removeCallback(parentCallback);
+        for (Runnable callback : toRun) {
             try {
-                r.run();
+                callback.run();
             } catch (Throwable ignored) {
-                // cancellation callbacks must not propagate
             }
         }
+        return true;
+    }
+
+    private synchronized void removeCallback(Runnable callback) {
+        callbacks.remove(callback);
     }
 }

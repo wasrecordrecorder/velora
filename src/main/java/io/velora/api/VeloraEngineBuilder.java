@@ -18,7 +18,7 @@ public final class VeloraEngineBuilder {
     }
 
     public VeloraEngineBuilder limits(VeloraLimits limits) {
-        this.limits = limits;
+        this.limits = java.util.Objects.requireNonNull(limits, "limits");
         return this;
     }
 
@@ -26,9 +26,11 @@ public final class VeloraEngineBuilder {
     public VeloraLimits limits() { return limits; }
 
     public VeloraEngine build() {
-        if (host == null) {
-            throw new VeloraException("VeloraHost is required");
-        }
+        if (host == null) throw new VeloraException("VeloraHost is required");
+        if (host.mainThread() == null) throw new VeloraException("VeloraHost.mainThread() is required");
+        if (host.workers() == null) throw new VeloraException("VeloraHost.workers() is required");
+        if (host.clock() == null) throw new VeloraException("VeloraHost.clock() is required");
+        if (host.logger() == null) throw new VeloraException("VeloraHost.logger() is required");
         return io.velora.internal.runtime.DefaultVeloraEngine.create(this);
     }
 }

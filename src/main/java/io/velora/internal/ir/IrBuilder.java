@@ -188,6 +188,7 @@ public final class IrBuilder {
     private int[] buildStatement(StatementNode stmt, List<IrInstruction> instrs, int nextLocal) {
         int localCount = nextLocal;
         int maxStack = 0;
+        if (stmt.line() > 0) instrs.add(new IrInstruction.Line(stmt.line()));
 
         if (stmt instanceof VariableDeclarationNode vd) {
             if (vd.initializer() != null) {

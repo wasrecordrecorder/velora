@@ -35,17 +35,72 @@ public final class BytecodeVerifier {
         for (int i = 0; i < module.functions().size(); i++) {
             CompiledFunction function = module.functions().get(i);
             if (function.index() != i) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Function index mismatch for " + function.name() + ": " + function.index() + " != " + i);
-            if (!names.add(function.name())) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Duplicate function name: " + function.name());
+            if (function.name() == null || function.name().isBlank()) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Function name cannot be empty at index " + i);
+            else if (!names.add(function.name())) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Duplicate function name: " + function.name());
             verifyFunction(function, module, diagnostics);
         }
+        verifyModuleMetadata(module, diagnostics);
         return diagnostics;
+    }
+
+    private void verifyModuleMetadata(CompiledModule module, List<Diagnostic> diagnostics) {
+        int persistent = module.persistentFieldIds().size();
+        if (module.persistentFieldTypes().size() != persistent || module.persistentFieldIndices().size() != persistent || module.persistentFieldIsStatic().size() != persistent) {
+            error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Persistent field metadata sizes do not match");
+        }
+        Set<String> persistentIds = new HashSet<>();
+        for (int i = 0; i < persistent; i++) {
+            String id = module.persistentFieldIds().get(i);
+            if (id == null || id.isBlank()) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Persistent field id cannot be empty at index " + i);
+            else if (!persistentIds.add(id)) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Duplicate persistent field id: " + id);
+            if (i < module.persistentFieldTypes().size() && (module.persistentFieldTypes().get(i) == null || module.persistentFieldTypes().get(i).isBlank())) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Persistent field type cannot be empty at index " + i);
+            if (i < module.persistentFieldIndices().size() && module.persistentFieldIndices().get(i) < 0) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Negative persistent field index at " + i);
+        }
+
+        Set<String> hooks = new HashSet<>();
+        Set<String> validHooks = Set.of("ON_LOAD", "ON_ENABLE", "ON_RUN", "ON_DISABLE", "ON_UNLOAD");
+        for (String hook : module.lifecycleHooks()) {
+            if (hook == null || !validHooks.contains(hook)) {
+                error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Invalid lifecycle hook: " + hook);
+                continue;
+            }
+            if (!hooks.add(hook)) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Duplicate lifecycle hook: " + hook);
+            CompiledFunction function = module.functionByName(hook);
+            if (function == null || !function.isLifecycle() || function.parameterCount() != 0) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Lifecycle hook " + hook + " does not reference a valid lifecycle function");
+        }
+
+        for (CompiledModule.EventHandlerInfo handler : module.eventHandlers()) {
+            if (handler.eventReference() == null || handler.eventReference().isBlank()) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Event handler reference cannot be empty");
+            CompiledFunction function = module.function(handler.functionIndex());
+            if (function == null) {
+                error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Event handler function index out of range: " + handler.functionIndex());
+                continue;
+            }
+            if (!function.name().equals(handler.functionName())) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Event handler function name mismatch at index " + handler.functionIndex());
+            if (module.lifecycleHooks().contains(function.name())) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Event handler cannot reference a lifecycle hook: " + function.name());
+            if (function.suspending() != handler.suspending()) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Event handler suspend metadata mismatch for " + function.name());
+        }
+
+        Set<String> initializers = new HashSet<>();
+        for (CompiledModule.FieldInitializer initializer : module.fieldInitializers()) {
+            if (initializer.fieldIndex() < 0) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Negative field initializer index: " + initializer.fieldIndex());
+            String key = (initializer.isStatic() ? "S" : "I") + initializer.fieldIndex();
+            if (!initializers.add(key)) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Duplicate field initializer: " + key);
+        }
     }
 
     private void verifyFunction(CompiledFunction function, CompiledModule module, List<Diagnostic> diagnostics) {
         int[] code = function.code();
-        if (function.localCount() < function.parameterCount() || function.maxStack() < 0) {
+        int[] lines = function.lineNumbers();
+        if (function.localCount() < function.parameterCount() || function.maxStack() < 0 || lines == null || lines.length != 0 && lines.length != code.length) {
             error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Invalid function metadata in " + function.name());
             return;
+        }
+        for (int line : lines) {
+            if (line < 0) {
+                error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Negative source line in " + function.name());
+                return;
+            }
         }
 
         int errorStart = diagnostics.size();

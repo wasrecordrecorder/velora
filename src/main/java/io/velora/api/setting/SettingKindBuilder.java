@@ -10,10 +10,10 @@ import java.util.function.Function;
  */
 public final class SettingKindBuilder {
 
-    private final SettingKind.Builder delegate = SettingKind.named(null);
+    private final SettingKind.Builder delegate;
 
     private SettingKindBuilder(String name) {
-        delegate.name(name);
+        delegate = SettingKind.named(name);
     }
 
     public static SettingKindBuilder named(String name) {
@@ -40,8 +40,18 @@ public final class SettingKindBuilder {
         return this;
     }
 
+    public SettingKindBuilder categoryId(String categoryId) {
+        delegate.categoryId(categoryId);
+        return this;
+    }
+
     public SettingKindBuilder editor(String editorId) {
         delegate.editor(editorId);
+        return this;
+    }
+
+    public SettingKindBuilder editor(SettingEditorDescriptor editor) {
+        delegate.editor(editor);
         return this;
     }
 

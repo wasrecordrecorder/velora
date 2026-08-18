@@ -53,8 +53,33 @@ public final class VeloraTypes {
     }
 
     public static boolean isCompatible(VeloraType source, VeloraType target) {
-        if (source == null || target == null) return false;
-        if (source.equals(target) || isWidening(source, target)) return true;
-        return target.isNullable() && source.nonNull().equals(target.nonNull());
+        if (source == null || target == null || source.isNullable() && !target.isNullable()) return false;
+        VeloraType from = source.nonNull();
+        VeloraType to = target.nonNull();
+        return sameType(from, to) || isWidening(from, to);
+    }
+
+    private static boolean sameType(VeloraType left, VeloraType right) {
+        if (left == right || left.equals(right)) return true;
+        if (left instanceof ListType a && right instanceof ListType b) return sameType(a.element(), b.element());
+        if (left instanceof SetType a && right instanceof SetType b) return sameType(a.element(), b.element());
+        if (left instanceof MapType a && right instanceof MapType b) return sameType(a.key(), b.key()) && sameType(a.value(), b.value());
+        if (left instanceof TaskType a && right instanceof TaskType b) return sameType(a.result(), b.result());
+        if (left instanceof StructType a && right instanceof StructType b) {
+            if (!a.name().equals(b.name()) || a.javaClass() != b.javaClass() || a.properties().size() != b.properties().size()) return false;
+            for (int i = 0; i < a.properties().size(); i++) {
+                StructType.Property x = a.properties().get(i);
+                StructType.Property y = b.properties().get(i);
+                if (!x.name().equals(y.name()) || !sameType(x.type(), y.type())) return false;
+            }
+            return true;
+        }
+        if (left instanceof EnumType a && right instanceof EnumType b) {
+            if (!a.name().equals(b.name()) || a.javaClass() != b.javaClass() || a.constants().size() != b.constants().size()) return false;
+            for (int i = 0; i < a.constants().size(); i++) if (!a.constants().get(i).name().equals(b.constants().get(i).name())) return false;
+            return true;
+        }
+        return left instanceof HandleType && right instanceof HandleType
+                && left.name().equals(right.name()) && left.javaClass() == right.javaClass();
     }
 }

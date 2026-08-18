@@ -4,6 +4,7 @@ import io.velora.api.Velora;
 import io.velora.api.VeloraEngine;
 import io.velora.api.VeloraLimits;
 import io.velora.api.compiler.*;
+import io.velora.api.function.ScriptThread;
 import io.velora.api.type.VeloraTypes;
 import io.velora.api.setting.SettingDescriptor;
 import io.velora.api.setting.SettingValue;
@@ -24,7 +25,10 @@ import io.velora.internal.lexer.LexerResult;
 import io.velora.internal.language.DefaultEditorSession;
 import io.velora.internal.parser.ParseResult;
 import io.velora.internal.parser.Parser;
+import io.velora.internal.persistence.BytecodeCache;
+import io.velora.internal.persistence.EnabledScriptsStore;
 import io.velora.internal.registry.*;
+import io.velora.internal.scheduler.FiberState;
 import io.velora.internal.scheduler.ScriptFiber;
 import io.velora.internal.scheduler.ScriptScheduler;
 import io.velora.internal.semantic.ResolvedScript;
@@ -34,12 +38,16 @@ import io.velora.internal.vm.*;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.*;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class HardeningV2Test {
+    private enum Mode { FAST, SLOW }
+
     private DefaultTypeRegistry types;
     private DefaultSettingRegistry settings;
     private DefaultConstantRegistry constants;
@@ -85,6 +93,19 @@ class HardeningV2Test {
     }
 
     @Test
+    void incrementalCompilationDoesNotTrustCallerContentHash() {
+        DefaultScriptCompiler compiler = compiler();
+        String first = "@Script(\"CacheT\")\n@Version(\"1\")\nscript CacheT { int answer() { return 1 } }";
+        String second = "@Script(\"CacheT\")\n@Version(\"1\")\nscript CacheT { int answer() { return 2 } }";
+        CompiledModule initial = compiler.compileToModule(new CompileRequest("cache-t", List.of(new SourceFile("main.vls", first, "stale")), CompileMode.FULL, 2, Map.of()));
+        CompiledModule updated = compiler.compileToModule(new CompileRequest("cache-t", List.of(new SourceFile("main.vls", second, "stale")), CompileMode.INCREMENTAL, 2, Map.of()));
+        VmExecutionResult result = execute(updated);
+        assertTrue(result.success());
+        assertEquals(2, ((Number) result.returnValue().boxed()).intValue());
+        assertNotEquals(initial.sourceHash(), updated.sourceHash());
+    }
+
+    @Test
     void floatArithmeticAndUnaryMinus() {
         CompiledModule module = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { float answer() { return -(10.0f - 2.0f * 3.0f / 2.0f) } }");
         VmExecutionResult result = execute(module);
@@ -110,6 +131,45 @@ class HardeningV2Test {
     }
 
     @Test
+    void mutableFieldInitializersAreIsolatedFromCompiledModule() {
+        CompiledModule module = compile("@Script(\"T\")\nscript T { values = list<int>() int add() { values.add(1) return values.size } int size() { return values.size } }");
+        VirtualMachine first = new VirtualMachine(api, module.settings(), 100_000);
+        VmExecutionResult mutated = first.execute(module, module.functionByName("add").index(), new ScriptValue[0]);
+        assertTrue(mutated.success());
+        assertEquals(1, ((Number) mutated.returnValue().boxed()).intValue());
+        VirtualMachine second = new VirtualMachine(api, module.settings(), 100_000);
+        VmExecutionResult fresh = second.execute(module, module.functionByName("size").index(), new ScriptValue[0]);
+        assertTrue(fresh.success());
+        assertEquals(0, ((Number) fresh.returnValue().boxed()).intValue());
+    }
+
+    @Test
+    void settingLoadsRespectRuntimeValueLimits() {
+        CompiledModule module = compile("@Script(\"T\")\nscript T { @Setting(\"Name\") name = \"abcdef\" String answer() { return name } }");
+        VmExecutionResult result = new VirtualMachine(api, module.settings(), null, 100_000, 128, 3, 100, 8)
+                .execute(module, module.functionByName("answer").index(), new ScriptValue[0]);
+        assertFalse(result.success());
+        assertEquals(DiagnosticCode.RUNTIME_RESOURCE_LIMIT, result.error().code());
+    }
+
+    @Test
+    void failedCollectionMutationsDoNotCommitInvalidState() {
+        CompiledModule module = compile("@Script(\"T\")\nscript T { values = list<int>() ids = set<int>() scores = map<String, int>() " +
+                "int fillList() { values.add(1) values.add(2) return values.size } int listSize() { return values.size } " +
+                "int fillSet() { ids.add(1) ids.add(2) return ids.size } int setSize() { return ids.size } " +
+                "int fillMap() { scores.put(\"a\", 1) scores.put(\"b\", 2) return scores.size } int mapSize() { return scores.size } }");
+        VirtualMachine vm = new VirtualMachine(api, module.settings(), null, 100_000, 128, 1_000, 1, 8);
+        for (String fill : List.of("fillList", "fillSet", "fillMap")) {
+            VmExecutionResult result = vm.execute(module, module.functionByName(fill).index(), new ScriptValue[0]);
+            assertFalse(result.success());
+            assertEquals(DiagnosticCode.RUNTIME_RESOURCE_LIMIT, result.error().code());
+        }
+        assertEquals(1, ((Number) vm.execute(module, module.functionByName("listSize").index(), new ScriptValue[0]).returnValue().boxed()).intValue());
+        assertEquals(1, ((Number) vm.execute(module, module.functionByName("setSize").index(), new ScriptValue[0]).returnValue().boxed()).intValue());
+        assertEquals(1, ((Number) vm.execute(module, module.functionByName("mapSize").index(), new ScriptValue[0]).returnValue().boxed()).intValue());
+    }
+
+    @Test
     void invalidFunctionIndexReturnsVmFailure() {
         CompiledModule module = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { int answer() { return 42 } }");
         VmExecutionResult result = new VirtualMachine(api, List.of(), 100_000).execute(module, 999, new ScriptValue[0]);
@@ -129,6 +189,16 @@ class HardeningV2Test {
     void semanticRejectsRuntimeFieldInitializer() {
         List<Diagnostic> diagnostics = semanticDiagnostics("@Script(\"T\")\n@Version(\"1\")\nscript T { int make() { return 1 }\n int value = make()\n int answer() { return value } }");
         assertTrue(diagnostics.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_NON_CONSTANT_FIELD_INIT));
+    }
+
+    @Test
+    void constantEvaluationPreservesLongPrecisionAndRejectsIntegerOverflow() {
+        CompiledModule module = compile("@Script(\"T\")\n@Version(\"1\")\nscript T { boolean value = 9007199254740992L < 9007199254740993L boolean answer() { return value } }");
+        VmExecutionResult result = execute(module);
+        assertTrue(result.success());
+        assertEquals(true, result.returnValue().boxed());
+        List<Diagnostic> overflow = semanticDiagnostics("@Script(\"T\")\nscript T { int value = 2147483647 + 1 int answer() { return value } }");
+        assertTrue(overflow.stream().anyMatch(Diagnostic::isError));
     }
 
     @Test
@@ -338,6 +408,17 @@ class HardeningV2Test {
     }
 
     @Test
+    void setsRejectMutableNonHashableElementTypes() {
+        List<Diagnostic> constructor = semanticDiagnostics("@Script(\"T\")\nscript T { values = set<List<int>>() int answer() { return 0 } }");
+        assertTrue(constructor.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_TYPE_MISMATCH));
+        List<Diagnostic> declared = semanticDiagnostics("@Script(\"T\")\nscript T { int answer(Set<List<int>> values) { return 0 } }");
+        assertTrue(declared.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_TYPE_MISMATCH));
+        @VeloraNamespace("badset")
+        class BadSetBinding { @VeloraFunction(name = "values") public Set<List<Integer>> values() { return Set.of(); } }
+        assertThrows(BindingValidationException.class, () -> api.registerAnnotated(new BadSetBinding()));
+    }
+
+    @Test
     void setValuesCrossHostBoundaryAndExposeSize() {
         ScriptValue value = ScriptValue.fromJava(new LinkedHashSet<>(List.of(1, 2, 3)));
         assertTrue(value instanceof SetValue);
@@ -399,6 +480,18 @@ class HardeningV2Test {
     }
 
     @Test
+    void unannotatedBindingParameterNamesAreStableAcrossObfuscation() {
+        @VeloraNamespace("stable")
+        class Binding {
+            @VeloraFunction(name = "sum") public int sum(int left, int right) { return left + right; }
+        }
+        api.registerAnnotated(new Binding());
+        var descriptor = api.find("stable", "sum");
+        assertEquals("arg0", descriptor.parameters().get(0).name());
+        assertEquals("arg1", descriptor.parameters().get(1).name());
+    }
+
+    @Test
     void annotatedBindingsRejectUnsupportedAndInvalidPropertyShapes() {
         @VeloraNamespace("bad")
         class Unsupported { @VeloraFunction(name = "value") public Object value() { return new Object(); } }
@@ -423,6 +516,57 @@ class HardeningV2Test {
         assertThrows(IllegalArgumentException.class, () -> store.set("name", SettingValue.ofString("ABC")));
         assertThrows(IllegalArgumentException.class, () -> store.set("name", SettingValue.ofString("toolong")));
         assertEquals(1, store.applySnapshot(Map.of("speed", SettingValue.ofDouble(2.5), "name", SettingValue.ofString("BAD"))));
+    }
+
+    @Test
+    void nonFiniteSettingValuesReturnValidationErrors() {
+        SettingDescriptor range = new SettingDescriptor("value", "Value", VeloraTypes.DOUBLE, 0.0, null, null, null, 0, false, false, false, null,
+                List.of(SettingDescriptor.Constraint.range(-10.0, 10.0)), 0);
+        SettingDescriptor step = new SettingDescriptor("step", "Step", VeloraTypes.DOUBLE, 0.0, null, null, null, 0, false, false, false, null,
+                List.of(SettingDescriptor.Constraint.step(0.5)), 0);
+        assertFalse(io.velora.internal.setting.SettingValidator.validate(range, SettingValue.ofDouble(Double.NaN)).isValid());
+        assertFalse(io.velora.internal.setting.SettingValidator.validate(range, SettingValue.ofDouble(Double.POSITIVE_INFINITY)).isValid());
+        assertFalse(io.velora.internal.setting.SettingValidator.validate(step, SettingValue.ofDouble(Double.NEGATIVE_INFINITY)).isValid());
+    }
+
+    @Test
+    void nullableTargetsPreserveNormalWideningRules() {
+        assertTrue(VeloraTypes.isCompatible(VeloraTypes.INT, VeloraTypes.LONG.nullable()));
+        assertTrue(VeloraTypes.isCompatible(VeloraTypes.INT.nullable(), VeloraTypes.LONG.nullable()));
+        assertFalse(VeloraTypes.isCompatible(VeloraTypes.INT.nullable(), VeloraTypes.LONG));
+        var handle = new io.velora.api.type.HandleType("PlayerRef", Object.class);
+        assertTrue(VeloraTypes.isCompatible(handle, handle.nullable()));
+        assertTrue(VeloraTypes.isCompatible(handle.nullable(), handle.nullable()));
+        var otherHandle = new io.velora.api.type.HandleType("PlayerRef", String.class);
+        assertFalse(VeloraTypes.isCompatible(handle, otherHandle));
+        assertFalse(VeloraTypes.isCompatible(VeloraTypes.list(handle), VeloraTypes.list(otherHandle)));
+        SettingDescriptor descriptor = new SettingDescriptor("value", "Value", VeloraTypes.LONG.nullable(), null, null, null, null, 0, false, false, false, null, List.of(), 0);
+        SettingStore store = new SettingStore(List.of(descriptor));
+        store.set("value", SettingValue.ofInt(42));
+        assertEquals(42L, ((Number) store.get("value").value()).longValue());
+    }
+
+    @Test
+    void settingStoreRejectsForgedNumericCarriersAndNormalizesDurationPersistence() {
+        SettingDescriptor integer = new SettingDescriptor("amount", "Amount", VeloraTypes.INT, 1, null, null, null, 0, false, false, false, null, List.of(), 0);
+        SettingDescriptor duration = new SettingDescriptor("delay", "Delay", VeloraTypes.DURATION, Duration.ofSeconds(1), null, null, null, 0, false, false, false, null, List.of(), 1);
+        SettingStore store = new SettingStore(List.of(integer, duration));
+        assertThrows(IllegalArgumentException.class, () -> store.set("amount", SettingValue.of(VeloraTypes.INT, Long.MAX_VALUE)));
+        assertEquals(Duration.ofSeconds(1).toNanos(), ((Number) store.get("delay").value()).longValue());
+        Map<String, SettingValue> snapshot = store.snapshot();
+        assertEquals(snapshot, io.velora.internal.persistence.SettingsFileCodec.decode(io.velora.internal.persistence.SettingsFileCodec.encode(snapshot)));
+        store.set("delay", SettingValue.of(VeloraTypes.DURATION, Duration.ofMillis(250)));
+        assertEquals(Duration.ofMillis(250).toNanos(), ((Number) store.get("delay").value()).longValue());
+    }
+
+    @Test
+    void invalidSettingConstraintMetadataIsRejectedExplicitly() {
+        List<Diagnostic> negativeStep = semanticDiagnostics("@Script(\"BadStep\")\n@Version(\"1\")\nscript BadStep { @Setting(\"Speed\", step=-1) speed = 2 }");
+        assertTrue(negativeStep.stream().anyMatch(d -> d.code() == DiagnosticCode.SETTING_OUT_OF_RANGE));
+        List<Diagnostic> lengths = semanticDiagnostics("@Script(\"BadLength\")\n@Version(\"1\")\nscript BadLength { @Setting(\"Name\", minLength=5, maxLength=2) name = \"abc\" }");
+        assertTrue(lengths.stream().anyMatch(d -> d.code() == DiagnosticCode.SETTING_OUT_OF_RANGE));
+        SettingDescriptor descriptor = new SettingDescriptor("speed", "Speed", VeloraTypes.INT, 1, null, null, null, 0, false, false, false, null, List.of(SettingDescriptor.Constraint.step(-1)), 0);
+        assertThrows(IllegalArgumentException.class, () -> new SettingStore(List.of(descriptor)));
     }
 
     @Test
@@ -519,6 +663,41 @@ class HardeningV2Test {
     }
 
     @Test
+    void pendingHostTasksResumeAsyncFunctions() {
+        io.velora.api.task.VeloraTaskSource<Integer> source = io.velora.api.task.TaskFactory.create();
+        api.namespace("asyncSuccess", ns -> ns.suspendFunction("value", VeloraTypes.INT, p -> {}, ctx -> source.task()));
+        api.freeze();
+        CompiledModule module = compile("@Script(\"AsyncSuccess\")\n@Version(\"1\")\nscript AsyncSuccess { async int answer() { return asyncSuccess.value() } }");
+        ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), api, new RuntimeErrorStore(10));
+        ScriptFiber fiber = scheduler.spawnFiber("AsyncSuccess", module.functionByName("answer").index(), new ScriptValue[0]);
+        scheduler.tick(System.nanoTime(), Map.of("AsyncSuccess", module), Map.of("AsyncSuccess", List.of()));
+        assertEquals(FiberState.WAITING_TASK, fiber.state());
+        source.succeed(42);
+        scheduler.tick(System.nanoTime(), Map.of("AsyncSuccess", module), Map.of("AsyncSuccess", List.of()));
+        assertEquals(FiberState.COMPLETED, fiber.state());
+        assertEquals(42, ((Number) fiber.result().boxed()).intValue());
+    }
+
+    @Test
+    void failedAsyncTasksAreRecordedAsRuntimeErrors() {
+        io.velora.api.task.VeloraTaskSource<Integer> source = io.velora.api.task.TaskFactory.create();
+        api.namespace("asyncFailure", ns -> ns.suspendFunction("value", VeloraTypes.INT, p -> {}, ctx -> source.task()));
+        api.freeze();
+        CompiledModule module = compile("@Script(\"AsyncFailure\")\n@Version(\"1\")\nscript AsyncFailure { async int answer() { return asyncFailure.value() } }");
+        RuntimeErrorStore errors = new RuntimeErrorStore(10);
+        ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), api, errors);
+        ScriptFiber fiber = scheduler.spawnFiber("AsyncFailure", module.functionByName("answer").index(), new ScriptValue[0]);
+        assertNotNull(fiber);
+        scheduler.tick(System.nanoTime(), Map.of("AsyncFailure", module), Map.of("AsyncFailure", List.of()));
+        assertFalse(fiber.isDone());
+        source.fail(new IllegalStateException("async-boom"));
+        scheduler.tick(System.nanoTime(), Map.of("AsyncFailure", module), Map.of("AsyncFailure", List.of()));
+        assertTrue(fiber.isDone());
+        assertEquals(1, errors.get("AsyncFailure").size());
+        assertEquals("async-boom", errors.get("AsyncFailure").getFirst().message());
+    }
+
+    @Test
     void workerBindingsActuallyExecuteThroughWorkerExecutor() {
         int[] executions = {0};
         api.namespace("worker", ns -> ns.suspendFunction("value", VeloraTypes.INT, p -> {}, ctx -> 42)
@@ -598,6 +777,180 @@ class HardeningV2Test {
     }
 
     @Test
+    void multiFileDiagnosticsDoNotOverlapAtTrailingNewlines() {
+        CompileResult result = compiler().compile(CompileRequest.builder("Multi")
+                .source("main.vls", "@Script(\"Multi\")\n@Version(\"1\")\nscript Multi { int answer() { return first() } } // } tail")
+                .source("a.vls", "int first() { return second() }\n")
+                .source("b.vls", "int second() { return \"wrong\" }\n")
+                .build());
+        assertFalse(result.success());
+        Diagnostic diagnostic = result.diagnostics().stream().filter(Diagnostic::isError).findFirst().orElseThrow();
+        assertEquals("b.vls", diagnostic.range().filePath());
+        assertEquals(1, diagnostic.range().startLine());
+    }
+
+    @Test
+    void localFileSystemNeverListsSymbolicLinkSources() throws Exception {
+        Path root = Files.createTempDirectory("velora-fs-");
+        Path external = Files.createTempFile("velora-external-", ".vls");
+        try {
+            LocalVeloraFileSystem fs = new LocalVeloraFileSystem(root);
+            fs.writeAtomic("safe", "main.vls", "@Script(\"Safe\") script Safe {}", null);
+            Path link = root.resolve("safe/link.vls");
+            try {
+                Files.createSymbolicLink(link, external);
+            } catch (UnsupportedOperationException | java.io.IOException | SecurityException ignored) {
+                return;
+            }
+            assertEquals(1, fs.listScripts().size());
+            assertEquals("main.vls", fs.listScripts().getFirst().relativePath());
+            assertThrows(IllegalArgumentException.class, () -> fs.readSource("safe", "link.vls"));
+        } finally {
+            if (Files.exists(root.resolve("safe/link.vls"))) Files.delete(root.resolve("safe/link.vls"));
+            if (Files.exists(root.resolve("safe/main.vls"))) Files.delete(root.resolve("safe/main.vls"));
+            if (Files.exists(root.resolve("safe"))) Files.delete(root.resolve("safe"));
+            Files.deleteIfExists(root);
+            Files.deleteIfExists(external);
+        }
+    }
+
+    @Test
+    void bytecodeDeserializerHandlesCorruptedInputsWithoutThrowing() {
+        CompileResult result = compiler().compile(CompileRequest.builder("Fuzz")
+                .source("main.vls", "@Script(\"Fuzz\")\n@Version(\"1\")\nscript Fuzz { int answer() { return 42 } }")
+                .build());
+        assertTrue(result.success());
+        Random random = new Random(0x56454c4f5241L);
+        byte[] valid = result.bytecode();
+        for (int i = 0; i < 1_000; i++) {
+            byte[] damaged;
+            int mode = i % 3;
+            if (mode == 0) {
+                damaged = Arrays.copyOf(valid, random.nextInt(valid.length + 1));
+            } else if (mode == 1) {
+                damaged = valid.clone();
+                for (int j = 0, changes = 1 + random.nextInt(8); j < changes; j++) damaged[random.nextInt(damaged.length)] ^= (byte) (1 << random.nextInt(8));
+            } else {
+                damaged = Arrays.copyOf(valid, valid.length + 1 + random.nextInt(32));
+                for (int j = valid.length; j < damaged.length; j++) damaged[j] = (byte) random.nextInt(256);
+            }
+            assertDoesNotThrow(() -> DefaultScriptCompiler.deserializeBytecode(damaged, List.of()));
+        }
+    }
+
+    @Test
+    void bytecodeDeserializerRejectsTrailingGarbage() {
+        CompileResult result = compiler().compile(CompileRequest.builder("Bytecode")
+                .source("main.vls", "@Script(\"Bytecode\")\n@Version(\"1\")\nscript Bytecode { int answer() { return 42 } }")
+                .build());
+        assertTrue(result.success());
+        byte[] damaged = Arrays.copyOf(result.bytecode(), result.bytecode().length + 1);
+        damaged[damaged.length - 1] = 1;
+        assertNull(DefaultScriptCompiler.deserializeBytecode(damaged, List.of()));
+    }
+
+    @Test
+    void bytecodeVerifierRejectsInvalidModuleMetadata() {
+        CompiledModule base = compile("@Script(\"MetaCheck\")\n@Version(\"1\")\nscript MetaCheck { int answer() { return 42 } }");
+        CompiledModule malformed = new CompiledModule(base.scriptId(), base.scriptName(), base.version(), base.languageVersion(), base.sourceHash(), base.registryHash(),
+                base.constantPool(), base.functions(), base.settings(), List.of("state"), List.of(), List.of(0), List.of(false), base.lifecycleHooks(),
+                List.of(new CompiledModule.EventHandlerInfo("client.tick", "answer", 999, false)), base.fieldInitializers(), base.author(), base.description());
+        List<Diagnostic> diagnostics = new BytecodeVerifier(api).verify(malformed);
+        assertTrue(diagnostics.stream().anyMatch(diagnostic -> diagnostic.message().contains("Persistent field metadata sizes")));
+        assertTrue(diagnostics.stream().anyMatch(diagnostic -> diagnostic.message().contains("function index out of range")));
+    }
+
+    @Test
+    void bytecodeVerifierRejectsInvalidSourceLineMetadata() {
+        CompiledModule base = compile("@Script(\"LineMeta\")\n@Version(\"1\")\nscript LineMeta { int answer() { return 42 } }");
+        CompiledFunction original = base.functions().getFirst();
+        CompiledFunction malformedFunction = new CompiledFunction(original.name(), original.index(), original.parameterCount(), original.localCount(), original.maxStack(), original.suspending(), original.isLifecycle(), original.code(), new int[original.code().length + 1]);
+        List<CompiledFunction> functions = new ArrayList<>(base.functions());
+        functions.set(0, malformedFunction);
+        CompiledModule malformed = new CompiledModule(base.scriptId(), base.scriptName(), base.version(), base.languageVersion(), base.sourceHash(), base.registryHash(),
+                base.constantPool(), functions, base.settings(), base.persistentFieldIds(), base.persistentFieldTypes(), base.persistentFieldIndices(), base.persistentFieldIsStatic(),
+                base.lifecycleHooks(), base.eventHandlers(), base.fieldInitializers(), base.author(), base.description());
+        assertTrue(new BytecodeVerifier(api).verify(malformed).stream().anyMatch(diagnostic -> diagnostic.message().contains("Invalid function metadata")));
+    }
+
+    @Test
+    void runtimeErrorsKeepSourceLine() {
+        CompiledModule module = compile("@Script(\"LineT\")\n@Version(\"1\")\nscript LineT {\n    int answer() {\n        int zero = 0\n        return 1 / zero\n    }\n}");
+        VmExecutionResult result = execute(module);
+        assertFalse(result.success());
+        assertTrue(result.error().line() >= 5, String.valueOf(result.error()));
+    }
+
+    @Test
+    void languageServiceUsesSemanticSymbolsAndLexicalCallDelimiters() {
+        api.namespace("client", ns -> ns.function("mix", VeloraTypes.INT,
+                p -> { p.required("a", VeloraTypes.STRING); p.required("b", VeloraTypes.INT); p.required("c", VeloraTypes.INT); }, ctx -> 0));
+        var language = new io.velora.internal.language.DefaultLanguageService(api, types, null, settings, constants);
+        var editor = language.openEditor("SemanticEditor", "main.vls");
+        String source = "@Script(\"SemanticEditor\")\n@Version(\"1\")\nscript SemanticEditor { int value = 1\n int helper(int amount) { return amount + value }\n int answer() { return client.mix(\"x,(y)\", 2, 3) } }";
+        editor.updateText(source);
+        assertFalse(editor.snapshot().hasErrors(), editor.snapshot().diagnostics().toString());
+        assertTrue(editor.completions(5, source.lines().toList().get(4).indexOf("client") + 1).stream().anyMatch(item -> item.label().equals("value")));
+        assertTrue(editor.hover(3, source.lines().toList().get(2).indexOf("value") + 1).orElseThrow().content().contains("Property `Int`"));
+        int thirdArgument = source.lines().toList().get(4).lastIndexOf("3)") + 1;
+        assertEquals(2, editor.signatureHelp(5, thirdArgument).orElseThrow().activeParameter());
+        editor.updateText("@Script(\"D\")\nscript D { int helper(int amount) { return amount }\n int answer() { for (item in list<int>()) { return item } return helper(1) } }");
+        assertEquals(2, editor.definition(2, 44).orElseThrow().line());
+        assertTrue(editor.rename("amount", "if").isEmpty());
+        language.close();
+    }
+
+    @Test
+    void definitionRespectsRealScopesTypedForBindersAndForwardMembers() {
+        DefaultEditorSession editor = new DefaultEditorSession("D", "main.vls");
+        String source = "@Script(\"D\")\nscript D {\n    int answer() { return helper() + value }\n    int helper() { return 40 }\n    int value = 2\n    int loop() {\n        for (int item in list<int>()) {\n            return item\n        }\n        return 0\n    }\n}";
+        editor.updateText(source);
+        List<String> lines = source.lines().toList();
+        int helperUse = lines.get(2).indexOf("helper") + 1;
+        int valueUse = lines.get(2).indexOf("value") + 1;
+        assertEquals(4, editor.definition(3, helperUse).orElseThrow().line());
+        assertEquals(5, editor.definition(3, valueUse).orElseThrow().line());
+        int itemUse = lines.get(7).indexOf("item") + 1;
+        var itemDefinition = editor.definition(8, itemUse).orElseThrow();
+        assertEquals(7, itemDefinition.line());
+        assertEquals(lines.get(6).indexOf("item") + 1, itemDefinition.column());
+
+        String sibling = "@Script(\"S\")\nscript S {\n    int first(int amount) { return amount }\n    int second() { if (true) { int local = 1 } if (true) { return local + amount } return 0 }\n}";
+        editor.updateText(sibling);
+        List<String> siblingLines = sibling.lines().toList();
+        assertTrue(editor.definition(4, siblingLines.get(3).indexOf("local +") + 1).isEmpty());
+        assertTrue(editor.definition(4, siblingLines.get(3).lastIndexOf("amount") + 1).isEmpty());
+        editor.close();
+    }
+
+    @Test
+    void definitionDoesNotTreatAssignmentsAsDeclarations() {
+        DefaultEditorSession editor = new DefaultEditorSession("Assign", "main.vls");
+        String source = "@Script(\"Assign\")\nscript Assign {\n    int answer() {\n        int value = 1\n        value = 2\n        return value\n    }\n}";
+        editor.updateText(source);
+        List<String> lines = source.lines().toList();
+        int use = lines.get(5).indexOf("value") + 1;
+        var definition = editor.definition(6, use).orElseThrow();
+        assertEquals(4, definition.line());
+        assertEquals(lines.get(3).indexOf("value") + 1, definition.column());
+        assertEquals(3, editor.rename("value", "renamed").size());
+        editor.close();
+    }
+
+    @Test
+    void renameRefusesAmbiguousShadowedSymbolsInsteadOfEditingUnrelatedScopes() {
+        DefaultEditorSession editor = new DefaultEditorSession("Rename", "main.vls");
+        String source = "@Script(\"Rename\")\nscript Rename {\n    int first(int value) { return value }\n    int second(int value) { return value }\n}";
+        editor.updateText(source);
+        assertTrue(editor.rename("value", "renamed").isEmpty());
+
+        String unique = "@Script(\"Rename\")\nscript Rename {\n    int field = 1\n    int answer() { return field }\n}";
+        editor.updateText(unique);
+        assertEquals(2, editor.rename("field", "renamed").size());
+        editor.close();
+    }
+
+    @Test
     void invalidAnnotationPlacementAndMetadataAreRejected() {
         List<Diagnostic> misplaced = semanticDiagnostics("@Script(\"T\")\nscript T { @Unknown int answer() { return 1 } }");
         assertTrue(misplaced.stream().anyMatch(Diagnostic::isError));
@@ -636,6 +989,23 @@ class HardeningV2Test {
     }
 
     @Test
+    void functionContextNeverSilentlyNarrowsNumericArguments() {
+        @VeloraNamespace("narrow")
+        class Binding {
+            @VeloraFunction(name = "shortValue") public int shortValue(short value) { return value; }
+        }
+        api.registerAnnotated(new Binding());
+        CompiledModule valid = compile("@Script(\"NarrowValid\")\n@Version(\"1\")\nscript NarrowValid { int answer() { return narrow.shortValue(32000) } }");
+        VmExecutionResult validResult = execute(valid);
+        assertTrue(validResult.success(), String.valueOf(validResult.error()));
+        assertEquals(32000, ((Number) validResult.returnValue().boxed()).intValue());
+        CompiledModule overflow = compile("@Script(\"NarrowOverflow\")\n@Version(\"1\")\nscript NarrowOverflow { int answer() { return narrow.shortValue(40000) } }");
+        VmExecutionResult overflowResult = execute(overflow);
+        assertFalse(overflowResult.success());
+        assertEquals(DiagnosticCode.RUNTIME_API_ERROR, overflowResult.error().code());
+    }
+
+    @Test
     void hostDefaultsAreTypedValidatedAndExecutable() {
         UUID id = UUID.fromString("123e4567-e89b-12d3-a456-426614174000");
         api.namespace("defaults", ns -> ns
@@ -653,6 +1023,25 @@ class HardeningV2Test {
                 p -> p.optional("optional", VeloraTypes.INT, 1).required("required", VeloraTypes.INT), ctx -> 0)));
         assertThrows(IllegalArgumentException.class, () -> api.namespace("invalidCharDefault", ns -> ns.function("bad", VeloraTypes.CHAR,
                 p -> p.optional("value", VeloraTypes.CHAR, 'x'), ctx -> ctx.argument(0))));
+    }
+
+    @Test
+    void freezingAnEngineTwiceDoesNotRegisterExtensionsTwice() {
+        VeloraEngine engine = Velora.builder().host(host(new ArrayList<>())).build();
+        int[] registrations = {0};
+        engine.extensions().register(new io.velora.api.VeloraExtension() {
+            @Override public String id() { return "once"; }
+            @Override public String version() { return "1"; }
+            @Override public void register(io.velora.api.VeloraExtensionContext context) {
+                registrations[0]++;
+                context.api().namespace("once", ns -> ns.function("value", VeloraTypes.INT, ctx -> 1));
+            }
+        });
+        engine.freeze();
+        engine.freeze();
+        assertEquals(1, registrations[0]);
+        assertEquals(io.velora.api.VeloraState.FROZEN, engine.state());
+        engine.close();
     }
 
     @Test
@@ -679,9 +1068,98 @@ class HardeningV2Test {
     }
 
     @Test
+    void extensionFreezeRollsBackTheWholeBatchAndCanRetry() {
+        VeloraEngine engine = Velora.builder().host(host(new ArrayList<>())).build();
+        java.util.concurrent.atomic.AtomicBoolean fail = new java.util.concurrent.atomic.AtomicBoolean(true);
+        engine.extensions().register(new io.velora.api.VeloraExtension() {
+            @Override public String id() { return "first"; }
+            @Override public String version() { return "1"; }
+            @Override public void register(io.velora.api.VeloraExtensionContext context) {
+                context.api().namespace("firstExtension", ns -> ns.function("value", VeloraTypes.INT, ctx -> 1));
+            }
+        });
+        engine.extensions().register(new io.velora.api.VeloraExtension() {
+            @Override public String id() { return "second"; }
+            @Override public String version() { return "1"; }
+            @Override public void register(io.velora.api.VeloraExtensionContext context) {
+                if (fail.getAndSet(false)) throw new IllegalStateException("first attempt fails");
+                context.api().namespace("secondExtension", ns -> ns.function("value", VeloraTypes.INT, ctx -> 2));
+            }
+        });
+
+        assertThrows(IllegalStateException.class, engine::freeze);
+        assertNull(engine.api().find("firstExtension", "value"));
+        assertNull(engine.api().find("secondExtension", "value"));
+        engine.freeze();
+        assertNotNull(engine.api().find("firstExtension", "value"));
+        assertNotNull(engine.api().find("secondExtension", "value"));
+        engine.close();
+    }
+
+    @Test
+    void enumSettingsCompileAndPersistThroughDescriptorAwareCodec() {
+        var modeType = types.enumType("Mode", Mode.class, List.of(
+                new io.velora.api.type.EnumType.Constant("FAST", Mode.FAST),
+                new io.velora.api.type.EnumType.Constant("SLOW", Mode.SLOW)));
+        CompiledModule module = compile("@Script(\"EnumSetting\")\nscript EnumSetting { @Setting(\"Mode\") Mode mode = Mode.FAST int answer() { return 1 } }");
+        SettingDescriptor descriptor = module.settings().getFirst();
+        assertEquals(modeType.name(), descriptor.type().name());
+        assertEquals(Mode.FAST, descriptor.defaultValue());
+        SettingStore store = new SettingStore(module.settings());
+        store.set("mode", SettingValue.of(modeType, Mode.SLOW));
+        String encoded = io.velora.internal.persistence.SettingsFileCodec.encode(store.snapshot());
+        Map<String, SettingValue> decoded = io.velora.internal.persistence.SettingsFileCodec.decode(encoded, module.settings());
+        SettingStore restored = new SettingStore(module.settings());
+        assertEquals(1, restored.applySnapshot(decoded));
+        assertEquals(Mode.SLOW, restored.get("mode").value());
+    }
+
+    @Test
+    void settingsRejectTypesThatCannotBePersisted() {
+        types.handle("Player", Object.class);
+        List<Diagnostic> diagnostics = semanticDiagnostics("@Script(\"UnsupportedSetting\")\nscript UnsupportedSetting { @Setting(\"Target\") Player? target = null }");
+        assertTrue(diagnostics.stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_INVALID_PERSISTENT_TYPE));
+    }
+
+    @Test
+    void customSettingKindsValidateTheirSchemaAndDriveTypeInference() {
+        settings.register(io.velora.api.setting.SettingKind.named("Scaled")
+                .identifierParameter()
+                .positional("name", io.velora.api.setting.SettingKind.Parameter.ParameterRole.DISPLAY_NAME, VeloraTypes.STRING, true)
+                .positional("scale", io.velora.api.setting.SettingKind.Parameter.ParameterRole.NAMED, VeloraTypes.DOUBLE, true)
+                .positional("defaultValue", io.velora.api.setting.SettingKind.Parameter.ParameterRole.DEFAULT_VALUE, VeloraTypes.DOUBLE, true)
+                .resultType(VeloraTypes.DOUBLE)
+                .editor("scaled")
+                .build());
+        DefaultScriptCompiler compiler = compiler();
+        CompileRequest goodRequest = CompileRequest.builder("scaled")
+                .source("main.vls", "@Script(\"Scaled\")\nscript Scaled { @Setting(\"Value\", kind=\"Scaled\", scale=2.0) value = 1 }")
+                .build();
+        CompileResult good = compiler.compile(goodRequest);
+        assertTrue(good.success(), good.diagnostics().toString());
+        SettingDescriptor descriptor = compiler.compileToModule(goodRequest).settings().getFirst();
+        assertEquals(VeloraTypes.DOUBLE, descriptor.type());
+        assertEquals("scaled", descriptor.editor().orElseThrow().editorId());
+
+        CompileResult missing = compiler.compile(CompileRequest.builder("missing")
+                .source("main.vls", "@Script(\"Missing\")\nscript Missing { @Setting(\"Value\", kind=\"Scaled\") value = 1 }")
+                .build());
+        assertFalse(missing.success());
+        assertTrue(missing.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_INVALID_ARGUMENT));
+
+        CompileResult wrong = compiler.compile(CompileRequest.builder("wrong")
+                .source("main.vls", "@Script(\"Wrong\")\nscript Wrong { @Setting(\"Value\", kind=\"Scaled\", scale=\"bad\") value = 1 }")
+                .build());
+        assertFalse(wrong.success());
+        assertTrue(wrong.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE));
+    }
+
+    @Test
     void registriesAndTypeBuildersRejectAmbiguousDuplicateEntries() {
         constants.register("Answers", "VALUE", VeloraTypes.INT, 1);
         assertThrows(IllegalStateException.class, () -> constants.register("Answers", "VALUE", VeloraTypes.INT, 2));
+        assertThrows(IllegalArgumentException.class, () -> constants.register("Answers", "BAD", VeloraTypes.INT, "not-an-int"));
+        assertNull(constants.find("Answers", "BAD"));
         assertEquals(1, constants.all().size());
         var kind = io.velora.api.setting.SettingKind.named("SingleKind").resultType(VeloraTypes.INT).build();
         settings.register(kind);
@@ -756,6 +1234,280 @@ class HardeningV2Test {
         assertEquals(62, ((Number) result.returnValue().boxed()).intValue());
     }
 
+    @Test
+    void enabledScriptReloadReplacesStaleInMemoryState() throws Exception {
+        Path root = Files.createTempDirectory("velora-enabled-store-");
+        VeloraFileSystem fileSystem = VeloraFileSystem.local(root);
+        fileSystem.writeDataAtomic("", "enabled.velora", "alpha\nbeta".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        EnabledScriptsStore store = new EnabledScriptsStore(fileSystem);
+        assertTrue(store.load());
+        assertEquals(Set.of("alpha", "beta"), store.enabledScripts());
+        fileSystem.writeDataAtomic("", "enabled.velora", "beta".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        assertTrue(store.load());
+        assertEquals(Set.of("beta"), store.enabledScripts());
+        fileSystem.writeDataAtomic("", "enabled.velora", new byte[0]);
+        assertTrue(store.load());
+        assertTrue(store.enabledScripts().isEmpty());
+    }
+
+    @Test
+    void enabledScriptStoreReportsPersistenceFailuresWithoutLosingRuntimeState() {
+        VeloraFileSystem fileSystem = new VeloraFileSystem() {
+            @Override public List<io.velora.host.ScriptFileEntry> listScripts() { return List.of(); }
+            @Override public io.velora.host.SourceSnapshot readSource(String scriptId, String relativePath) { return null; }
+            @Override public io.velora.host.FileRevision writeAtomic(String scriptId, String relativePath, String content, io.velora.host.FileRevision expectedRevision) { throw new UnsupportedOperationException(); }
+            @Override public io.velora.host.FileTransaction beginTransaction(String scriptId) { throw new UnsupportedOperationException(); }
+            @Override public byte[] readData(String scriptId, String key) { throw new IllegalStateException("read failed"); }
+            @Override public void writeDataAtomic(String scriptId, String key, byte[] data) { throw new IllegalStateException("write failed"); }
+            @Override public boolean scriptExists(String scriptId) { return false; }
+            @Override public void deleteScript(String scriptId) { }
+        };
+        EnabledScriptsStore store = new EnabledScriptsStore(fileSystem);
+        assertFalse(store.load());
+        assertFalse(store.enable("alpha"));
+        assertTrue(store.isEnabled("alpha"));
+        assertFalse(store.disable("alpha"));
+        assertFalse(store.isEnabled("alpha"));
+    }
+
+    @Test
+    void bytecodeCacheRemainsConsistentUnderConcurrentAccess() throws Exception {
+        BytecodeCache cache = new BytecodeCache();
+        CompiledModule module = compile("@Script(\"CacheConcurrency\")\n@Version(\"1\")\nscript CacheConcurrency { int answer() { return 42 } }");
+        List<Thread> threads = new ArrayList<>();
+        for (int t = 0; t < 8; t++) {
+            int thread = t;
+            threads.add(Thread.ofPlatform().start(() -> {
+                for (int i = 0; i < 1000; i++) {
+                    String scriptId = "script-" + (i % 4);
+                    String hash = "hash-" + thread + '-' + i;
+                    cache.put(scriptId, hash, "registry", module);
+                    cache.get(scriptId, hash, "registry");
+                    if ((i & 7) == 0) cache.invalidate("script-" + ((i + 1) % 4));
+                }
+            }));
+        }
+        for (Thread thread : threads) thread.join();
+        cache.clear();
+        assertNull(cache.get("script-0", "hash", "registry"));
+    }
+
+    @Test
+    void lexerAndParserHandleArbitraryEditorText() {
+        Random random = new Random(0x56454C4F5241L);
+        String alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@{}()[]<>,.:;!?+\\-*/%=\"' \t\r\n";
+        for (int sample = 0; sample < 2000; sample++) {
+            int length = random.nextInt(129);
+            StringBuilder source = new StringBuilder(length);
+            for (int i = 0; i < length; i++) source.append(alphabet.charAt(random.nextInt(alphabet.length())));
+            new Lexer(source.toString(), "fuzz.vls").lex();
+            Parser.parse(source.toString(), "fuzz.vls");
+        }
+    }
+
+    @Test
+    void hostApiResultsCannotViolateDeclaredVeloraTypes() {
+        api.namespace("badResult", ns -> {
+            ns.function("textAsInt", VeloraTypes.INT, ctx -> "wrong");
+            ns.function("longAsInt", VeloraTypes.INT, ctx -> 4_294_967_297L);
+            ns.function("scriptValueAsInt", VeloraTypes.INT, ctx -> new StringValue("wrong"));
+            ns.function("badVec2", VeloraTypes.VEC2, ctx -> new double[]{1.0});
+            ns.function("badColor", VeloraTypes.COLOR, ctx -> new int[]{255, 255, 255});
+        });
+        api.freeze();
+        for (String function : List.of("textAsInt", "longAsInt", "scriptValueAsInt")) {
+            CompiledModule module = compile("@Script(\"BadResult\")\nscript BadResult { int answer() { return badResult." + function + "() } }");
+            VmExecutionResult result = new VirtualMachine(api, List.of(), 100_000).execute(module, module.functionByName("answer").index(), new ScriptValue[0]);
+            assertFalse(result.success());
+            assertEquals(DiagnosticCode.RUNTIME_API_ERROR, result.error().code());
+        }
+        for (String function : List.of("badVec2", "badColor")) {
+            CompiledModule module = compile("@Script(\"BadShape\")\nscript BadShape { int answer() { badResult." + function + "()\n return 1 } }");
+            VmExecutionResult result = new VirtualMachine(api, List.of(), 100_000).execute(module, module.functionByName("answer").index(), new ScriptValue[0]);
+            assertFalse(result.success());
+            assertEquals(DiagnosticCode.RUNTIME_API_ERROR, result.error().code());
+        }
+    }
+
+    @Test
+    void mainThreadApisCannotRunOffMainThread() {
+        boolean[] invoked = {false};
+        api.namespace("client", ns -> ns.function("touch", VeloraTypes.UNIT, ctx -> {
+            invoked[0] = true;
+            return null;
+        }).thread(ScriptThread.MAIN));
+        api.freeze();
+        CompiledModule module = compile("@Script(\"MainThread\")\nscript MainThread { run() { client.touch() } }");
+        RuntimeErrorStore errors = new RuntimeErrorStore(10);
+        ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), api, errors, null, constants, types, System::nanoTime, () -> false);
+        ScriptFiber fiber = scheduler.spawnFiber(module.scriptId(), module.functionByName("run").index(), new ScriptValue[0]);
+        scheduler.tick(System.nanoTime(), Map.of(module.scriptId(), module), Map.of(module.scriptId(), List.of()));
+        assertEquals(FiberState.FAILED, fiber.state());
+        assertFalse(invoked[0]);
+        assertTrue(errors.get(module.scriptId()).getFirst().message().contains("main thread"));
+    }
+
+    @Test
+    void taskFactoryIsolatesCompletionAndCancellationCallbacks() {
+        var completion = io.velora.api.task.TaskFactory.<Integer>create();
+        int[] completed = {0};
+        completion.task().onComplete(task -> { throw new IllegalStateException("listener"); });
+        completion.task().onComplete(task -> completed[0]++);
+        assertTrue(completion.succeed(42));
+        assertEquals(1, completed[0]);
+        assertEquals(42, completion.task().result());
+
+        var cancellation = io.velora.api.task.TaskFactory.<Integer>create();
+        int[] cancelled = {0};
+        cancellation.onCancel(() -> { throw new IllegalStateException("cancel"); });
+        cancellation.onCancel(() -> cancelled[0]++);
+        assertTrue(cancellation.cancel());
+        assertEquals(1, cancelled[0]);
+    }
+
+    @Test
+    void cancellationSourceRunsCallbacksOutsideItsMonitorAndUnlinksChildren() throws Exception {
+        var parent = io.velora.api.task.CancellationSource.create();
+        var child = io.velora.api.task.CancellationSource.childOf(parent);
+        boolean[] held = {true};
+        child.onCancel(() -> held[0] = Thread.holdsLock(child));
+        assertTrue(child.cancel());
+        assertFalse(held[0]);
+        assertFalse(child.cancel());
+        var callbacks = io.velora.api.task.CancellationSource.class.getDeclaredField("callbacks");
+        callbacks.setAccessible(true);
+        assertTrue(((List<?>) callbacks.get(parent)).isEmpty());
+    }
+
+    @Test
+    void taskListenerRegistrationFailureDoesNotLeakSchedulerState() {
+        ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), api);
+        ScriptFiber fiber = scheduler.spawnFiber("task-listener", 0, new ScriptValue[0]);
+        assertNotNull(fiber);
+        io.velora.api.task.VeloraTask<Object> task = new io.velora.api.task.VeloraTask<>() {
+            @Override public io.velora.api.task.TaskState state() { return io.velora.api.task.TaskState.PENDING; }
+            @Override public Object result() { throw new IllegalStateException(); }
+            @Override public Throwable failure() { throw new IllegalStateException(); }
+            @Override public boolean cancel() { return true; }
+            @Override public void onComplete(io.velora.api.task.TaskListener<Object> listener) { throw new IllegalStateException("listener rejected"); }
+        };
+        assertThrows(IllegalStateException.class, () -> scheduler.watchTask(fiber.id(), task, VeloraTypes.INT));
+        assertEquals(0, scheduler.resources("task-listener").tasks());
+        assertEquals(-1L, fiber.awaitTaskId());
+    }
+
+    @Test
+    void settingsUseDeclaredTypeAtRuntime() {
+        class PlayerRef {}
+        var playerType = new io.velora.api.type.HandleType("Player", PlayerRef.class);
+        PlayerRef player = new PlayerRef();
+        SettingDescriptor descriptor = new SettingDescriptor("target", "Target", playerType, player, null, null, null, 0, false, false, false, null, List.of(), 0);
+        SettingStore store = new SettingStore(List.of(descriptor));
+        int[] code = {Opcode.LOAD_SETTING.ordinal(), 0, Opcode.RETURN.ordinal()};
+        CompiledFunction function = new CompiledFunction("answer", 0, 0, 0, 1, false, false, code, new int[code.length]);
+        CompiledModule module = new CompiledModule("settings", "Settings", "1", 2, "source", "registry", new ConstantPool(), List.of(function), List.of(descriptor), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), null, null);
+        VmExecutionResult result = new VirtualMachine(api, List.of(descriptor), store, 100).execute(module, 0, new ScriptValue[0]);
+        assertTrue(result.success(), result.error() != null ? result.error().message() : "");
+        assertTrue(result.returnValue() instanceof HandleValue);
+        HandleValue handle = (HandleValue) result.returnValue();
+        assertEquals("Player", handle.typeName());
+        assertSame(player, handle.handle());
+    }
+
+    @Test
+    void persistentCollectionMutationsRespectScriptMemoryBudget() {
+        String payload = "x".repeat(100);
+        CompiledModule module = compile("@Script(\"MemoryMutation\")\nscript MemoryMutation { values = list<String>() int fill() { values.add(\"" + payload + "\") return values.size } int size() { return values.size } }");
+        VeloraLimits limits = VeloraLimits.builder().memoryPerScript(400).build();
+        RuntimeErrorStore errors = new RuntimeErrorStore(10);
+        ScriptScheduler scheduler = new ScriptScheduler(limits, api, errors);
+        ScriptFiber fill = scheduler.spawnFiber(module.scriptId(), module.functionByName("fill").index(), new ScriptValue[0]);
+        assertNotNull(fill);
+        scheduler.tick(System.nanoTime(), Map.of(module.scriptId(), module), Map.of(module.scriptId(), List.of()));
+        assertEquals(FiberState.FAILED, fill.state());
+        assertEquals(DiagnosticCode.RUNTIME_RESOURCE_LIMIT.name(), errors.get(module.scriptId()).getFirst().errorType());
+        ScriptFiber size = scheduler.spawnFiber(module.scriptId(), module.functionByName("size").index(), new ScriptValue[0]);
+        assertNotNull(size);
+        scheduler.tick(System.nanoTime(), Map.of(module.scriptId(), module), Map.of(module.scriptId(), List.of()));
+        assertEquals(FiberState.COMPLETED, size.state());
+        assertEquals(0, ((Number) size.result().boxed()).intValue());
+    }
+
+    @Test
+    void apiCostAccountingCannotOverflowPastTheLimit() {
+        api.namespace("expensive", ns -> ns.function("hit", VeloraTypes.UNIT, ctx -> null).cost(2_000_000_000));
+        api.freeze();
+        CompiledModule module = compile("@Script(\"CostOverflow\")\nscript CostOverflow { run() { expensive.hit() expensive.hit() } }");
+        VeloraLimits limits = VeloraLimits.builder().apiCostPerScriptTick(Integer.MAX_VALUE).build();
+        RuntimeErrorStore errors = new RuntimeErrorStore(10);
+        ScriptScheduler scheduler = new ScriptScheduler(limits, api, errors);
+        ScriptFiber fiber = scheduler.spawnFiber("CostOverflow", module.functionByName("run").index(), new ScriptValue[0]);
+        scheduler.tick(System.nanoTime(), Map.of("CostOverflow", module), Map.of("CostOverflow", List.of()));
+        assertEquals(FiberState.FAILED, fiber.state());
+        assertEquals(2_000_000_000, scheduler.apiCost("CostOverflow"));
+        assertEquals(DiagnosticCode.RUNTIME_RESOURCE_LIMIT.name(), errors.get("CostOverflow").getFirst().errorType());
+    }
+
+    @Test
+    void sharedValueGraphsCannotExplodeMemoryEstimation() {
+        ScriptValue value = PrimitiveValue.of(1);
+        for (int depth = 0; depth < 7; depth++) value = new ListValue(Collections.nCopies(1000, value));
+        VeloraLimits limits = VeloraLimits.builder().memoryPerScript(Long.MAX_VALUE).maxCollectionElements(1000).build();
+        ScriptScheduler scheduler = new ScriptScheduler(limits, api);
+        assertNull(scheduler.spawnFiber("graph", 0, new ScriptValue[]{value}));
+    }
+
+    @Test
+    void cyclicHostValuesAreRejectedWithoutStackOverflow() {
+        List<Object> cyclic = new ArrayList<>();
+        cyclic.add(cyclic);
+        assertThrows(IllegalArgumentException.class, () -> VirtualMachine.javaToValue(VeloraTypes.list(VeloraTypes.list(VeloraTypes.INT)), cyclic));
+        assertThrows(IllegalArgumentException.class, () -> ScriptValue.fromJava(cyclic));
+
+        ListValue scriptCycle = new ListValue(List.of());
+        scriptCycle.elements().add(scriptCycle);
+        ScriptScheduler scheduler = new ScriptScheduler(VeloraLimits.defaults(), api);
+        assertNull(scheduler.spawnFiber("cycle", 0, new ScriptValue[]{scriptCycle}));
+    }
+
+    @Test
+    void runtimeTypeChecksValidateBuiltinValueShape() {
+        ConstantPool uuidPool = new ConstantPool();
+        int invalidUuid = uuidPool.addString("not-a-uuid");
+        int uuidType = uuidPool.addString("UUID");
+        CompiledFunction uuidFunction = new CompiledFunction("answer", 0, 0, 0, 1, false, false,
+                new int[]{Opcode.CONST.ordinal(), invalidUuid, Opcode.IS_TYPE.ordinal(), uuidType, Opcode.RETURN.ordinal()}, new int[5]);
+        CompiledModule uuidModule = new CompiledModule("type-uuid", "TypeUuid", "1", 2, "source", "registry", uuidPool, List.of(uuidFunction),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), null, null);
+        VmExecutionResult uuidResult = new VirtualMachine(api, List.of(), 100).execute(uuidModule, 0, new ScriptValue[0]);
+        assertTrue(uuidResult.success());
+        assertEquals(false, uuidResult.returnValue().boxed());
+
+        ConstantPool vecPool = new ConstantPool();
+        int x = vecPool.addDouble(1);
+        int y = vecPool.addDouble(2);
+        int vec3Type = vecPool.addString("Vec3");
+        CompiledFunction vecFunction = new CompiledFunction("answer", 0, 0, 0, 2, false, false,
+                new int[]{Opcode.CONST.ordinal(), x, Opcode.CONST.ordinal(), y, Opcode.CREATE_LIST.ordinal(), 2, Opcode.IS_TYPE.ordinal(), vec3Type, Opcode.RETURN.ordinal()}, new int[9]);
+        CompiledModule vecModule = new CompiledModule("type-vec", "TypeVec", "1", 2, "source", "registry", vecPool, List.of(vecFunction),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), null, null);
+        VmExecutionResult vecResult = new VirtualMachine(api, List.of(), 100).execute(vecModule, 0, new ScriptValue[0]);
+        assertTrue(vecResult.success());
+        assertEquals(false, vecResult.returnValue().boxed());
+
+        ConstantPool colorPool = new ConstantPool();
+        int c = colorPool.addDouble(1);
+        int colorType = colorPool.addString("Color");
+        CompiledFunction colorFunction = new CompiledFunction("answer", 0, 0, 0, 4, false, false,
+                new int[]{Opcode.CONST.ordinal(), c, Opcode.CONST.ordinal(), c, Opcode.CONST.ordinal(), c, Opcode.CONST.ordinal(), c,
+                        Opcode.CREATE_LIST.ordinal(), 4, Opcode.IS_TYPE.ordinal(), colorType, Opcode.RETURN.ordinal()}, new int[13]);
+        CompiledModule colorModule = new CompiledModule("type-color", "TypeColor", "1", 2, "source", "registry", colorPool, List.of(colorFunction),
+                List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), null, null);
+        VmExecutionResult colorResult = new VirtualMachine(api, List.of(), 100).execute(colorModule, 0, new ScriptValue[0]);
+        assertTrue(colorResult.success());
+        assertEquals(false, colorResult.returnValue().boxed());
+    }
+
     private CompiledModule withFunction(CompiledModule base, CompiledFunction function) {
         return new CompiledModule(base.scriptId(), base.scriptName(), base.version(), base.languageVersion(), base.sourceHash(), base.registryHash(),
                 base.constantPool(), List.of(function), base.settings(), base.persistentFieldIds(), base.persistentFieldTypes(), base.persistentFieldIndices(),
@@ -788,4 +1540,36 @@ class HardeningV2Test {
             @Override public VeloraFileSystem fileSystem() { return null; }
         };
     }
+    @Test
+    void compileResultDoesNotExposeMutableBytecode() {
+        VeloraEngine engine = Velora.builder().host(host(new ArrayList<>())).build();
+        engine.freeze();
+        CompileResult result = engine.compiler().compile(CompileRequest.builder("immutable-bytecode")
+                .source("main.vls", "@Script(\"Immutable\")\nscript Immutable { int answer() { return 42 } }")
+                .build());
+        assertTrue(result.success(), result.diagnostics().toString());
+        byte[] first = result.bytecode();
+        byte original = first[0];
+        first[0] ^= 0x7f;
+        assertEquals(original, result.bytecode()[0]);
+        engine.close();
+    }
+
+    @Test
+    void synchronousLifecycleHooksCannotSuspendButRunCan() {
+        VeloraEngine engine = Velora.builder().host(host(new ArrayList<>())).build();
+        engine.freeze();
+        CompileResult invalid = engine.compiler().compile(CompileRequest.builder("lifecycle-suspend")
+                .source("main.vls", "@Script(\"T\")\nscript T { @Enable async enable() { delay(1) } }")
+                .build());
+        assertFalse(invalid.success());
+        assertTrue(invalid.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.SEMANTIC_ASYNC_VIOLATION));
+
+        CompileResult run = engine.compiler().compile(CompileRequest.builder("run-suspend")
+                .source("main.vls", "@Script(\"T\")\nscript T { @Run async run() { delay(1) } }")
+                .build());
+        assertTrue(run.success(), run.diagnostics().toString());
+        engine.close();
+    }
+
 }
