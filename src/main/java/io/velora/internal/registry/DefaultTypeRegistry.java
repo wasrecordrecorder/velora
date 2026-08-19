@@ -18,7 +18,7 @@ public final class DefaultTypeRegistry implements TypeRegistry {
 
     private void registerBuiltins() {
         for (VeloraType t : new VeloraType[]{
-                VeloraTypes.UNIT, VeloraTypes.NOTHING, VeloraTypes.BOOLEAN, VeloraTypes.BYTE,
+                VeloraTypes.ANY, VeloraTypes.UNIT, VeloraTypes.NOTHING, VeloraTypes.BOOLEAN, VeloraTypes.BYTE,
                 VeloraTypes.INT, VeloraTypes.LONG, VeloraTypes.FLOAT, VeloraTypes.DOUBLE,
                 VeloraTypes.CHAR, VeloraTypes.STRING, VeloraTypes.DURATION, VeloraTypes.VEC2,
                 VeloraTypes.VEC3, VeloraTypes.COLOR, VeloraTypes.UUID

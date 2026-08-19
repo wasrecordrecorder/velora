@@ -186,7 +186,7 @@ public final class DefaultJavaImportRegistry implements JavaImportRegistry {
             var descriptors = factory.createStaticDescriptors(type, namespace);
             if (descriptors.isEmpty()) throw new BindingValidationException("Java import " + importName + " has no @VeloraFunction or @VeloraProperty methods");
             for (var descriptor : descriptors) apiRegistry.register(descriptor);
-            imports.put(importName, new JavaImportDescriptor(importName, alias, namespace, type, source));
+            imports.put(importName, new JavaImportDescriptor(importName, alias, namespace, type, source, annotation.description().trim()));
             importClasses.put(importName, type);
         } catch (RuntimeException | LinkageError error) {
             apiRegistry.rollbackTo(apiSnapshot);

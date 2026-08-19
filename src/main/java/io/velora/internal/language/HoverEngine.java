@@ -69,7 +69,7 @@ public final class HoverEngine {
             if (token.isTrivia() || token.is(TokenType.EOF)) return Optional.empty();
             String text = token.text().startsWith("@") ? token.text().substring(1) : token.text();
             String qualified = qualifiedAt(content, line, token.column(), token.text());
-            String detail = dynamicInfo(content, text, qualified, apiRegistry, typeRegistry, constantRegistry, eventRegistry, javaImportRegistry, resolved);
+            String detail = dynamicInfo(content, text, qualified, token.offset(), apiRegistry, typeRegistry, constantRegistry, eventRegistry, javaImportRegistry, resolved);
             if (detail == null) detail = INFO.get(text);
             String shown = qualified != null ? qualified : token.text();
             String body = "```velora\n" + shown + "\n```" + (detail == null ? "" : "\n" + detail);
@@ -78,20 +78,24 @@ public final class HoverEngine {
         return Optional.empty();
     }
 
-    private static String dynamicInfo(String content, String token, String qualified, ApiRegistry apiRegistry, TypeRegistry typeRegistry,
+    private static String dynamicInfo(String content, String token, String qualified, int tokenOffset, ApiRegistry apiRegistry, TypeRegistry typeRegistry,
                                       ConstantRegistry constantRegistry, EventRegistry eventRegistry, JavaImportRegistry javaImportRegistry, ResolvedScript resolved) {
         if (qualified != null) {
-            int dot = qualified.indexOf('.');
-            String namespace = qualified.substring(0, dot);
-            String member = qualified.substring(dot + 1);
-            if (apiRegistry != null) {
+            String normalized = qualified.replace("?.", ".");
+            int dot = normalized.lastIndexOf('.');
+            String namespace = normalized.substring(0, dot);
+            String member = normalized.substring(dot + 1);
+            if (apiRegistry != null && namespace.indexOf('.') < 0) {
                 var function = apiRegistry.find(JavaImportAliases.namespace(content, namespace, javaImportRegistry), member);
-                if (function != null) return function.description() + "\nReturns `" + function.returnType().name() + "`.";
+                if (function != null) return "`" + LanguageMetadata.signature(function) + "`" + (function.description().isBlank() ? "" : "\n" + function.description());
             }
-            if (constantRegistry != null) {
+            if (constantRegistry != null && namespace.indexOf('.') < 0) {
                 var constant = constantRegistry.find(namespace, member);
                 if (constant != null) return "Constant `" + constant.type().name() + "`.";
             }
+            var receiverType = LanguageMetadata.qualifierType(content, namespace, tokenOffset, typeRegistry, resolved);
+            var builtin = LanguageMetadata.member(receiverType, member);
+            if (builtin != null) return "`" + builtin.detail() + "`\n" + builtin.description();
         }
         if (resolved != null) {
             var property = resolved.properties().get(token);
@@ -100,12 +104,21 @@ public final class HoverEngine {
             var function = resolved.functions().get(token);
             if (function != null) return "Function `" + function.name() + "(" + String.join(", ", function.parameters().stream().map(parameter -> parameter.name() + ": " + parameter.type().name()).toList()) + ") -> " + function.returnType().name() + "`.";
         }
+        if (javaImportRegistry != null) {
+            var imported = JavaImportAliases.resolve(content, javaImportRegistry).get(token);
+            if (imported != null) return "Java import `" + imported.importName() + "`." + (imported.description().isBlank() ? "" : "\n" + imported.description());
+        }
         if (eventRegistry != null) {
             for (var event : eventRegistry.all()) {
                 if (event.scriptName().equals(token)) return "Client event `" + event.scriptName() + "` with payload `" + event.payloadType().name() + "`." + (event.description() == null ? "" : "\n" + event.description());
             }
         }
-        if (typeRegistry != null && typeRegistry.find(token) != null) return "Registered Velora type `" + typeRegistry.find(token).name() + "`.";
+        String builtInTypeDocumentation = LanguageMetadata.typeDocumentation(token);
+        if (builtInTypeDocumentation != null) return builtInTypeDocumentation;
+        if (typeRegistry != null && typeRegistry.find(token) != null) {
+            String documentation = LanguageMetadata.typeDocumentation(typeRegistry.find(token).nonNull().name());
+            return documentation != null ? documentation : "Registered Velora type `" + typeRegistry.find(token).name() + "`.";
+        }
         return null;
     }
 
@@ -119,7 +132,14 @@ public final class HoverEngine {
         if (dot < 0 || source.charAt(dot) != '.') return null;
         int end = dot;
         int start = end;
-        while (start > 0 && Character.isJavaIdentifierPart(source.charAt(start - 1))) start--;
-        return start == end ? null : source.substring(start, end) + "." + token;
+        while (start > 0) {
+            char c = source.charAt(start - 1);
+            if (Character.isJavaIdentifierPart(c) || c == '.' || c == '?') start--;
+            else break;
+        }
+        if (start == end) return null;
+        String qualifier = source.substring(start, end);
+        if (qualifier.startsWith(".") || qualifier.endsWith(".")) return null;
+        return qualifier + "." + token;
     }
 }

@@ -235,8 +235,8 @@ public final class BytecodeVerifier {
             error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "API index " + index + " out of range in " + function.name() + " at " + instruction.offset());
             return;
         }
-        int required = (int) descriptor.parameters().stream().filter(parameter -> parameter.required() && !parameter.hasDefault()).count();
-        if (argumentCount < required || argumentCount > descriptor.parameters().size()) {
+        int required = descriptor.minimumArgumentCount();
+        if (argumentCount < required || argumentCount > descriptor.maximumArgumentCount()) {
             error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Argument count mismatch for " + descriptor.qualifiedName() + " in " + function.name() + " at " + instruction.offset());
         }
         boolean suspendOpcode = instruction.opcode() == Opcode.CALL_SUSPEND;

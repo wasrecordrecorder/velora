@@ -11,4 +11,6 @@ public @interface VeloraParam {
     String value();
 
     String type() default "";
+
+    String description() default "";
 }

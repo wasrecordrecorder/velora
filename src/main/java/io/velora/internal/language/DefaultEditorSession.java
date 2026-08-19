@@ -108,7 +108,8 @@ public final class DefaultEditorSession implements EditorSession {
     @Override
     public Optional<SignatureHelp> signatureHelp(int line, int column) {
         ensureOpen();
-        return SignatureHelpEngine.getSignatureHelp(content, line, column, apiRegistry, javaImportRegistry);
+        snapshot();
+        return SignatureHelpEngine.getSignatureHelp(content, line, column, apiRegistry, javaImportRegistry, typeRegistry, cachedResolved);
     }
 
     @Override

@@ -3,6 +3,7 @@ package io.velora.api.type;
 public final class VeloraTypes {
     private VeloraTypes() {}
 
+    public static final VeloraType ANY = SimpleType.of("Any", Object.class, false, false);
     public static final VeloraType UNIT = SimpleType.of("Unit", void.class, false, true);
     public static final VeloraType NOTHING = SimpleType.of("Nothing", Void.class, false, true);
     public static final VeloraType BOOLEAN = SimpleType.of("Boolean", boolean.class, true, true);
@@ -56,6 +57,8 @@ public final class VeloraTypes {
         if (source == null || target == null || source.isNullable() && !target.isNullable()) return false;
         VeloraType from = source.nonNull();
         VeloraType to = target.nonNull();
+        if (to == ANY) return true;
+        if (from == ANY) return to == ANY;
         return sameType(from, to) || isWidening(from, to);
     }
 

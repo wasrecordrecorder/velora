@@ -263,8 +263,8 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             }
         });
         apiRegistry.all().stream().sorted(Comparator.comparing(FunctionDescriptor::qualifiedName)).forEach(function -> {
-            out.append("F|").append(function.qualifiedName()).append('|').append(function.returnType().name()).append('|').append(function.suspending()).append('|').append(function.thread()).append('|').append(function.cost()).append('|');
-            function.parameters().forEach(parameter -> out.append(parameter.name()).append(':').append(parameter.type().name()).append(':').append(parameter.required()).append(':').append(parameter.hasDefault()).append(':').append(stableValue(parameter.defaultValue())).append(','));
+            out.append("F|").append(function.qualifiedName()).append('|').append(function.returnType().name()).append('|').append(function.suspending()).append('|').append(function.property()).append('|').append(function.thread()).append('|').append(function.cost()).append('|');
+            function.parameters().forEach(parameter -> out.append(parameter.name()).append(':').append(parameter.type().name()).append(':').append(parameter.required()).append(':').append(parameter.hasDefault()).append(':').append(parameter.variadic()).append(':').append(stableValue(parameter.defaultValue())).append(','));
             out.append(';');
         });
         settingRegistry.all().stream().sorted(Comparator.comparing(SettingKind::name)).forEach(kind -> {

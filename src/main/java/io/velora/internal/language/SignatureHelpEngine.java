@@ -3,6 +3,8 @@ package io.velora.internal.language;
 import io.velora.api.function.ApiRegistry;
 import io.velora.api.language.SignatureHelp;
 import io.velora.api.interop.JavaImportRegistry;
+import io.velora.api.registry.TypeRegistry;
+import io.velora.internal.semantic.ResolvedScript;
 import io.velora.internal.lexer.Lexer;
 import io.velora.internal.lexer.Token;
 import io.velora.internal.lexer.TokenType;
@@ -16,15 +18,21 @@ public final class SignatureHelpEngine {
     private SignatureHelpEngine() {}
 
     public static Optional<SignatureHelp> getSignatureHelp(String content, int line, int column) {
-        return getSignatureHelp(content, line, column, null, null);
+        return getSignatureHelp(content, line, column, null, null, null, null);
     }
 
     public static Optional<SignatureHelp> getSignatureHelp(String content, int line, int column, ApiRegistry apiRegistry) {
-        return getSignatureHelp(content, line, column, apiRegistry, null);
+        return getSignatureHelp(content, line, column, apiRegistry, null, null, null);
     }
 
     public static Optional<SignatureHelp> getSignatureHelp(String content, int line, int column, ApiRegistry apiRegistry,
                                                             JavaImportRegistry javaImportRegistry) {
+        return getSignatureHelp(content, line, column, apiRegistry, javaImportRegistry, null, null);
+    }
+
+    public static Optional<SignatureHelp> getSignatureHelp(String content, int line, int column, ApiRegistry apiRegistry,
+                                                            JavaImportRegistry javaImportRegistry, TypeRegistry typeRegistry,
+                                                            ResolvedScript resolved) {
         if (line < 1 || column < 1) return Optional.empty();
         int cursor = cursorOffset(content, line, column);
         if (cursor < 0) return Optional.empty();
@@ -44,7 +52,7 @@ public final class SignatureHelpEngine {
         for (Delimiter delimiter : stack) {
             if (delimiter.type != TokenType.LPAREN) continue;
             String name = callee(tokens, delimiter.tokenIndex);
-            if (name != null) return Optional.of(buildSignature(content, name, delimiter.commas, apiRegistry, javaImportRegistry));
+            if (name != null) return Optional.of(buildSignature(content, name, delimiter.commas, cursor, apiRegistry, javaImportRegistry, typeRegistry, resolved));
         }
         return Optional.empty();
     }
@@ -58,9 +66,14 @@ public final class SignatureHelpEngine {
         if (i < 0 || !tokens.get(i).is(TokenType.IDENTIFIER)) return null;
         StringBuilder name = new StringBuilder(tokens.get(i).text());
         if (i > 0 && tokens.get(i - 1).is(TokenType.AT)) return "@" + name;
-        while (i >= 2 && tokens.get(i - 1).is(TokenType.DOT) && tokens.get(i - 2).is(TokenType.IDENTIFIER)) {
-            name.insert(0, tokens.get(i - 2).text() + ".");
-            i -= 2;
+        while (i >= 2 && tokens.get(i - 1).is(TokenType.DOT)) {
+            if (tokens.get(i - 2).is(TokenType.IDENTIFIER)) {
+                name.insert(0, tokens.get(i - 2).text() + ".");
+                i -= 2;
+            } else if (i >= 3 && tokens.get(i - 2).is(TokenType.QUESTION) && tokens.get(i - 3).is(TokenType.IDENTIFIER)) {
+                name.insert(0, tokens.get(i - 3).text() + ".");
+                i -= 3;
+            } else break;
         }
         return name.toString();
     }
@@ -90,27 +103,40 @@ public final class SignatureHelpEngine {
         }
     }
 
-    private static SignatureHelp buildSignature(String content, String name, int activeParameter, ApiRegistry apiRegistry, JavaImportRegistry javaImportRegistry) {
-        if (apiRegistry != null) {
-            int dot = name.lastIndexOf('.');
-            if (dot > 0 && dot + 1 < name.length()) {
-                var descriptor = apiRegistry.find(JavaImportAliases.namespace(content, name.substring(0, dot), javaImportRegistry), name.substring(dot + 1));
-                if (descriptor != null) {
-                    List<SignatureHelp.SignatureParameter> parameters = descriptor.parameters().stream()
-                            .map(parameter -> new SignatureHelp.SignatureParameter(parameter.name(), parameter.type().name(), parameter.hasDefault() ? "Default: " + parameter.defaultValue() : null))
-                            .toList();
-                    return new SignatureHelp(descriptor.qualifiedName(), parameters, Math.min(activeParameter, Math.max(0, parameters.size() - 1)), descriptor.description());
-                }
+    private static SignatureHelp buildSignature(String content, String name, int activeParameter, int cursor, ApiRegistry apiRegistry,
+                                                JavaImportRegistry javaImportRegistry, TypeRegistry typeRegistry, ResolvedScript resolved) {
+        int dot = name.lastIndexOf('.');
+        if (dot > 0 && dot + 1 < name.length()) {
+            String qualifier = name.substring(0, dot);
+            String member = name.substring(dot + 1);
+            if (apiRegistry != null) {
+                var descriptor = apiRegistry.find(JavaImportAliases.namespace(content, qualifier, javaImportRegistry), member);
+                if (descriptor != null && !descriptor.property()) return LanguageMetadata.signatureHelp(descriptor, activeParameter);
             }
+            var receiverType = LanguageMetadata.qualifierType(content, qualifier, cursor, typeRegistry, resolved);
+            var builtin = LanguageMetadata.member(receiverType, member);
+            if (builtin != null && !builtin.property()) return builtin.signature(activeParameter);
         }
-        if (name.equals("@Script") || name.equals("Script")) {
-            return new SignatureHelp("@Script", List.of(
-                    new SignatureHelp.SignatureParameter("name", "String", "Script display name"),
-                    new SignatureHelp.SignatureParameter("version", "String", "Script version")
-            ), Math.min(activeParameter, 1), null);
-        }
-        if (name.equals("delay")) return new SignatureHelp("delay", List.of(new SignatureHelp.SignatureParameter("duration", "Duration", "Suspend duration")), 0, null);
-        if (name.equals("await")) return new SignatureHelp("await", List.of(new SignatureHelp.SignatureParameter("task", "Task<T>", "Task to await")), 0, null);
+        if (name.equals("@Script") || name.equals("Script")) return signature("@Script", activeParameter, "Declares the script display name.",
+                parameter("name", "String", "Script display name."));
+        if (name.equals("@Version") || name.equals("Version")) return signature("@Version", activeParameter, "Sets optional script version metadata.", parameter("value", "String", "Version string."));
+        if (name.equals("@Author") || name.equals("Author")) return signature("@Author", activeParameter, "Sets optional script author metadata.", parameter("value", "String", "Author name."));
+        if (name.equals("@Description") || name.equals("Description")) return signature("@Description", activeParameter, "Sets optional script description metadata.", parameter("value", "String", "Human-readable description."));
+        if (name.equals("@Persistent") || name.equals("Persistent")) return signature("@Persistent", activeParameter, "Persists a mutable field across reloads.", parameter("id", "String?", "Optional stable persistence id."));
+        if (name.equals("@Setting") || name.equals("Setting")) return signature("@Setting", activeParameter, "Exposes a field as a client setting.",
+                parameter("name", "String?", "Optional display name."), parameter("min", "Number?", "Optional minimum numeric value."),
+                parameter("max", "Number?", "Optional maximum numeric value."), parameter("step", "Number?", "Optional positive numeric step."));
+        if (name.equals("delay")) return signature("delay", 0, "Suspends the current fiber for a duration.", parameter("duration", "Duration", "Suspend duration."));
+        if (name.equals("await")) return signature("await", 0, "Suspends until a task completes and returns its result.", parameter("task", "Task<T>", "Task to await."));
         return new SignatureHelp(name, List.of(), 0, null);
+    }
+
+    private static SignatureHelp signature(String name, int activeParameter, String documentation, SignatureHelp.SignatureParameter... parameters) {
+        List<SignatureHelp.SignatureParameter> list = List.of(parameters);
+        return new SignatureHelp(name, list, list.isEmpty() ? 0 : Math.min(activeParameter, list.size() - 1), documentation);
+    }
+
+    private static SignatureHelp.SignatureParameter parameter(String name, String type, String documentation) {
+        return new SignatureHelp.SignatureParameter(name, type, documentation);
     }
 }

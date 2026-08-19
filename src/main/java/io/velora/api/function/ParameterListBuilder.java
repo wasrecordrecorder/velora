@@ -2,23 +2,37 @@ package io.velora.api.function;
 
 import io.velora.api.type.VeloraType;
 
-import java.util.*;
-import java.util.function.Function;
+import java.util.ArrayList;
+import java.util.List;
 
-/**
- * Builder for parameter lists.
- */
 public final class ParameterListBuilder {
 
     private final List<ParameterDescriptor> params = new ArrayList<>();
 
     public ParameterListBuilder required(String name, VeloraType type) {
-        params.add(ParameterDescriptor.required(name, type));
+        return required(name, type, "");
+    }
+
+    public ParameterListBuilder required(String name, VeloraType type, String description) {
+        params.add(ParameterDescriptor.required(name, type, description));
         return this;
     }
 
     public ParameterListBuilder optional(String name, VeloraType type, Object defaultValue) {
-        params.add(ParameterDescriptor.optional(name, type, defaultValue));
+        return optional(name, type, defaultValue, "");
+    }
+
+    public ParameterListBuilder optional(String name, VeloraType type, Object defaultValue, String description) {
+        params.add(ParameterDescriptor.optional(name, type, defaultValue, description));
+        return this;
+    }
+
+    public ParameterListBuilder variadic(String name, VeloraType type) {
+        return variadic(name, type, "");
+    }
+
+    public ParameterListBuilder variadic(String name, VeloraType type, String description) {
+        params.add(ParameterDescriptor.variadic(name, type, description));
         return this;
     }
 
@@ -26,9 +40,6 @@ public final class ParameterListBuilder {
         return List.copyOf(params);
     }
 
-    /**
-     * Functional interface for building parameter lists.
-     */
     @FunctionalInterface
     public interface Spec {
         ParameterListBuilder apply(ParameterListBuilder builder);

@@ -156,7 +156,7 @@ public final class DefaultApiRegistry implements ApiRegistry {
         @Override
         public NamespaceBuilder property(String name, VeloraType type, FunctionInvoker getter, String description) {
             FunctionDescriptor descriptor = FunctionDescriptor.builder()
-                    .namespace(ns).name(name).returns(type).invoker(getter).description(description).build();
+                    .namespace(ns).name(name).returns(type).invoker(getter).description(description).property(true).build();
             registerFromBuilder(descriptor);
             lastRegistered = descriptor;
             return this;
@@ -221,6 +221,7 @@ public final class DefaultApiRegistry implements ApiRegistry {
                     .parameters(lastRegistered.parameters())
                     .returns(lastRegistered.returnType())
                     .suspending(lastRegistered.suspending())
+                    .property(lastRegistered.property())
                     .thread(thread)
                     .cost(cost)
                     .invoker(lastRegistered.invoker())

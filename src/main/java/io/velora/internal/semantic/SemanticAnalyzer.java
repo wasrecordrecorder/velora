@@ -541,15 +541,45 @@ public final class SemanticAnalyzer {
             VeloraType receiver = inferExpressionType(member.target(), scope, current);
             if (receiver == null) return null;
             VeloraType base = receiver.nonNull();
-            boolean list = VeloraTypes.listElement(base) != null;
-            boolean set = VeloraTypes.setElement(base) != null;
-            boolean map = VeloraTypes.mapKey(base) != null;
-            if (!list && !set && !map) return null;
-            return switch (member.member()) {
-                case "contains", "containsKey", "remove" -> VeloraTypes.BOOLEAN;
-                case "add", "put", "clear" -> VeloraTypes.UNIT;
+            VeloraType result;
+            if (member.member().equals("toString")) result = VeloraTypes.STRING;
+            else if (base == VeloraTypes.STRING) result = switch (member.member()) {
+                case "lower", "upper", "trim", "substring", "replace", "repeat" -> VeloraTypes.STRING;
+                case "contains", "startsWith", "endsWith", "equalsIgnoreCase" -> VeloraTypes.BOOLEAN;
+                case "indexOf", "lastIndexOf" -> VeloraTypes.INT;
+                case "charAt" -> VeloraTypes.CHAR;
+                case "split" -> VeloraTypes.list(VeloraTypes.STRING);
                 default -> null;
             };
+            else result = null;
+            if (result != null) return member.isSafeAccess() ? result.nullable() : result;
+            VeloraType listElement = VeloraTypes.listElement(base);
+            VeloraType setElement = VeloraTypes.setElement(base);
+            VeloraType mapKey = VeloraTypes.mapKey(base);
+            VeloraType mapValue = VeloraTypes.mapValue(base);
+            if (listElement != null) result = switch (member.member()) {
+                case "contains", "remove" -> VeloraTypes.BOOLEAN;
+                case "indexOf" -> VeloraTypes.INT;
+                case "first", "last", "removeAt" -> listElement;
+                case "add", "clear" -> VeloraTypes.UNIT;
+                default -> null;
+            };
+            else if (setElement != null) result = switch (member.member()) {
+                case "contains", "remove" -> VeloraTypes.BOOLEAN;
+                case "add", "clear" -> VeloraTypes.UNIT;
+                default -> null;
+            };
+            else if (mapKey != null) result = switch (member.member()) {
+                case "containsKey", "remove" -> VeloraTypes.BOOLEAN;
+                case "get" -> mapValue.nullable();
+                case "getOrDefault" -> mapValue;
+                case "keys" -> VeloraTypes.list(mapKey);
+                case "values" -> VeloraTypes.list(mapValue);
+                case "put", "clear" -> VeloraTypes.UNIT;
+                default -> null;
+            };
+            else result = null;
+            return result != null && member.isSafeAccess() ? result.nullable() : result;
         }
         return null;
     }
@@ -560,7 +590,7 @@ public final class SemanticAnalyzer {
             if (constant != null) return constant.type();
             if (isApiNamespace(namespace.name())) {
                 FunctionDescriptor descriptor = apiRegistry.find(resolveApiNamespace(namespace.name()), member.member());
-                if (descriptor != null && descriptor.parameters().isEmpty()) return descriptor.returnType();
+                if (descriptor != null && descriptor.property()) return descriptor.returnType();
             }
         }
         VeloraType receiver = inferExpressionType(member.target(), scope, current);
@@ -568,8 +598,13 @@ public final class SemanticAnalyzer {
         VeloraType base = receiver.nonNull();
         if (base instanceof io.velora.api.type.StructType struct && struct.hasProperty(member.member())) return struct.property(member.member()).type();
         if (base == VeloraTypes.STRING && member.member().equals("length")) return VeloraTypes.INT;
+        if (base == VeloraTypes.STRING && (member.member().equals("isEmpty") || member.member().equals("isBlank"))) return VeloraTypes.BOOLEAN;
         if (isCollection(base) && member.member().equals("size")) return VeloraTypes.INT;
         if (isCollection(base) && member.member().equals("isEmpty")) return VeloraTypes.BOOLEAN;
+        if ((base == VeloraTypes.VEC2 || base == VeloraTypes.VEC3 || base == VeloraTypes.COLOR) && member.member().equals("size")) return VeloraTypes.INT;
+        if (base == VeloraTypes.VEC2 && (member.member().equals("x") || member.member().equals("y"))) return VeloraTypes.DOUBLE;
+        if (base == VeloraTypes.VEC3 && (member.member().equals("x") || member.member().equals("y") || member.member().equals("z"))) return VeloraTypes.DOUBLE;
+        if (base == VeloraTypes.COLOR && (member.member().equals("r") || member.member().equals("g") || member.member().equals("b") || member.member().equals("a"))) return VeloraTypes.INT;
         return null;
     }
 
@@ -738,8 +773,9 @@ public final class SemanticAnalyzer {
 
     private boolean isAssignable(VeloraType from, VeloraType to) {
         if (from == null || to == null) return false;
-        if (from == to || to == VeloraTypes.UNIT) return true;
+        if (from == to || to == VeloraTypes.UNIT || to.nonNull() == VeloraTypes.ANY) return true;
         if (isNullType(from)) return !to.isPrimitive() || to.isNullable();
+        if (from.nonNull() == VeloraTypes.ANY) return to.nonNull() == VeloraTypes.ANY;
         if (VeloraTypes.isWidening(from, to)) return true;
         if (from.name().equals(to.name())) return true;
         return to.isNullable() && from.nonNull().name().equals(to.nonNull().name());
@@ -803,6 +839,7 @@ public final class SemanticAnalyzer {
             VeloraType memberType = null;
             if (baseType instanceof io.velora.api.type.StructType st && st.hasProperty(mem.member())) memberType = st.property(mem.member()).type();
             else if (baseType == VeloraTypes.STRING && mem.member().equals("length")) memberType = VeloraTypes.INT;
+            else if (baseType == VeloraTypes.STRING && (mem.member().equals("isEmpty") || mem.member().equals("isBlank"))) memberType = VeloraTypes.BOOLEAN;
             else if (isCollection(baseType) && mem.member().equals("size")) memberType = VeloraTypes.INT;
             else if (isCollection(baseType) && mem.member().equals("isEmpty")) memberType = VeloraTypes.BOOLEAN;
             else if ((baseType == VeloraTypes.VEC2 || baseType == VeloraTypes.VEC3 || baseType == VeloraTypes.COLOR) && mem.member().equals("size")) memberType = VeloraTypes.INT;
@@ -817,7 +854,7 @@ public final class SemanticAnalyzer {
             }
             if (mem.target() instanceof IdentifierExpressionNode ns && isApiNamespace(ns.name())) {
                 FunctionDescriptor fd = apiRegistry.find(resolveApiNamespace(ns.name()), mem.member());
-                if (fd != null && fd.parameters().isEmpty()) {
+                if (fd != null && fd.property()) {
                     return fd.returnType();
                 }
                 error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "Unknown API property: " + ns.name() + "." + mem.member(), mem.line(), mem.column());
@@ -1002,16 +1039,12 @@ public final class SemanticAnalyzer {
                 // API call: namespace.function(args)
                 FunctionDescriptor fd = apiRegistry.find(resolveApiNamespace(ns.name()), mem.member());
                 if (fd != null) {
-                    List<ExpressionNode> bound = bindArguments(fd.qualifiedName(), args, fd.parameters().stream().map(io.velora.api.function.ParameterDescriptor::name).toList(), fd.parameters().stream().map(io.velora.api.function.ParameterDescriptor::hasDefault).toList(), scope, currentFn, mem.line(), mem.column());
-                    for (int i = 0; i < bound.size(); i++) {
-                        ExpressionNode argExpr = bound.get(i);
-                        if (argExpr == null) continue;
-                        VeloraType argType = checkExpression(argExpr, scope, currentFn);
-                        VeloraType paramType = fd.parameters().get(i).type();
-                        if (argType != null && argType != VeloraTypes.UNIT && !isAssignableExpression(argExpr, argType, paramType)) {
-                            error(DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE, "Argument '" + fd.parameters().get(i).name() + "' type mismatch: expected " + paramType.name() + ", got " + argType.name(), argExpr.line(), argExpr.column());
-                        }
+                    if (fd.property()) {
+                        error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "API property '" + fd.qualifiedName() + "' is not callable", mem.line(), mem.column());
+                        for (ExpressionNode argument : args) checkExpression(argument, scope, currentFn);
+                        return fd.returnType();
                     }
+                    checkApiArguments(fd, args, scope, currentFn, mem.line(), mem.column());
                     if (fd.suspending() && !currentFn.suspending()) {
                         error(DiagnosticCode.SEMANTIC_ASYNC_VIOLATION, "Sync function cannot call async API '" + fd.qualifiedName() + "'", mem.line(), mem.column());
                     }
@@ -1022,8 +1055,8 @@ public final class SemanticAnalyzer {
                 return VeloraTypes.UNIT;
             }
             VeloraType receiverType = checkExpression(mem.target(), scope, currentFn);
-            VeloraType collectionResult = checkCollectionMethod(mem, receiverType, args, scope, currentFn);
-            if (collectionResult != null) return collectionResult;
+            VeloraType builtinResult = checkBuiltinMethod(mem, receiverType, args, scope, currentFn);
+            if (builtinResult != null) return mem.isSafeAccess() ? builtinResult.nullable() : builtinResult;
             for (ExpressionNode a : args) checkExpression(a, scope, currentFn);
             error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "Unknown method: " + mem.member(), mem.line(), mem.column());
             return VeloraTypes.UNIT;
@@ -1134,6 +1167,44 @@ public final class SemanticAnalyzer {
         return VeloraTypes.listElement(base) != null || VeloraTypes.setElement(base) != null || VeloraTypes.mapKey(base) != null;
     }
 
+    private VeloraType checkBuiltinMethod(MemberAccessExpressionNode member, VeloraType receiverType, List<ExpressionNode> args, Scope scope, ResolvedScript.ResolvedFunction currentFn) {
+        if (receiverType == null) return null;
+        VeloraType base = receiverType.nonNull();
+        if (member.member().equals("toString")) {
+            checkCollectionArgs(member, args, List.of(), scope, currentFn);
+            if (receiverType.isNullable() && !member.isSafeAccess()) error(DiagnosticCode.SEMANTIC_NULLABILITY, "toString() requires a non-null receiver", member.line(), member.column());
+            return VeloraTypes.STRING;
+        }
+        if (base == VeloraTypes.STRING) return checkStringMethod(member, receiverType, args, scope, currentFn);
+        return checkCollectionMethod(member, receiverType, args, scope, currentFn);
+    }
+
+    private VeloraType checkStringMethod(MemberAccessExpressionNode member, VeloraType receiverType, List<ExpressionNode> args, Scope scope, ResolvedScript.ResolvedFunction currentFn) {
+        if (receiverType.isNullable() && !member.isSafeAccess()) error(DiagnosticCode.SEMANTIC_NULLABILITY, "String method requires a non-null receiver", member.line(), member.column());
+        return switch (member.member()) {
+            case "lower", "upper", "trim" -> { checkCollectionArgs(member, args, List.of(), scope, currentFn); yield VeloraTypes.STRING; }
+            case "contains", "startsWith", "endsWith", "equalsIgnoreCase" -> { checkCollectionArgs(member, args, List.of(VeloraTypes.STRING), scope, currentFn); yield VeloraTypes.BOOLEAN; }
+            case "indexOf", "lastIndexOf" -> { checkCollectionArgs(member, args, List.of(VeloraTypes.STRING), scope, currentFn); yield VeloraTypes.INT; }
+            case "charAt" -> { checkCollectionArgs(member, args, List.of(VeloraTypes.INT), scope, currentFn); yield VeloraTypes.CHAR; }
+            case "replace" -> { checkCollectionArgs(member, args, List.of(VeloraTypes.STRING, VeloraTypes.STRING), scope, currentFn); yield VeloraTypes.STRING; }
+            case "split" -> { checkCollectionArgs(member, args, List.of(VeloraTypes.STRING), scope, currentFn); yield VeloraTypes.list(VeloraTypes.STRING); }
+            case "repeat" -> { checkCollectionArgs(member, args, List.of(VeloraTypes.INT), scope, currentFn); yield VeloraTypes.STRING; }
+            case "substring" -> {
+                if (args.size() != 1 && args.size() != 2) {
+                    error(DiagnosticCode.SEMANTIC_WRONG_ARITY, "substring expects 1 or 2 arguments, got " + args.size(), member.line(), member.column());
+                    for (ExpressionNode arg : args) checkExpression(arg, scope, currentFn);
+                } else {
+                    for (ExpressionNode arg : args) {
+                        VeloraType actual = checkExpression(arg, scope, currentFn);
+                        if (actual != VeloraTypes.UNIT && !isAssignableExpression(arg, actual, VeloraTypes.INT)) error(DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE, "substring indices must be Int", arg.line(), arg.column());
+                    }
+                }
+                yield VeloraTypes.STRING;
+            }
+            default -> null;
+        };
+    }
+
     private VeloraType checkCollectionMethod(MemberAccessExpressionNode member, VeloraType receiverType,
                                              List<ExpressionNode> args, Scope scope, ResolvedScript.ResolvedFunction currentFn) {
         if (receiverType == null) return null;
@@ -1143,7 +1214,7 @@ public final class SemanticAnalyzer {
         VeloraType mapKey = VeloraTypes.mapKey(base);
         VeloraType mapValue = VeloraTypes.mapValue(base);
         if (listElement == null && setElement == null && mapKey == null) return null;
-        if (receiverType.isNullable()) error(DiagnosticCode.SEMANTIC_NULLABILITY, "Collection method requires a non-null receiver", member.line(), member.column());
+        if (receiverType.isNullable() && !member.isSafeAccess()) error(DiagnosticCode.SEMANTIC_NULLABILITY, "Collection method requires a non-null receiver", member.line(), member.column());
         VeloraType element = listElement != null ? listElement : setElement;
         return switch (member.member()) {
             case "add" -> {
@@ -1158,6 +1229,31 @@ public final class SemanticAnalyzer {
             case "remove" -> {
                 checkCollectionArgs(member, args, List.of(mapKey != null ? mapKey : element), scope, currentFn);
                 yield VeloraTypes.BOOLEAN;
+            }
+            case "indexOf" -> {
+                if (listElement == null) {
+                    error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "indexOf() is only available on List", member.line(), member.column());
+                    for (ExpressionNode arg : args) checkExpression(arg, scope, currentFn);
+                } else checkCollectionArgs(member, args, List.of(listElement), scope, currentFn);
+                yield VeloraTypes.INT;
+            }
+            case "removeAt" -> {
+                if (listElement == null) {
+                    error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "removeAt() is only available on List", member.line(), member.column());
+                    for (ExpressionNode arg : args) checkExpression(arg, scope, currentFn);
+                    yield VeloraTypes.UNIT;
+                }
+                checkCollectionArgs(member, args, List.of(VeloraTypes.INT), scope, currentFn);
+                yield listElement;
+            }
+            case "first", "last" -> {
+                if (listElement == null) {
+                    error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, member.member() + "() is only available on List", member.line(), member.column());
+                    for (ExpressionNode arg : args) checkExpression(arg, scope, currentFn);
+                    yield VeloraTypes.UNIT;
+                }
+                checkCollectionArgs(member, args, List.of(), scope, currentFn);
+                yield listElement;
             }
             case "contains" -> {
                 if (mapKey != null) {
@@ -1174,6 +1270,42 @@ public final class SemanticAnalyzer {
                     for (ExpressionNode arg : args) checkExpression(arg, scope, currentFn);
                 } else checkCollectionArgs(member, args, List.of(mapKey), scope, currentFn);
                 yield VeloraTypes.BOOLEAN;
+            }
+            case "get" -> {
+                if (mapKey == null) {
+                    error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "get() is only available on Map", member.line(), member.column());
+                    for (ExpressionNode arg : args) checkExpression(arg, scope, currentFn);
+                    yield VeloraTypes.UNIT;
+                }
+                checkCollectionArgs(member, args, List.of(mapKey), scope, currentFn);
+                yield mapValue.nullable();
+            }
+            case "getOrDefault" -> {
+                if (mapKey == null) {
+                    error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "getOrDefault() is only available on Map", member.line(), member.column());
+                    for (ExpressionNode arg : args) checkExpression(arg, scope, currentFn);
+                    yield VeloraTypes.UNIT;
+                }
+                checkCollectionArgs(member, args, List.of(mapKey, mapValue), scope, currentFn);
+                yield mapValue;
+            }
+            case "keys" -> {
+                if (mapKey == null) {
+                    error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "keys() is only available on Map", member.line(), member.column());
+                    for (ExpressionNode arg : args) checkExpression(arg, scope, currentFn);
+                    yield VeloraTypes.UNIT;
+                }
+                checkCollectionArgs(member, args, List.of(), scope, currentFn);
+                yield VeloraTypes.list(mapKey);
+            }
+            case "values" -> {
+                if (mapKey == null) {
+                    error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "values() is only available on Map", member.line(), member.column());
+                    for (ExpressionNode arg : args) checkExpression(arg, scope, currentFn);
+                    yield VeloraTypes.UNIT;
+                }
+                checkCollectionArgs(member, args, List.of(), scope, currentFn);
+                yield VeloraTypes.list(mapValue);
             }
             case "put" -> {
                 if (mapKey == null) {
@@ -1282,6 +1414,57 @@ public final class SemanticAnalyzer {
 
     private boolean isNullType(VeloraType type) {
         return type != null && type.isNullable() && type.name().equals("Unit?");
+    }
+
+    private void checkApiArguments(FunctionDescriptor descriptor, List<ExpressionNode> args, Scope scope, ResolvedScript.ResolvedFunction currentFn, int line, int column) {
+        if (!descriptor.variadic()) {
+            List<ExpressionNode> bound = bindArguments(descriptor.qualifiedName(), args, descriptor.parameters().stream().map(io.velora.api.function.ParameterDescriptor::name).toList(), descriptor.parameters().stream().map(io.velora.api.function.ParameterDescriptor::hasDefault).toList(), scope, currentFn, line, column);
+            for (int i = 0; i < bound.size(); i++) checkApiArgument(descriptor, descriptor.parameters().get(i), bound.get(i), scope, currentFn);
+            return;
+        }
+        int fixedCount = descriptor.parameters().size() - 1;
+        List<ExpressionNode> fixed = new ArrayList<>(Collections.nCopies(fixedCount, null));
+        List<ExpressionNode> variadic = new ArrayList<>();
+        boolean namedStarted = false;
+        int positional = 0;
+        for (ExpressionNode argument : args) {
+            if (argument instanceof NamedArgumentExpressionNode named) {
+                namedStarted = true;
+                int index = descriptor.parameters().stream().map(io.velora.api.function.ParameterDescriptor::name).toList().indexOf(named.argumentName());
+                if (index < 0) {
+                    error(DiagnosticCode.SEMANTIC_NAMED_ARG_UNKNOWN, "Unknown named argument '" + named.argumentName() + "' for " + descriptor.qualifiedName(), named.line(), named.column());
+                    checkExpression(named.value(), scope, currentFn);
+                } else if (index >= fixedCount) {
+                    error(DiagnosticCode.SEMANTIC_INVALID_ARGUMENT, "Variadic argument '" + named.argumentName() + "' must be positional", named.line(), named.column());
+                    checkExpression(named.value(), scope, currentFn);
+                } else if (fixed.get(index) != null) {
+                    error(DiagnosticCode.SEMANTIC_NAMED_ARG_DUPLICATE, "Duplicate argument '" + named.argumentName() + "'", named.line(), named.column());
+                    checkExpression(named.value(), scope, currentFn);
+                } else {
+                    fixed.set(index, named.value());
+                }
+                continue;
+            }
+            if (namedStarted) error(DiagnosticCode.SEMANTIC_WRONG_ARITY, "Positional arguments cannot follow named arguments in " + descriptor.qualifiedName(), argument.line(), argument.column());
+            while (positional < fixedCount && fixed.get(positional) != null) positional++;
+            if (positional < fixedCount) fixed.set(positional++, argument);
+            else variadic.add(argument);
+        }
+        for (int i = 0; i < fixedCount; i++) {
+            var parameter = descriptor.parameters().get(i);
+            if (fixed.get(i) == null && parameter.required()) error(DiagnosticCode.SEMANTIC_WRONG_ARITY, "Missing required argument '" + parameter.name() + "' for " + descriptor.qualifiedName(), line, column);
+            checkApiArgument(descriptor, parameter, fixed.get(i), scope, currentFn);
+        }
+        var parameter = descriptor.parameters().get(descriptor.parameters().size() - 1);
+        for (ExpressionNode argument : variadic) checkApiArgument(descriptor, parameter, argument, scope, currentFn);
+    }
+
+    private void checkApiArgument(FunctionDescriptor descriptor, io.velora.api.function.ParameterDescriptor parameter, ExpressionNode expression, Scope scope, ResolvedScript.ResolvedFunction currentFn) {
+        if (expression == null) return;
+        VeloraType argumentType = checkExpression(expression, scope, currentFn);
+        if (argumentType != null && argumentType != VeloraTypes.UNIT && !isAssignableExpression(expression, argumentType, parameter.type())) {
+            error(DiagnosticCode.SEMANTIC_WRONG_ARG_TYPE, "Argument '" + parameter.name() + "' type mismatch for " + descriptor.qualifiedName() + ": expected " + parameter.type().name() + ", got " + argumentType.name(), expression.line(), expression.column());
+        }
     }
 
     private List<ExpressionNode> bindArguments(String functionName, List<ExpressionNode> args, List<String> parameterNames, List<Boolean> defaults, Scope scope, ResolvedScript.ResolvedFunction currentFn, int line, int column) {
@@ -1411,6 +1594,7 @@ public final class SemanticAnalyzer {
             case "Float", "float" -> VeloraTypes.FLOAT;
             case "Double", "double" -> VeloraTypes.DOUBLE;
             case "Char", "char" -> VeloraTypes.CHAR;
+            case "Any" -> VeloraTypes.ANY;
             case "String" -> VeloraTypes.STRING;
             case "Duration" -> VeloraTypes.DURATION;
             case "Vec2" -> VeloraTypes.VEC2;

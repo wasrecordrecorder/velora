@@ -411,6 +411,32 @@ public final class IrBuilder {
                     int argCount = buildCall(call.callee(), call.arguments(), instrs);
                     maxStack = Math.max(maxStack, argCount);
                 }
+            } else if (call.callee() instanceof MemberAccessExpressionNode member && member.isSafeAccess()
+                    && !(member.target() instanceof IdentifierExpressionNode namespace && isApiNamespace(namespace.name()))) {
+                int[] target = buildExpression(member.target(), instrs);
+                maxStack = Math.max(maxStack, Math.max(target[1], 2));
+                instrs.add(new IrInstruction.Dup());
+                instrs.add(new IrInstruction.IsNull());
+                int memberJump = instrs.size();
+                instrs.add(new IrInstruction.JumpIfFalse(0));
+                int endJump = instrs.size();
+                instrs.add(new IrInstruction.Jump(0));
+                int memberStart = instrs.size();
+                instrs.set(memberJump, new IrInstruction.JumpIfFalse(memberStart));
+                for (int i = 0; i < call.arguments().size(); i++) {
+                    int[] argument = buildExpression(call.arguments().get(i), instrs);
+                    maxStack = Math.max(maxStack, argument[1] + i + 1);
+                }
+                VeloraType resultType = switch (member.member()) {
+                    case "contains", "containsKey", "remove", "startsWith", "endsWith", "equalsIgnoreCase" -> VeloraTypes.BOOLEAN;
+                    case "indexOf", "lastIndexOf" -> VeloraTypes.INT;
+                    case "charAt" -> VeloraTypes.CHAR;
+                    case "lower", "upper", "trim", "substring", "replace", "repeat", "toString" -> VeloraTypes.STRING;
+                    case "split" -> VeloraTypes.list(VeloraTypes.STRING);
+                    default -> VeloraTypes.UNIT;
+                };
+                instrs.add(new IrInstruction.CallMember(member.member(), call.arguments().size(), resultType));
+                instrs.set(endJump, new IrInstruction.Jump(instrs.size()));
             } else {
                 int argCount = buildCall(call.callee(), call.arguments(), instrs);
                 maxStack = Math.max(maxStack, argCount);
@@ -645,13 +671,11 @@ public final class IrBuilder {
         }
         if (callee instanceof MemberAccessExpressionNode mem && mem.target() instanceof IdentifierExpressionNode ns && isApiNamespace(ns.name())) {
             FunctionDescriptor descriptor = resolveApiDescriptor(ns.name(), mem.member());
-            List<ExpressionNode> bound = bindArguments(args, descriptor.parameters().stream().map(io.velora.api.function.ParameterDescriptor::name).toList());
-            List<Object> defaults = descriptor.parameters().stream().map(p -> p.hasDefault() ? p.defaultValue() : null).toList();
-            int stack = emitBoundArguments(bound, defaults, instrs);
+            int[] emitted = emitApiArguments(descriptor, args, instrs);
             int apiIdx = descriptor.index() >= 0 ? descriptor.index() : resolveApiIndex(ns.name(), mem.member());
-            if (descriptor.suspending()) instrs.add(new IrInstruction.CallSuspend(apiIdx, descriptor.parameters().size(), descriptor.returnType()));
-            else instrs.add(new IrInstruction.CallApi(apiIdx, descriptor.parameters().size(), descriptor.returnType()));
-            return Math.max(stack, descriptor.parameters().size());
+            if (descriptor.suspending()) instrs.add(new IrInstruction.CallSuspend(apiIdx, emitted[0], descriptor.returnType()));
+            else instrs.add(new IrInstruction.CallApi(apiIdx, emitted[0], descriptor.returnType()));
+            return Math.max(emitted[1], emitted[0]);
         }
         if (callee instanceof MemberAccessExpressionNode mem) {
             int[] receiver = buildExpression(mem.target(), instrs);
@@ -661,13 +685,46 @@ public final class IrBuilder {
                 max = Math.max(max, result[1] + i + 1);
             }
             VeloraType resultType = switch (mem.member()) {
-                case "contains", "containsKey", "remove" -> VeloraTypes.BOOLEAN;
+                case "contains", "containsKey", "remove", "startsWith", "endsWith", "equalsIgnoreCase" -> VeloraTypes.BOOLEAN;
+                case "indexOf", "lastIndexOf" -> VeloraTypes.INT;
+                case "charAt" -> VeloraTypes.CHAR;
+                case "lower", "upper", "trim", "substring", "replace", "repeat", "toString" -> VeloraTypes.STRING;
+                case "split" -> VeloraTypes.list(VeloraTypes.STRING);
                 default -> VeloraTypes.UNIT;
             };
             instrs.add(new IrInstruction.CallMember(mem.member(), args.size(), resultType));
             return Math.max(max, args.size() + 1);
         }
         throw new IllegalStateException("Unsupported callable expression: " + callee.nodeName());
+    }
+
+    private int[] emitApiArguments(FunctionDescriptor descriptor, List<ExpressionNode> args, List<IrInstruction> instrs) {
+        if (!descriptor.variadic()) {
+            List<ExpressionNode> bound = bindArguments(args, descriptor.parameters().stream().map(io.velora.api.function.ParameterDescriptor::name).toList());
+            List<Object> defaults = descriptor.parameters().stream().map(parameter -> parameter.hasDefault() ? parameter.defaultValue() : null).toList();
+            return new int[]{descriptor.parameters().size(), emitBoundArguments(bound, defaults, instrs)};
+        }
+        int fixedCount = descriptor.parameters().size() - 1;
+        List<ExpressionNode> fixed = new ArrayList<>(Collections.nCopies(fixedCount, null));
+        List<ExpressionNode> rest = new ArrayList<>();
+        int positional = 0;
+        for (ExpressionNode argument : args) {
+            if (argument instanceof NamedArgumentExpressionNode named) {
+                for (int i = 0; i < fixedCount; i++) if (descriptor.parameters().get(i).name().equals(named.argumentName())) fixed.set(i, named.value());
+                continue;
+            }
+            while (positional < fixedCount && fixed.get(positional) != null) positional++;
+            if (positional < fixedCount) fixed.set(positional++, argument);
+            else rest.add(argument);
+        }
+        int max = emitBoundArguments(fixed, descriptor.parameters().subList(0, fixedCount).stream().map(parameter -> parameter.hasDefault() ? parameter.defaultValue() : null).toList(), instrs);
+        int emitted = fixedCount;
+        for (ExpressionNode argument : rest) {
+            int[] result = buildExpression(argument, instrs);
+            max = Math.max(max, result[1] + emitted);
+            emitted++;
+        }
+        return new int[]{emitted, max};
     }
 
     private List<ExpressionNode> bindArguments(List<ExpressionNode> args, List<String> parameterNames) {
@@ -796,6 +853,7 @@ public final class IrBuilder {
             case "Float", "float" -> VeloraTypes.FLOAT;
             case "Double", "double" -> VeloraTypes.DOUBLE;
             case "Boolean", "boolean", "bool" -> VeloraTypes.BOOLEAN;
+            case "Any" -> VeloraTypes.ANY;
             case "String" -> VeloraTypes.STRING;
             case "Byte", "byte" -> VeloraTypes.BYTE;
             case "Char", "char" -> VeloraTypes.CHAR;

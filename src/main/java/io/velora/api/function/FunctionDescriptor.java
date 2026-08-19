@@ -17,6 +17,7 @@ public final class FunctionDescriptor {
     private final List<ParameterDescriptor> parameters;
     private final VeloraType returnType;
     private final boolean suspending;
+    private final boolean property;
     private final ScriptThread thread;
     private final int cost;
     private final FunctionInvoker invoker;
@@ -25,12 +26,13 @@ public final class FunctionDescriptor {
     private FunctionDescriptor(Builder b) {
         this.namespace = b.namespace;
         this.name = b.name;
-        this.description = b.description;
+        this.description = b.description == null ? "" : b.description;
         this.categoryId = b.categoryId;
         this.extensionId = b.extensionId;
         this.parameters = List.copyOf(b.parameters);
         this.returnType = b.returnType;
         this.suspending = b.suspending;
+        this.property = b.property;
         this.thread = b.thread;
         this.cost = b.cost;
         this.invoker = b.invoker;
@@ -47,6 +49,7 @@ public final class FunctionDescriptor {
         b.parameters = new ArrayList<>(this.parameters);
         b.returnType = this.returnType;
         b.suspending = this.suspending;
+        b.property = this.property;
         b.thread = this.thread;
         b.cost = this.cost;
         b.invoker = this.invoker;
@@ -62,10 +65,14 @@ public final class FunctionDescriptor {
     public List<ParameterDescriptor> parameters() { return parameters; }
     public VeloraType returnType() { return returnType; }
     public boolean suspending() { return suspending; }
+    public boolean property() { return property; }
     public ScriptThread thread() { return thread; }
     public int cost() { return cost; }
     public FunctionInvoker invoker() { return invoker; }
     public int index() { return index; }
+    public boolean variadic() { return !parameters.isEmpty() && parameters.get(parameters.size() - 1).variadic(); }
+    public int minimumArgumentCount() { return (int) parameters.stream().filter(ParameterDescriptor::required).count(); }
+    public int maximumArgumentCount() { return variadic() ? Integer.MAX_VALUE : parameters.size(); }
 
     /**
      * Qualified name: namespace.name
@@ -87,6 +94,7 @@ public final class FunctionDescriptor {
         private List<ParameterDescriptor> parameters = new ArrayList<>();
         private VeloraType returnType;
         private boolean suspending = false;
+        private boolean property = false;
         private ScriptThread thread = ScriptThread.ANY;
         private int cost = 1;
         private FunctionInvoker invoker;
@@ -98,10 +106,14 @@ public final class FunctionDescriptor {
         public Builder categoryId(String v) { this.categoryId = v; return this; }
         public Builder extensionId(String v) { this.extensionId = v; return this; }
         public Builder parameter(String name, VeloraType type) { this.parameters.add(ParameterDescriptor.required(name, type)); return this; }
+        public Builder parameter(String name, VeloraType type, String description) { this.parameters.add(ParameterDescriptor.required(name, type, description)); return this; }
+        public Builder variadicParameter(String name, VeloraType type) { this.parameters.add(ParameterDescriptor.variadic(name, type)); return this; }
+        public Builder variadicParameter(String name, VeloraType type, String description) { this.parameters.add(ParameterDescriptor.variadic(name, type, description)); return this; }
         public Builder parameter(ParameterDescriptor param) { this.parameters.add(param); return this; }
         public Builder parameters(List<ParameterDescriptor> params) { this.parameters = new ArrayList<>(params); return this; }
         public Builder returns(VeloraType type) { this.returnType = type; return this; }
         public Builder suspending(boolean v) { this.suspending = v; return this; }
+        public Builder property(boolean v) { this.property = v; return this; }
         public Builder thread(ScriptThread v) { this.thread = v; return this; }
         public Builder cost(int v) { this.cost = v; return this; }
         public Builder invoker(FunctionInvoker v) { this.invoker = v; return this; }
@@ -116,13 +128,20 @@ public final class FunctionDescriptor {
             Objects.requireNonNull(invoker, "invoker");
             if (cost <= 0) throw new IllegalArgumentException("Cost must be positive");
             if (thread == ScriptThread.WORKER && !suspending) throw new IllegalArgumentException("WORKER functions must be suspending");
+            if (property && (!parameters.isEmpty() || suspending)) throw new IllegalArgumentException("Properties cannot declare parameters or suspend");
             if (description != null && !description.isEmpty() && description.isBlank()) throw new IllegalArgumentException("Description cannot be blank");
             Set<String> names = new HashSet<>();
             boolean optionalSeen = false;
-            for (ParameterDescriptor parameter : parameters) {
+            boolean variadicSeen = false;
+            for (int i = 0; i < parameters.size(); i++) {
+                ParameterDescriptor parameter = parameters.get(i);
                 if (!isIdentifier(parameter.name())) throw new IllegalArgumentException("Invalid parameter name: " + parameter.name());
                 if (!names.add(parameter.name())) throw new IllegalArgumentException("Duplicate parameter name: " + parameter.name());
-                if (parameter.hasDefault()) {
+                if (parameter.description() != null && !parameter.description().isEmpty() && parameter.description().isBlank()) throw new IllegalArgumentException("Parameter description cannot be blank: " + parameter.name());
+                if (parameter.variadic()) {
+                    if (variadicSeen || i != parameters.size() - 1) throw new IllegalArgumentException("Variadic parameter must be the last parameter: " + parameter.name());
+                    variadicSeen = true;
+                } else if (parameter.hasDefault()) {
                     optionalSeen = true;
                     validateDefault(parameter);
                 } else if (optionalSeen) {

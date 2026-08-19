@@ -361,10 +361,41 @@ public final class VirtualMachine {
                         ScriptValue[] memberArgs = new ScriptValue[argCount];
                         for (int i = argCount - 1; i >= 0; i--) memberArgs[i] = stack.pop();
                         ScriptValue recv = stack.pop();
-                        ScriptValue result;
-                        if (recv instanceof ListValue list) {
+                        ScriptValue result = null;
+                        if (memberName.equals("toString") && argCount == 0) {
+                            result = new StringValue(valueToString(recv));
+                        } else if (recv instanceof StringValue string) {
+                            result = switch (memberName) {
+                                case "lower" -> { requireMemberArgs(memberName, memberArgs, 0); yield new StringValue(string.value().toLowerCase(Locale.ROOT)); }
+                                case "upper" -> { requireMemberArgs(memberName, memberArgs, 0); yield new StringValue(string.value().toUpperCase(Locale.ROOT)); }
+                                case "trim" -> { requireMemberArgs(memberName, memberArgs, 0); yield new StringValue(string.value().strip()); }
+                                case "contains" -> { requireMemberArgs(memberName, memberArgs, 1); yield PrimitiveValue.of(string.value().contains(stringArg(memberArgs[0], memberName))); }
+                                case "startsWith" -> { requireMemberArgs(memberName, memberArgs, 1); yield PrimitiveValue.of(string.value().startsWith(stringArg(memberArgs[0], memberName))); }
+                                case "endsWith" -> { requireMemberArgs(memberName, memberArgs, 1); yield PrimitiveValue.of(string.value().endsWith(stringArg(memberArgs[0], memberName))); }
+                                case "equalsIgnoreCase" -> { requireMemberArgs(memberName, memberArgs, 1); yield PrimitiveValue.of(string.value().equalsIgnoreCase(stringArg(memberArgs[0], memberName))); }
+                                case "indexOf" -> { requireMemberArgs(memberName, memberArgs, 1); yield PrimitiveValue.of(string.value().indexOf(stringArg(memberArgs[0], memberName))); }
+                                case "lastIndexOf" -> { requireMemberArgs(memberName, memberArgs, 1); yield PrimitiveValue.of(string.value().lastIndexOf(stringArg(memberArgs[0], memberName))); }
+                                case "charAt" -> { requireMemberArgs(memberName, memberArgs, 1); yield PrimitiveValue.of(string.value().charAt(intArg(memberArgs[0], memberName))); }
+                                case "substring" -> {
+                                    if (memberArgs.length != 1 && memberArgs.length != 2) throw new IllegalArgumentException("substring expects 1 or 2 arguments");
+                                    int begin = intArg(memberArgs[0], memberName);
+                                    yield new StringValue(memberArgs.length == 1 ? string.value().substring(begin) : string.value().substring(begin, intArg(memberArgs[1], memberName)));
+                                }
+                                case "replace" -> { requireMemberArgs(memberName, memberArgs, 2); yield new StringValue(string.value().replace(stringArg(memberArgs[0], memberName), stringArg(memberArgs[1], memberName))); }
+                                case "split" -> {
+                                    requireMemberArgs(memberName, memberArgs, 1);
+                                    String delimiter = stringArg(memberArgs[0], memberName);
+                                    if (delimiter.isEmpty()) throw new IllegalArgumentException("split delimiter cannot be empty");
+                                    List<ScriptValue> parts = Arrays.stream(string.value().split(java.util.regex.Pattern.quote(delimiter), -1)).map(StringValue::new).map(value -> (ScriptValue) value).toList();
+                                    yield new ListValue(parts);
+                                }
+                                case "repeat" -> { requireMemberArgs(memberName, memberArgs, 1); yield new StringValue(string.value().repeat(intArg(memberArgs[0], memberName))); }
+                                default -> null;
+                            };
+                        } else if (recv instanceof ListValue list) {
                             result = switch (memberName) {
                                 case "add" -> {
+                                    requireMemberArgs(memberName, memberArgs, 1);
                                     list.elements().add(memberArgs[0]);
                                     try {
                                         enforceValueLimits(list);
@@ -376,14 +407,29 @@ public final class VirtualMachine {
                                     yield PrimitiveValue.nullValue();
                                 }
                                 case "remove" -> {
+                                    requireMemberArgs(memberName, memberArgs, 1);
                                     boolean removed = list.elements().remove(memberArgs[0]);
                                     if (removed && host != null) host.commitStateMutation(fiberId);
                                     yield PrimitiveValue.of(removed);
                                 }
-                                case "contains" -> PrimitiveValue.of(list.elements().contains(memberArgs[0]));
-                                case "clear" -> {
-                                    list.elements().clear();
+                                case "removeAt" -> {
+                                    requireMemberArgs(memberName, memberArgs, 1);
+                                    int index = intArg(memberArgs[0], memberName);
+                                    if (index < 0 || index >= list.elements().size()) throw new IndexAccessException("List index out of bounds: " + index);
+                                    ScriptValue removed = list.elements().remove(index);
                                     if (host != null) host.commitStateMutation(fiberId);
+                                    yield removed;
+                                }
+                                case "contains" -> { requireMemberArgs(memberName, memberArgs, 1); yield PrimitiveValue.of(list.elements().contains(memberArgs[0])); }
+                                case "indexOf" -> { requireMemberArgs(memberName, memberArgs, 1); yield PrimitiveValue.of(list.elements().indexOf(memberArgs[0])); }
+                                case "first" -> { requireMemberArgs(memberName, memberArgs, 0); if (list.elements().isEmpty()) throw new IndexAccessException("first() called on an empty List"); yield list.elements().get(0); }
+                                case "last" -> { requireMemberArgs(memberName, memberArgs, 0); if (list.elements().isEmpty()) throw new IndexAccessException("last() called on an empty List"); yield list.elements().get(list.elements().size() - 1); }
+                                case "clear" -> {
+                                    requireMemberArgs(memberName, memberArgs, 0);
+                                    if (!list.elements().isEmpty()) {
+                                        list.elements().clear();
+                                        if (host != null) host.commitStateMutation(fiberId);
+                                    }
                                     yield PrimitiveValue.nullValue();
                                 }
                                 default -> null;
@@ -391,6 +437,7 @@ public final class VirtualMachine {
                         } else if (recv instanceof SetValue set) {
                             result = switch (memberName) {
                                 case "add" -> {
+                                    requireMemberArgs(memberName, memberArgs, 1);
                                     boolean added = set.elements().add(memberArgs[0]);
                                     try {
                                         enforceValueLimits(set);
@@ -401,22 +448,15 @@ public final class VirtualMachine {
                                     }
                                     yield PrimitiveValue.nullValue();
                                 }
-                                case "remove" -> {
-                                    boolean removed = set.elements().remove(memberArgs[0]);
-                                    if (removed && host != null) host.commitStateMutation(fiberId);
-                                    yield PrimitiveValue.of(removed);
-                                }
-                                case "contains" -> PrimitiveValue.of(set.elements().contains(memberArgs[0]));
-                                case "clear" -> {
-                                    set.elements().clear();
-                                    if (host != null) host.commitStateMutation(fiberId);
-                                    yield PrimitiveValue.nullValue();
-                                }
+                                case "remove" -> { requireMemberArgs(memberName, memberArgs, 1); boolean removed = set.elements().remove(memberArgs[0]); if (removed && host != null) host.commitStateMutation(fiberId); yield PrimitiveValue.of(removed); }
+                                case "contains" -> { requireMemberArgs(memberName, memberArgs, 1); yield PrimitiveValue.of(set.elements().contains(memberArgs[0])); }
+                                case "clear" -> { requireMemberArgs(memberName, memberArgs, 0); if (!set.elements().isEmpty()) { set.elements().clear(); if (host != null) host.commitStateMutation(fiberId); } yield PrimitiveValue.nullValue(); }
                                 default -> null;
                             };
                         } else if (recv instanceof MapValue map) {
                             result = switch (memberName) {
                                 case "put" -> {
+                                    requireMemberArgs(memberName, memberArgs, 2);
                                     boolean hadKey = map.entries().containsKey(memberArgs[0]);
                                     ScriptValue previous = map.entries().put(memberArgs[0], memberArgs[1]);
                                     try {
@@ -429,26 +469,21 @@ public final class VirtualMachine {
                                     }
                                     yield PrimitiveValue.nullValue();
                                 }
-                                case "remove" -> {
-                                    boolean removed = map.entries().remove(memberArgs[0]) != null;
-                                    if (removed && host != null) host.commitStateMutation(fiberId);
-                                    yield PrimitiveValue.of(removed);
-                                }
-                                case "containsKey" -> PrimitiveValue.of(map.entries().containsKey(memberArgs[0]));
-                                case "clear" -> {
-                                    map.entries().clear();
-                                    if (host != null) host.commitStateMutation(fiberId);
-                                    yield PrimitiveValue.nullValue();
-                                }
+                                case "remove" -> { requireMemberArgs(memberName, memberArgs, 1); boolean removed = map.entries().remove(memberArgs[0]) != null; if (removed && host != null) host.commitStateMutation(fiberId); yield PrimitiveValue.of(removed); }
+                                case "containsKey" -> { requireMemberArgs(memberName, memberArgs, 1); yield PrimitiveValue.of(map.entries().containsKey(memberArgs[0])); }
+                                case "get" -> { requireMemberArgs(memberName, memberArgs, 1); yield map.entries().getOrDefault(memberArgs[0], PrimitiveValue.nullValue()); }
+                                case "getOrDefault" -> { requireMemberArgs(memberName, memberArgs, 2); yield map.entries().getOrDefault(memberArgs[0], memberArgs[1]); }
+                                case "keys" -> { requireMemberArgs(memberName, memberArgs, 0); yield new ListValue(new ArrayList<>(map.entries().keySet())); }
+                                case "values" -> { requireMemberArgs(memberName, memberArgs, 0); yield new ListValue(new ArrayList<>(map.entries().values())); }
+                                case "clear" -> { requireMemberArgs(memberName, memberArgs, 0); if (!map.entries().isEmpty()) { map.entries().clear(); if (host != null) host.commitStateMutation(fiberId); } yield PrimitiveValue.nullValue(); }
                                 default -> null;
                             };
-                        } else {
-                            result = null;
                         }
                         if (result == null) {
                             return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
                                     "Method not found: " + memberName, currentLine(callStack), fiberId), instructions, System.nanoTime() - startTime);
                         }
+                        enforceValueLimits(result);
                         stack.push(result);
                     }
                     case GET_MEMBER -> {
@@ -456,6 +491,10 @@ public final class VirtualMachine {
                         ScriptValue recv = stack.pop();
                         if (recv instanceof StringValue sv && memberName.equals("length")) {
                             stack.push(PrimitiveValue.of(sv.value().length()));
+                        } else if (recv instanceof StringValue sv && memberName.equals("isEmpty")) {
+                            stack.push(PrimitiveValue.of(sv.value().isEmpty()));
+                        } else if (recv instanceof StringValue sv && memberName.equals("isBlank")) {
+                            stack.push(PrimitiveValue.of(sv.value().isBlank()));
                         } else if (recv instanceof ListValue lv && memberName.equals("size")) {
                             stack.push(PrimitiveValue.of(lv.elements().size()));
                         } else if (recv instanceof ListValue lv && memberName.equals("isEmpty")) {
@@ -729,6 +768,7 @@ public final class VirtualMachine {
 
     private static ScriptValue javaToValue(io.velora.api.type.VeloraType type, Object value, IdentityHashMap<Object, Boolean> active) {
         io.velora.api.type.VeloraType expected = type.nonNull();
+        if (expected == io.velora.api.type.VeloraTypes.ANY) return javaToValue(value, active);
         if (value == null) {
             if (expected == io.velora.api.type.VeloraTypes.UNIT || type.isNullable()) return PrimitiveValue.nullValue();
             throw new IllegalArgumentException("Host returned null for non-null type " + type.name());
@@ -825,6 +865,7 @@ public final class VirtualMachine {
 
     private static ScriptValue validateScriptValue(io.velora.api.type.VeloraType type, ScriptValue value, IdentityHashMap<Object, Boolean> active) {
         io.velora.api.type.VeloraType expected = type.nonNull();
+        if (expected == io.velora.api.type.VeloraTypes.ANY) return value == null ? PrimitiveValue.nullValue() : value;
         if (value == null || value.isNull()) {
             if (expected == io.velora.api.type.VeloraTypes.UNIT || type.isNullable()) return PrimitiveValue.nullValue();
             throw new IllegalArgumentException("Host returned null for non-null type " + type.name());
@@ -954,6 +995,20 @@ public final class VirtualMachine {
         };
     }
 
+    private void requireMemberArgs(String name, ScriptValue[] args, int count) {
+        if (args.length != count) throw new IllegalArgumentException(name + " expects " + count + " argument(s), got " + args.length);
+    }
+
+    private String stringArg(ScriptValue value, String method) {
+        if (value instanceof StringValue string) return string.value();
+        throw new IllegalArgumentException(method + " expects String arguments");
+    }
+
+    private int intArg(ScriptValue value, String method) {
+        if (value instanceof PrimitiveValue.IntV number) return number.value();
+        throw new IllegalArgumentException(method + " expects Int arguments");
+    }
+
     private int vectorMemberIndex(String member) {
         return switch (member) {
             case "x", "r" -> 0;
@@ -999,10 +1054,16 @@ public final class VirtualMachine {
     }
 
     private String valueToString(ScriptValue value) {
-        if (value instanceof StringValue string) return string.value();
         if (value == null || value.isNull()) return "null";
-        Object boxed = value.boxed();
-        return boxed != null ? boxed.toString() : "null";
+        if (value instanceof StringValue string) return string.value();
+        if (value instanceof ListValue list) return list.elements().stream().map(this::valueToString).collect(java.util.stream.Collectors.joining(", ", "[", "]"));
+        if (value instanceof SetValue set) return set.elements().stream().map(this::valueToString).collect(java.util.stream.Collectors.joining(", ", "[", "]"));
+        if (value instanceof MapValue map) return map.entries().entrySet().stream().map(entry -> valueToString(entry.getKey()) + "=" + valueToString(entry.getValue())).collect(java.util.stream.Collectors.joining(", ", "{", "}"));
+        if (value instanceof StructValue struct) return struct.typeName() + struct.fields().entrySet().stream().map(entry -> entry.getKey() + "=" + valueToString(entry.getValue())).collect(java.util.stream.Collectors.joining(", ", "{", "}"));
+        if (value instanceof EnumValue enumValue) return enumValue.constantName();
+        if (value instanceof HandleValue handle) return String.valueOf(handle.handle());
+        if (value instanceof TaskValue task) return "Task(" + task.taskId() + ", " + task.state() + ")";
+        return String.valueOf(value.boxed());
     }
 
     private ScriptValue sub(ScriptValue a, ScriptValue b) { return numeric(a, b, '-'); }

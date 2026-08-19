@@ -82,7 +82,7 @@ public final class BindingDescriptorFactory {
         } else {
             returnType = resolveAnnotatedType(annotation.returnType(), genericReturn, method, true);
         }
-        String description = defaultText(annotation.description(), "Function " + annotation.name());
+        String description = annotation.description().trim();
         String categoryId = defaultText(annotation.category(), namespace);
         FunctionDescriptor.Builder builder = FunctionDescriptor.builder()
                 .namespace(namespace)
@@ -95,16 +95,22 @@ public final class BindingDescriptorFactory {
                 .cost(annotation.cost());
         int scriptArgIndex = 0;
         int contextCount = 0;
-        for (Parameter parameter : method.getParameters()) {
+        Parameter[] parameters = method.getParameters();
+        for (int i = 0; i < parameters.length; i++) {
+            Parameter parameter = parameters[i];
             if (parameter.getType() == FunctionContext.class) {
                 if (++contextCount > 1) throw new BindingValidationException("Function " + method.getName() + " can declare at most one FunctionContext");
                 continue;
             }
             VeloraParam named = parameter.getAnnotation(VeloraParam.class);
-            VeloraType parameterType = resolveAnnotatedType(named != null ? named.type() : "", parameter.getParameterizedType(), method, false);
+            boolean variadic = method.isVarArgs() && i == parameters.length - 1;
+            Type parameterJavaType = variadic ? parameter.getType().getComponentType() : parameter.getParameterizedType();
+            VeloraType parameterType = resolveAnnotatedType(named != null ? named.type() : "", parameterJavaType, method, false);
             String parameterName = named != null ? named.value() : "arg" + scriptArgIndex;
             if (!isIdentifier(parameterName)) throw new BindingValidationException("Invalid script parameter name '" + parameterName + "' in " + method.getName());
-            builder.parameter(parameterName, parameterType);
+            String parameterDescription = named != null ? named.description().trim() : "";
+            if (variadic) builder.variadicParameter(parameterName, parameterType, parameterDescription);
+            else builder.parameter(parameterName, parameterType, parameterDescription);
             scriptArgIndex++;
         }
         builder.invoker(context -> invoke(binding, method, extractArguments(method, context)));
@@ -125,11 +131,12 @@ public final class BindingDescriptorFactory {
         FunctionDescriptor.Builder builder = FunctionDescriptor.builder()
                 .namespace(namespace)
                 .name(annotation.name())
-                .description(defaultText(annotation.description(), "Property " + annotation.name()))
+                .description(annotation.description().trim())
                 .categoryId(defaultText(annotation.category(), namespace))
                 .returns(returnType)
                 .thread(annotation.thread())
-                .cost(annotation.cost());
+                .cost(annotation.cost())
+                .property(true);
         builder.invoker(context -> invoke(binding, method, extractArguments(method, context)));
         return builder.build();
     }
@@ -148,15 +155,27 @@ public final class BindingDescriptorFactory {
         int scriptArgIndex = 0;
         for (int i = 0; i < parameters.length; i++) {
             Class<?> type = parameters[i].getType();
-            if (type == FunctionContext.class) args[i] = context;
-            else {
-                Object value = context.argument(scriptArgIndex++);
-                if (type == Duration.class) args[i] = Duration.ofNanos(((Number) value).longValue());
-                else if (type == UUID.class) args[i] = value instanceof UUID uuid ? uuid : UUID.fromString(String.valueOf(value));
-                else args[i] = context.argument(scriptArgIndex - 1, type);
+            if (type == FunctionContext.class) {
+                args[i] = context;
+            } else if (method.isVarArgs() && i == parameters.length - 1) {
+                Class<?> component = type.getComponentType();
+                int count = context.argumentCount() - scriptArgIndex;
+                Object array = java.lang.reflect.Array.newInstance(component, count);
+                for (int j = 0; j < count; j++) java.lang.reflect.Array.set(array, j, bindingArgument(context, scriptArgIndex + j, component));
+                args[i] = array;
+                scriptArgIndex += count;
+            } else {
+                args[i] = bindingArgument(context, scriptArgIndex++, type);
             }
         }
         return args;
+    }
+
+    private Object bindingArgument(FunctionContext context, int index, Class<?> type) {
+        Object value = context.argument(index);
+        if (type == Duration.class) return Duration.ofNanos(((Number) value).longValue());
+        if (type == UUID.class) return value instanceof UUID uuid ? uuid : UUID.fromString(String.valueOf(value));
+        return context.argument(index, type);
     }
 
 
@@ -233,7 +252,11 @@ public final class BindingDescriptorFactory {
         if (javaType == String.class) return VeloraTypes.STRING;
         if (javaType == Duration.class) return VeloraTypes.DURATION;
         if (javaType == UUID.class) return VeloraTypes.UUID;
-        if (javaType == Object.class || javaType == Thread.class || javaType == java.nio.file.Path.class) throw unsupported(type, method);
+        if (javaType == Object.class) {
+            if (allowVoid) throw unsupported(type, method);
+            return VeloraTypes.ANY;
+        }
+        if (javaType == Thread.class || javaType == java.nio.file.Path.class) throw unsupported(type, method);
         if (List.class.isAssignableFrom(javaType) || Set.class.isAssignableFrom(javaType) || Map.class.isAssignableFrom(javaType) || VeloraTask.class.isAssignableFrom(javaType)) {
             throw new BindingValidationException("Generic type arguments are required for " + javaType.getTypeName() + " in " + method.getName());
         }

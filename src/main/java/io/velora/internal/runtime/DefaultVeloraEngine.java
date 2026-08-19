@@ -80,6 +80,10 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         categoryRegistry.register(new ApiCategory("core", "Core", "Core engine functionality"));
         categoryRegistry.register(new ApiCategory("console", "Console", "Script console output"));
         categoryRegistry.register(new ApiCategory("log", "Logging", "Logging utilities"));
+        categoryRegistry.register(new ApiCategory("math", "Math", "Numeric and trigonometric utilities"));
+        categoryRegistry.register(new ApiCategory("string", "String", "String conversion and parsing utilities"));
+        categoryRegistry.register(new ApiCategory("random", "Random", "Random value generation"));
+        categoryRegistry.register(new ApiCategory("time", "Time", "Host clock utilities"));
         categoryRegistry.register(new ApiCategory("settings", "Settings", "Script settings and configuration"));
         this.state = VeloraState.CONFIGURING;
     }
@@ -89,20 +93,218 @@ public final class DefaultVeloraEngine implements VeloraEngine {
     }
 
     private void registerBuiltInApi() {
+        registerConsoleApi();
+        registerStringApi();
+        registerConvertApi();
+        registerMathApi();
+        registerRandomApi();
+        registerTimeApi();
+        registerUuidApi();
+    }
+
+    private void registerConsoleApi() {
         var hostLogger = builder.host().logger();
         apiRegistry.namespace("console", ns -> {
-            ns.function("print", VeloraTypes.UNIT, p -> p.required("message", VeloraTypes.STRING), ctx -> { writeLog(ctx, ScriptLogEntry.Level.INFO, String.valueOf(ctx.argument(0)), hostLogger); return null; }).description("Prints a message to the host console").categoryId("console");
-            ns.function("info", VeloraTypes.UNIT, p -> p.required("message", VeloraTypes.STRING), ctx -> { writeLog(ctx, ScriptLogEntry.Level.INFO, String.valueOf(ctx.argument(0)), hostLogger); return null; }).description("Prints an informational message").categoryId("console");
-            ns.function("warn", VeloraTypes.UNIT, p -> p.required("message", VeloraTypes.STRING), ctx -> { writeLog(ctx, ScriptLogEntry.Level.WARN, String.valueOf(ctx.argument(0)), hostLogger); return null; }).description("Prints a warning message").categoryId("console");
-            ns.function("error", VeloraTypes.UNIT, p -> p.required("message", VeloraTypes.STRING), ctx -> { writeLog(ctx, ScriptLogEntry.Level.ERROR, String.valueOf(ctx.argument(0)), hostLogger); return null; }).description("Prints an error message").categoryId("console");
-            ns.function("debug", VeloraTypes.UNIT, p -> p.required("message", VeloraTypes.STRING), ctx -> { writeLog(ctx, ScriptLogEntry.Level.DEBUG, String.valueOf(ctx.argument(0)), hostLogger); return null; }).description("Prints a debug message").categoryId("console");
+            ns.function("print", VeloraTypes.UNIT, p -> p.variadic("values", VeloraTypes.ANY, "Values to print, separated by spaces"), ctx -> { writeLog(ctx, ScriptLogEntry.Level.INFO, formatArguments(ctx), hostLogger); return null; }).description("Prints one or more values to the host console").categoryId("console");
+            ns.function("info", VeloraTypes.UNIT, p -> p.variadic("values", VeloraTypes.ANY, "Values to log, separated by spaces"), ctx -> { writeLog(ctx, ScriptLogEntry.Level.INFO, formatArguments(ctx), hostLogger); return null; }).description("Logs one or more informational values").categoryId("console");
+            ns.function("warn", VeloraTypes.UNIT, p -> p.variadic("values", VeloraTypes.ANY, "Values to log, separated by spaces"), ctx -> { writeLog(ctx, ScriptLogEntry.Level.WARN, formatArguments(ctx), hostLogger); return null; }).description("Logs one or more warning values").categoryId("console");
+            ns.function("error", VeloraTypes.UNIT, p -> p.variadic("values", VeloraTypes.ANY, "Values to log, separated by spaces"), ctx -> { writeLog(ctx, ScriptLogEntry.Level.ERROR, formatArguments(ctx), hostLogger); return null; }).description("Logs one or more error values").categoryId("console");
+            ns.function("debug", VeloraTypes.UNIT, p -> p.variadic("values", VeloraTypes.ANY, "Values to log, separated by spaces"), ctx -> { writeLog(ctx, ScriptLogEntry.Level.DEBUG, formatArguments(ctx), hostLogger); return null; }).description("Logs one or more debug values").categoryId("console");
         });
         apiRegistry.namespace("log", ns -> {
-            ns.function("info", VeloraTypes.UNIT, p -> p.required("message", VeloraTypes.STRING), ctx -> { writeLog(ctx, ScriptLogEntry.Level.INFO, String.valueOf(ctx.argument(0)), hostLogger); return null; }).description("Logs an informational message").categoryId("log");
-            ns.function("warn", VeloraTypes.UNIT, p -> p.required("message", VeloraTypes.STRING), ctx -> { writeLog(ctx, ScriptLogEntry.Level.WARN, String.valueOf(ctx.argument(0)), hostLogger); return null; }).description("Logs a warning message").categoryId("log");
-            ns.function("error", VeloraTypes.UNIT, p -> p.required("message", VeloraTypes.STRING), ctx -> { writeLog(ctx, ScriptLogEntry.Level.ERROR, String.valueOf(ctx.argument(0)), hostLogger); return null; }).description("Logs an error message").categoryId("log");
-            ns.function("debug", VeloraTypes.UNIT, p -> p.required("message", VeloraTypes.STRING), ctx -> { writeLog(ctx, ScriptLogEntry.Level.DEBUG, String.valueOf(ctx.argument(0)), hostLogger); return null; }).description("Logs a debug message").categoryId("log");
+            ns.function("info", VeloraTypes.UNIT, p -> p.variadic("values", VeloraTypes.ANY, "Values to log, separated by spaces"), ctx -> { writeLog(ctx, ScriptLogEntry.Level.INFO, formatArguments(ctx), hostLogger); return null; }).description("Logs one or more informational values").categoryId("log");
+            ns.function("warn", VeloraTypes.UNIT, p -> p.variadic("values", VeloraTypes.ANY, "Values to log, separated by spaces"), ctx -> { writeLog(ctx, ScriptLogEntry.Level.WARN, formatArguments(ctx), hostLogger); return null; }).description("Logs one or more warning values").categoryId("log");
+            ns.function("error", VeloraTypes.UNIT, p -> p.variadic("values", VeloraTypes.ANY, "Values to log, separated by spaces"), ctx -> { writeLog(ctx, ScriptLogEntry.Level.ERROR, formatArguments(ctx), hostLogger); return null; }).description("Logs one or more error values").categoryId("log");
+            ns.function("debug", VeloraTypes.UNIT, p -> p.variadic("values", VeloraTypes.ANY, "Values to log, separated by spaces"), ctx -> { writeLog(ctx, ScriptLogEntry.Level.DEBUG, formatArguments(ctx), hostLogger); return null; }).description("Logs one or more debug values").categoryId("log");
         });
+    }
+
+    private void registerStringApi() {
+        apiRegistry.namespace("string", ns -> {
+            ns.function("valueOf", VeloraTypes.STRING, p -> p.required("value", VeloraTypes.ANY, "Value to convert to text"), ctx -> stringify(ctx.argument(0))).description("Converts any Velora value to a readable string").categoryId("string");
+            ns.function("parseInt", VeloraTypes.INT, p -> p.required("text", VeloraTypes.STRING, "Integer text"), ctx -> Integer.parseInt(ctx.argument(0, String.class).trim())).description("Parses a base-10 Int from text").categoryId("string");
+            ns.function("parseLong", VeloraTypes.LONG, p -> p.required("text", VeloraTypes.STRING, "Long integer text"), ctx -> Long.parseLong(ctx.argument(0, String.class).trim())).description("Parses a base-10 Long from text").categoryId("string");
+            ns.function("parseFloat", VeloraTypes.FLOAT, p -> p.required("text", VeloraTypes.STRING, "Floating-point text"), ctx -> Float.parseFloat(ctx.argument(0, String.class).trim())).description("Parses a Float from text").categoryId("string");
+            ns.function("parseDouble", VeloraTypes.DOUBLE, p -> p.required("text", VeloraTypes.STRING, "Floating-point text"), ctx -> Double.parseDouble(ctx.argument(0, String.class).trim())).description("Parses a Double from text").categoryId("string");
+            ns.function("parseBoolean", VeloraTypes.BOOLEAN, p -> p.required("text", VeloraTypes.STRING, "Either true or false"), ctx -> parseBoolean(ctx.argument(0, String.class))).description("Parses true or false from text, ignoring case").categoryId("string");
+            ns.function("tryParseInt", VeloraTypes.INT.nullable(), p -> p.required("text", VeloraTypes.STRING, "Integer text"), ctx -> tryParse(ctx.argument(0, String.class), Integer::parseInt)).description("Parses an Int or returns null when the text is invalid").categoryId("string");
+            ns.function("tryParseLong", VeloraTypes.LONG.nullable(), p -> p.required("text", VeloraTypes.STRING, "Long integer text"), ctx -> tryParse(ctx.argument(0, String.class), Long::parseLong)).description("Parses a Long or returns null when the text is invalid").categoryId("string");
+            ns.function("tryParseFloat", VeloraTypes.FLOAT.nullable(), p -> p.required("text", VeloraTypes.STRING, "Floating-point text"), ctx -> tryParse(ctx.argument(0, String.class), Float::parseFloat)).description("Parses a Float or returns null when the text is invalid").categoryId("string");
+            ns.function("tryParseDouble", VeloraTypes.DOUBLE.nullable(), p -> p.required("text", VeloraTypes.STRING, "Floating-point text"), ctx -> tryParse(ctx.argument(0, String.class), Double::parseDouble)).description("Parses a Double or returns null when the text is invalid").categoryId("string");
+            ns.function("tryParseBoolean", VeloraTypes.BOOLEAN.nullable(), p -> p.required("text", VeloraTypes.STRING, "Either true or false"), ctx -> { try { return parseBoolean(ctx.argument(0, String.class).trim()); } catch (IllegalArgumentException ignored) { return null; } }).description("Parses a Boolean or returns null when the text is invalid").categoryId("string");
+            ns.function("join", VeloraTypes.STRING, p -> p.required("separator", VeloraTypes.STRING, "Text inserted between values").required("values", VeloraTypes.ANY, "List, set or array of values"), ctx -> joinValues(ctx.argument(0, String.class), ctx.argument(1))).description("Joins a list, set or array into one string").categoryId("string");
+        });
+    }
+
+    private void registerConvertApi() {
+        apiRegistry.namespace("convert", ns -> {
+            ns.function("string", VeloraTypes.STRING, p -> p.required("value", VeloraTypes.ANY, "Value to convert"), ctx -> stringify(ctx.argument(0))).description("Converts a value to String").categoryId("core");
+            ns.function("int", VeloraTypes.INT, p -> p.required("value", VeloraTypes.ANY, "Number, character or numeric string"), ctx -> toInt(ctx.argument(0))).description("Converts a number, character or numeric string to Int").categoryId("core");
+            ns.function("long", VeloraTypes.LONG, p -> p.required("value", VeloraTypes.ANY, "Number, character or numeric string"), ctx -> toLong(ctx.argument(0))).description("Converts a number, character or numeric string to Long").categoryId("core");
+            ns.function("float", VeloraTypes.FLOAT, p -> p.required("value", VeloraTypes.ANY, "Number, character or numeric string"), ctx -> toFloat(ctx.argument(0))).description("Converts a number, character or numeric string to Float").categoryId("core");
+            ns.function("double", VeloraTypes.DOUBLE, p -> p.required("value", VeloraTypes.ANY, "Number, character or numeric string"), ctx -> toDouble(ctx.argument(0))).description("Converts a number, character or numeric string to Double").categoryId("core");
+            ns.function("boolean", VeloraTypes.BOOLEAN, p -> p.required("value", VeloraTypes.ANY, "Boolean or true/false string"), ctx -> toBoolean(ctx.argument(0))).description("Converts a Boolean or true/false string to Boolean").categoryId("core");
+            ns.function("char", VeloraTypes.CHAR, p -> p.required("value", VeloraTypes.ANY, "Character, numeric code unit or one-character string"), ctx -> toChar(ctx.argument(0))).description("Converts a character, numeric code unit or one-character string to Char").categoryId("core");
+        });
+    }
+
+    private void registerMathApi() {
+        apiRegistry.namespace("math", ns -> {
+            ns.property("PI", VeloraTypes.DOUBLE, ctx -> Math.PI, "Pi, the ratio of a circle circumference to its diameter").categoryId("math");
+            ns.property("E", VeloraTypes.DOUBLE, ctx -> Math.E, "Euler's number").categoryId("math");
+            ns.property("TAU", VeloraTypes.DOUBLE, ctx -> Math.TAU, "Tau, equal to two times pi").categoryId("math");
+            ns.function("abs", VeloraTypes.DOUBLE, p -> p.required("value", VeloraTypes.DOUBLE, "Number"), ctx -> Math.abs(ctx.argument(0, Double.class))).description("Returns the absolute value").categoryId("math");
+            ns.function("min", VeloraTypes.DOUBLE, p -> p.required("a", VeloraTypes.DOUBLE, "First number").required("b", VeloraTypes.DOUBLE, "Second number"), ctx -> Math.min(ctx.argument(0, Double.class), ctx.argument(1, Double.class))).description("Returns the smaller of two numbers").categoryId("math");
+            ns.function("max", VeloraTypes.DOUBLE, p -> p.required("a", VeloraTypes.DOUBLE, "First number").required("b", VeloraTypes.DOUBLE, "Second number"), ctx -> Math.max(ctx.argument(0, Double.class), ctx.argument(1, Double.class))).description("Returns the larger of two numbers").categoryId("math");
+            ns.function("clamp", VeloraTypes.DOUBLE, p -> p.required("value", VeloraTypes.DOUBLE, "Value to clamp").required("min", VeloraTypes.DOUBLE, "Minimum value").required("max", VeloraTypes.DOUBLE, "Maximum value"), ctx -> Math.clamp(ctx.argument(0, Double.class), ctx.argument(1, Double.class), ctx.argument(2, Double.class))).description("Clamps a number to the inclusive min..max range").categoryId("math");
+            ns.function("floor", VeloraTypes.DOUBLE, p -> p.required("value", VeloraTypes.DOUBLE, "Number"), ctx -> Math.floor(ctx.argument(0, Double.class))).description("Rounds down to the nearest integral Double").categoryId("math");
+            ns.function("ceil", VeloraTypes.DOUBLE, p -> p.required("value", VeloraTypes.DOUBLE, "Number"), ctx -> Math.ceil(ctx.argument(0, Double.class))).description("Rounds up to the nearest integral Double").categoryId("math");
+            ns.function("round", VeloraTypes.LONG, p -> p.required("value", VeloraTypes.DOUBLE, "Number"), ctx -> Math.round(ctx.argument(0, Double.class))).description("Rounds to the nearest Long").categoryId("math");
+            ns.function("sqrt", VeloraTypes.DOUBLE, p -> p.required("value", VeloraTypes.DOUBLE, "Number"), ctx -> Math.sqrt(ctx.argument(0, Double.class))).description("Returns the square root").categoryId("math");
+            ns.function("cbrt", VeloraTypes.DOUBLE, p -> p.required("value", VeloraTypes.DOUBLE, "Number"), ctx -> Math.cbrt(ctx.argument(0, Double.class))).description("Returns the cube root").categoryId("math");
+            ns.function("pow", VeloraTypes.DOUBLE, p -> p.required("base", VeloraTypes.DOUBLE, "Base value").required("power", VeloraTypes.DOUBLE, "Exponent"), ctx -> Math.pow(ctx.argument(0, Double.class), ctx.argument(1, Double.class))).description("Raises base to the given power").categoryId("math");
+            ns.function("hypot", VeloraTypes.DOUBLE, p -> p.required("x", VeloraTypes.DOUBLE, "First side").required("y", VeloraTypes.DOUBLE, "Second side"), ctx -> Math.hypot(ctx.argument(0, Double.class), ctx.argument(1, Double.class))).description("Returns sqrt(x*x + y*y) without intermediate overflow or underflow").categoryId("math");
+            ns.function("exp", VeloraTypes.DOUBLE, p -> p.required("value", VeloraTypes.DOUBLE, "Exponent"), ctx -> Math.exp(ctx.argument(0, Double.class))).description("Returns Euler's number raised to the given value").categoryId("math");
+            ns.function("log", VeloraTypes.DOUBLE, p -> p.required("value", VeloraTypes.DOUBLE, "Positive number"), ctx -> Math.log(ctx.argument(0, Double.class))).description("Returns the natural logarithm").categoryId("math");
+            ns.function("log10", VeloraTypes.DOUBLE, p -> p.required("value", VeloraTypes.DOUBLE, "Positive number"), ctx -> Math.log10(ctx.argument(0, Double.class))).description("Returns the base-10 logarithm").categoryId("math");
+            ns.function("sin", VeloraTypes.DOUBLE, p -> p.required("radians", VeloraTypes.DOUBLE, "Angle in radians"), ctx -> Math.sin(ctx.argument(0, Double.class))).description("Returns the sine of an angle in radians").categoryId("math");
+            ns.function("cos", VeloraTypes.DOUBLE, p -> p.required("radians", VeloraTypes.DOUBLE, "Angle in radians"), ctx -> Math.cos(ctx.argument(0, Double.class))).description("Returns the cosine of an angle in radians").categoryId("math");
+            ns.function("tan", VeloraTypes.DOUBLE, p -> p.required("radians", VeloraTypes.DOUBLE, "Angle in radians"), ctx -> Math.tan(ctx.argument(0, Double.class))).description("Returns the tangent of an angle in radians").categoryId("math");
+            ns.function("asin", VeloraTypes.DOUBLE, p -> p.required("value", VeloraTypes.DOUBLE, "Value in [-1, 1]"), ctx -> Math.asin(ctx.argument(0, Double.class))).description("Returns the arc sine in radians").categoryId("math");
+            ns.function("acos", VeloraTypes.DOUBLE, p -> p.required("value", VeloraTypes.DOUBLE, "Value in [-1, 1]"), ctx -> Math.acos(ctx.argument(0, Double.class))).description("Returns the arc cosine in radians").categoryId("math");
+            ns.function("atan", VeloraTypes.DOUBLE, p -> p.required("value", VeloraTypes.DOUBLE, "Number"), ctx -> Math.atan(ctx.argument(0, Double.class))).description("Returns the arc tangent in radians").categoryId("math");
+            ns.function("atan2", VeloraTypes.DOUBLE, p -> p.required("y", VeloraTypes.DOUBLE, "Y coordinate").required("x", VeloraTypes.DOUBLE, "X coordinate"), ctx -> Math.atan2(ctx.argument(0, Double.class), ctx.argument(1, Double.class))).description("Returns the angle from rectangular coordinates in radians").categoryId("math");
+            ns.function("toRadians", VeloraTypes.DOUBLE, p -> p.required("degrees", VeloraTypes.DOUBLE, "Angle in degrees"), ctx -> Math.toRadians(ctx.argument(0, Double.class))).description("Converts degrees to radians").categoryId("math");
+            ns.function("toDegrees", VeloraTypes.DOUBLE, p -> p.required("radians", VeloraTypes.DOUBLE, "Angle in radians"), ctx -> Math.toDegrees(ctx.argument(0, Double.class))).description("Converts radians to degrees").categoryId("math");
+            ns.function("lerp", VeloraTypes.DOUBLE, p -> p.required("start", VeloraTypes.DOUBLE, "Start value").required("end", VeloraTypes.DOUBLE, "End value").required("delta", VeloraTypes.DOUBLE, "Interpolation factor"), ctx -> ctx.argument(0, Double.class) + (ctx.argument(1, Double.class) - ctx.argument(0, Double.class)) * ctx.argument(2, Double.class)).description("Linearly interpolates between start and end").categoryId("math");
+            ns.function("sign", VeloraTypes.DOUBLE, p -> p.required("value", VeloraTypes.DOUBLE, "Number"), ctx -> Math.signum(ctx.argument(0, Double.class))).description("Returns -1, 0 or 1 with the sign of the value").categoryId("math");
+            ns.function("isFinite", VeloraTypes.BOOLEAN, p -> p.required("value", VeloraTypes.DOUBLE, "Number"), ctx -> Double.isFinite(ctx.argument(0, Double.class))).description("Returns true when the number is finite").categoryId("math");
+            ns.function("isNaN", VeloraTypes.BOOLEAN, p -> p.required("value", VeloraTypes.DOUBLE, "Number"), ctx -> Double.isNaN(ctx.argument(0, Double.class))).description("Returns true when the number is NaN").categoryId("math");
+        });
+    }
+
+    private void registerRandomApi() {
+        apiRegistry.namespace("random", ns -> {
+            ns.function("int", VeloraTypes.INT, p -> p.required("min", VeloraTypes.INT, "Inclusive lower bound").required("max", VeloraTypes.INT, "Exclusive upper bound"), ctx -> java.util.concurrent.ThreadLocalRandom.current().nextInt(ctx.argument(0, Integer.class), ctx.argument(1, Integer.class))).description("Returns a random Int in [min, max)").categoryId("random");
+            ns.function("long", VeloraTypes.LONG, p -> p.required("min", VeloraTypes.LONG, "Inclusive lower bound").required("max", VeloraTypes.LONG, "Exclusive upper bound"), ctx -> java.util.concurrent.ThreadLocalRandom.current().nextLong(ctx.argument(0, Long.class), ctx.argument(1, Long.class))).description("Returns a random Long in [min, max)").categoryId("random");
+            ns.function("double", VeloraTypes.DOUBLE, p -> p.optional("min", VeloraTypes.DOUBLE, 0.0, "Inclusive lower bound").optional("max", VeloraTypes.DOUBLE, 1.0, "Exclusive upper bound"), ctx -> java.util.concurrent.ThreadLocalRandom.current().nextDouble(ctx.argument(0, Double.class), ctx.argument(1, Double.class))).description("Returns a random Double in [min, max); defaults to [0, 1)").categoryId("random");
+            ns.function("boolean", VeloraTypes.BOOLEAN, ctx -> java.util.concurrent.ThreadLocalRandom.current().nextBoolean()).description("Returns a random Boolean").categoryId("random");
+            ns.function("chance", VeloraTypes.BOOLEAN, p -> p.required("probability", VeloraTypes.DOUBLE, "Probability from 0.0 to 1.0"), ctx -> { double value = ctx.argument(0, Double.class); if (value < 0 || value > 1 || Double.isNaN(value)) throw new IllegalArgumentException("probability must be between 0.0 and 1.0"); return java.util.concurrent.ThreadLocalRandom.current().nextDouble() < value; }).description("Returns true with the given probability").categoryId("random");
+        });
+    }
+
+    private void registerTimeApi() {
+        apiRegistry.namespace("time", ns -> {
+            ns.function("millis", VeloraTypes.LONG, ctx -> builder.host().clock().currentTimeMillis()).description("Returns the host wall-clock time in milliseconds").categoryId("time");
+            ns.function("nanos", VeloraTypes.LONG, ctx -> builder.host().clock().nanoTime()).description("Returns the host monotonic clock in nanoseconds").categoryId("time");
+        });
+    }
+
+    private void registerUuidApi() {
+        apiRegistry.namespace("uuid", ns -> {
+            ns.function("random", VeloraTypes.UUID, ctx -> java.util.UUID.randomUUID()).description("Creates a random UUID").categoryId("core");
+            ns.function("parse", VeloraTypes.UUID, p -> p.required("text", VeloraTypes.STRING, "Canonical UUID text"), ctx -> java.util.UUID.fromString(ctx.argument(0, String.class))).description("Parses a UUID from text").categoryId("core");
+            ns.function("isValid", VeloraTypes.BOOLEAN, p -> p.required("text", VeloraTypes.STRING, "Text to validate"), ctx -> { try { java.util.UUID.fromString(ctx.argument(0, String.class)); return true; } catch (IllegalArgumentException error) { return false; } }).description("Returns true when text is a valid UUID").categoryId("core");
+            ns.function("tryParse", VeloraTypes.UUID.nullable(), p -> p.required("text", VeloraTypes.STRING, "UUID text"), ctx -> { try { return java.util.UUID.fromString(ctx.argument(0, String.class)); } catch (IllegalArgumentException error) { return null; } }).description("Parses a UUID or returns null when the text is invalid").categoryId("core");
+        });
+    }
+
+    private String formatArguments(io.velora.api.function.FunctionContext context) {
+        StringBuilder text = new StringBuilder();
+        for (int i = 0; i < context.argumentCount(); i++) {
+            if (i > 0) text.append(' ');
+            text.append(stringify(context.argument(i)));
+        }
+        return text.toString();
+    }
+
+    private String stringify(Object value) {
+        if (value == null) return "null";
+        if (value instanceof String string) return string;
+        if (value instanceof Character character) return String.valueOf(character);
+        if (value.getClass().isArray()) {
+            int length = java.lang.reflect.Array.getLength(value);
+            StringBuilder text = new StringBuilder("[");
+            for (int i = 0; i < length; i++) {
+                if (i > 0) text.append(", ");
+                text.append(stringify(java.lang.reflect.Array.get(value, i)));
+            }
+            return text.append(']').toString();
+        }
+        if (value instanceof Collection<?> collection) return collection.stream().map(this::stringify).collect(java.util.stream.Collectors.joining(", ", "[", "]"));
+        if (value instanceof Map<?, ?> map) return map.entrySet().stream().map(entry -> stringify(entry.getKey()) + "=" + stringify(entry.getValue())).collect(java.util.stream.Collectors.joining(", ", "{", "}"));
+        return String.valueOf(value);
+    }
+
+    private String joinValues(String separator, Object values) {
+        if (values == null) return "";
+        if (values instanceof Collection<?> collection) return collection.stream().map(this::stringify).collect(java.util.stream.Collectors.joining(separator));
+        if (values.getClass().isArray()) {
+            int length = java.lang.reflect.Array.getLength(values);
+            StringJoiner joiner = new StringJoiner(separator);
+            for (int i = 0; i < length; i++) joiner.add(stringify(java.lang.reflect.Array.get(values, i)));
+            return joiner.toString();
+        }
+        throw new IllegalArgumentException("values must be a list, set or array");
+    }
+
+    private <T> T tryParse(String value, java.util.function.Function<String, T> parser) {
+        try { return parser.apply(value.trim()); } catch (IllegalArgumentException error) { return null; }
+    }
+
+    private boolean parseBoolean(String value) {
+        if (value.equalsIgnoreCase("true")) return true;
+        if (value.equalsIgnoreCase("false")) return false;
+        throw new IllegalArgumentException("Expected true or false, got: " + value);
+    }
+
+    private int toInt(Object value) {
+        if (value instanceof Number number) return number.intValue();
+        if (value instanceof Character character) return character;
+        if (value instanceof String string) return Integer.parseInt(string.trim());
+        throw new IllegalArgumentException("Cannot convert " + typeName(value) + " to Int");
+    }
+
+    private long toLong(Object value) {
+        if (value instanceof Number number) return number.longValue();
+        if (value instanceof Character character) return character;
+        if (value instanceof String string) return Long.parseLong(string.trim());
+        throw new IllegalArgumentException("Cannot convert " + typeName(value) + " to Long");
+    }
+
+    private float toFloat(Object value) {
+        if (value instanceof Number number) return number.floatValue();
+        if (value instanceof Character character) return character;
+        if (value instanceof String string) return Float.parseFloat(string.trim());
+        throw new IllegalArgumentException("Cannot convert " + typeName(value) + " to Float");
+    }
+
+    private double toDouble(Object value) {
+        if (value instanceof Number number) return number.doubleValue();
+        if (value instanceof Character character) return character;
+        if (value instanceof String string) return Double.parseDouble(string.trim());
+        throw new IllegalArgumentException("Cannot convert " + typeName(value) + " to Double");
+    }
+
+    private boolean toBoolean(Object value) {
+        if (value instanceof Boolean bool) return bool;
+        if (value instanceof String string) return parseBoolean(string.trim());
+        throw new IllegalArgumentException("Cannot convert " + typeName(value) + " to Boolean");
+    }
+
+    private char toChar(Object value) {
+        if (value instanceof Character character) return character;
+        if (value instanceof Number number) {
+            long code = number.longValue();
+            if (code < Character.MIN_VALUE || code > Character.MAX_VALUE) throw new IllegalArgumentException("Character code out of range: " + code);
+            return (char) code;
+        }
+        if (value instanceof String string && string.length() == 1) return string.charAt(0);
+        throw new IllegalArgumentException("Cannot convert " + typeName(value) + " to Char");
+    }
+
+    private String typeName(Object value) {
+        return value == null ? "null" : value.getClass().getSimpleName();
     }
 
     private void writeLog(io.velora.api.function.FunctionContext ctx, ScriptLogEntry.Level level, String message, io.velora.host.VeloraLogger hostLogger) {

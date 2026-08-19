@@ -11,10 +11,15 @@ public final class StructType implements VeloraType {
     private final Class<?> javaClass;
     private final List<Property> properties;
     private final Map<String, Property> propertyMap;
+    private final Map<String, String> propertyDescriptions;
     private final boolean nullable;
     private final boolean valueEquality;
 
     StructType(String name, Class<?> javaClass, List<Property> properties, boolean valueEquality, boolean nullable) {
+        this(name, javaClass, properties, Map.of(), valueEquality, nullable);
+    }
+
+    StructType(String name, Class<?> javaClass, List<Property> properties, Map<String, String> propertyDescriptions, boolean valueEquality, boolean nullable) {
         this.name = name;
         this.javaClass = javaClass;
         this.properties = List.copyOf(properties);
@@ -22,6 +27,7 @@ public final class StructType implements VeloraType {
         for (Property p : this.properties) {
             propertyMap.put(p.name(), p);
         }
+        this.propertyDescriptions = Map.copyOf(propertyDescriptions);
         this.valueEquality = valueEquality;
         this.nullable = nullable;
     }
@@ -36,6 +42,10 @@ public final class StructType implements VeloraType {
 
     public boolean hasProperty(String name) {
         return propertyMap.containsKey(name);
+    }
+
+    public String propertyDescription(String name) {
+        return propertyDescriptions.getOrDefault(name, "");
     }
 
     public boolean valueEquality() {
@@ -64,12 +74,12 @@ public final class StructType implements VeloraType {
 
     @Override
     public VeloraType nullable() {
-        return new StructType(name, javaClass, properties, valueEquality, true);
+        return new StructType(name, javaClass, properties, propertyDescriptions, valueEquality, true);
     }
 
     @Override
     public VeloraType nonNull() {
-        return nullable ? new StructType(name, javaClass, properties, valueEquality, false) : this;
+        return nullable ? new StructType(name, javaClass, properties, propertyDescriptions, valueEquality, false) : this;
     }
 
     /**
