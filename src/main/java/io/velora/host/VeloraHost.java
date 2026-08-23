@@ -14,4 +14,8 @@ public interface VeloraHost {
     VeloraLogger logger();
 
     VeloraFileSystem fileSystem();
+
+    default AssetStore assets() {
+        return AssetStore.disabled();
+    }
 }

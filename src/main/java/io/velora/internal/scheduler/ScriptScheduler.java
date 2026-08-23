@@ -766,6 +766,11 @@ public final class ScriptScheduler implements VmHost {
             return 40L + string.value().length() * 2L;
         }
         if (value instanceof PrimitiveValue) return 24;
+        if (value instanceof HandleValue handle && handle.handle() instanceof io.velora.api.memory.MemoryFootprint footprint) {
+            long bytes = footprint.estimatedBytes();
+            if (bytes < 0) throw new ResourceLimitViolation("Handle memory estimate cannot be negative");
+            return safeAdd(64, bytes);
+        }
         Long cached = estimates.get(value);
         if (cached != null) return cached;
         if (value instanceof ListValue || value instanceof MapValue || value instanceof SetValue || value instanceof StructValue) {

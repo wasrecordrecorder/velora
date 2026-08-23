@@ -306,6 +306,66 @@ VeloraLimits limits = VeloraLimits.builder()
         .build();
 ```
 
+Binary handles exposed by the standard library participate in the same per-script memory accounting. GPU meshes additionally use a shared script budget, immutable draw snapshots and deterministic release on reset, reload, disable and runtime failure.
+
+## Binary data and assets
+
+Velora has an immutable `ByteArray` handle and built-in `bytes`, `base64` and `assets` namespaces.
+
+```vls
+data = assets.bytes("textures/logo.png")
+config = assets.text("data/config.json")
+embedded = bytes.base64("data:application/octet-stream;base64,AAECAwQ=")
+encoded = bytes.base64Encode(embedded)
+files = assets.list("textures")
+```
+
+The host owns the asset root and can optionally provide a legacy root for migration:
+
+```java
+AssetStore assets = AssetStore.local(
+        scriptsRoot.resolve("assets"),
+        scriptsRoot,
+        16L * 1024L * 1024L,
+        logger
+);
+```
+
+Asset paths are relative, confined to the configured root and protected from traversal and symbolic-link escapes.
+
+## Custom GPU API
+
+The optional GPU module exposes typed formats, vertex and instance streams, indexed meshes, shader definitions, uniforms, textures, pipelines and HUD or world render types. The host decides how validated draw calls reach its renderer.
+
+```java
+GpuApi.register(engine, gpuBackend);
+```
+
+```vls
+format = gpu.format([
+    gpu.floatAttribute("position", 2),
+    gpu.colorAttribute("color")
+])
+
+mesh = gpu.indexedMesh(format)
+gpu.putVec2(mesh, 20.0f, 20.0f)
+gpu.putColor(mesh, -1)
+gpu.putVec2(mesh, 120.0f, 20.0f)
+gpu.putColor(mesh, -1)
+gpu.putVec2(mesh, 120.0f, 80.0f)
+gpu.putColor(mesh, -1)
+gpu.putVec2(mesh, 20.0f, 80.0f)
+gpu.putColor(mesh, -1)
+gpu.putQuad(mesh, 0, 1, 2, 3)
+
+shader = gpu.shader(vertexSource, fragmentSource)
+pipeline = gpu.pipeline(shader, GpuDrawMode.TRIANGLES, GpuBlend.ALPHA, GpuDepth.OFF)
+gpu.setFloat(pipeline, "opacity", 1.0f)
+gpu.draw(gpu.renderType(pipeline, GpuSpace.HUD), mesh)
+```
+
+Use `gpu.releaseMesh(mesh)` for meshes that will not be reused and `gpu.reset()` to release all GPU resources owned by the current script.
+
 ## Embedding
 
 Velora is designed to be embedded into another Java application.

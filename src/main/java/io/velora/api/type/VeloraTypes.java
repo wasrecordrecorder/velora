@@ -19,6 +19,7 @@ public final class VeloraTypes {
     public static final VeloraType VEC3 = SimpleType.of("Vec3", double[].class, false, false);
     public static final VeloraType COLOR = SimpleType.of("Color", int[].class, false, false);
     public static final VeloraType UUID = SimpleType.of("UUID", java.util.UUID.class, false, true);
+    public static final VeloraType BYTE_ARRAY = new HandleType("ByteArray", io.velora.api.data.ByteArray.class);
 
     public static VeloraType list(VeloraType element) { return new ListType(element); }
     public static VeloraType map(VeloraType key, VeloraType value) { return new MapType(key, value); }

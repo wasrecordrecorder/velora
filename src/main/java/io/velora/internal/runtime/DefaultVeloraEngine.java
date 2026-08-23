@@ -1,6 +1,7 @@
 package io.velora.internal.runtime;
 
 import io.velora.api.*;
+import io.velora.api.data.ByteArray;
 import io.velora.api.category.ApiCategory;
 import io.velora.api.category.CategoryRegistry;
 import io.velora.api.compiler.ScriptCompiler;
@@ -84,6 +85,8 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         categoryRegistry.register(new ApiCategory("string", "String", "String conversion and parsing utilities"));
         categoryRegistry.register(new ApiCategory("random", "Random", "Random value generation"));
         categoryRegistry.register(new ApiCategory("time", "Time", "Host clock utilities"));
+        categoryRegistry.register(new ApiCategory("bytes", "Bytes", "Binary data and Base64 utilities"));
+        categoryRegistry.register(new ApiCategory("assets", "Assets", "Confined script asset storage"));
         categoryRegistry.register(new ApiCategory("settings", "Settings", "Script settings and configuration"));
         this.state = VeloraState.CONFIGURING;
     }
@@ -100,6 +103,8 @@ public final class DefaultVeloraEngine implements VeloraEngine {
         registerRandomApi();
         registerTimeApi();
         registerUuidApi();
+        registerBytesApi();
+        registerAssetsApi();
     }
 
     private void registerConsoleApi() {
@@ -207,6 +212,80 @@ public final class DefaultVeloraEngine implements VeloraEngine {
             ns.function("isValid", VeloraTypes.BOOLEAN, p -> p.required("text", VeloraTypes.STRING, "Text to validate"), ctx -> { try { java.util.UUID.fromString(ctx.argument(0, String.class)); return true; } catch (IllegalArgumentException error) { return false; } }).description("Returns true when text is a valid UUID").categoryId("core");
             ns.function("tryParse", VeloraTypes.UUID.nullable(), p -> p.required("text", VeloraTypes.STRING, "UUID text"), ctx -> { try { return java.util.UUID.fromString(ctx.argument(0, String.class)); } catch (IllegalArgumentException error) { return null; } }).description("Parses a UUID or returns null when the text is invalid").categoryId("core");
         });
+    }
+
+    private void registerBytesApi() {
+        apiRegistry.namespace("bytes", ns -> {
+            ns.property("empty", VeloraTypes.BYTE_ARRAY, ctx -> ByteArray.empty(), "An empty byte array").categoryId("bytes");
+            ns.function("of", VeloraTypes.BYTE_ARRAY, p -> p.required("values", VeloraTypes.list(VeloraTypes.INT), "Unsigned byte values from 0 to 255"), ctx -> bytesOf(ctx.argument(0, List.class))).description("Creates bytes from unsigned integer values").categoryId("bytes");
+            ns.function("fromText", VeloraTypes.BYTE_ARRAY, p -> p.required("text", VeloraTypes.STRING, "UTF-8 text"), ctx -> ByteArray.utf8(ctx.argument(0, String.class))).description("Encodes UTF-8 text").categoryId("bytes");
+            ns.function("text", VeloraTypes.STRING, p -> p.required("data", VeloraTypes.BYTE_ARRAY, "UTF-8 bytes"), ctx -> checkedText(ctx.argument(0, ByteArray.class))).description("Decodes UTF-8 bytes").categoryId("bytes");
+            ns.function("base64", VeloraTypes.BYTE_ARRAY, p -> p.required("text", VeloraTypes.STRING, "Base64 text or data URL"), ctx -> decodeBase64(ctx.argument(0, String.class))).description("Decodes Base64 text or a Base64 data URL").categoryId("bytes");
+            ns.function("base64Encode", VeloraTypes.STRING, p -> p.required("data", VeloraTypes.BYTE_ARRAY, "Bytes to encode"), ctx -> encodeBase64(ctx.argument(0, ByteArray.class))).description("Encodes bytes as Base64 text").categoryId("bytes");
+            ns.function("size", VeloraTypes.INT, p -> p.required("data", VeloraTypes.BYTE_ARRAY, "Byte array"), ctx -> ctx.argument(0, ByteArray.class).size()).description("Returns the byte count").categoryId("bytes");
+            ns.function("get", VeloraTypes.INT, p -> p.required("data", VeloraTypes.BYTE_ARRAY, "Byte array").required("index", VeloraTypes.INT, "Zero-based index"), ctx -> ctx.argument(0, ByteArray.class).get(ctx.argument(1, Integer.class))).description("Returns an unsigned byte from 0 to 255").categoryId("bytes");
+            ns.function("slice", VeloraTypes.BYTE_ARRAY, p -> p.required("data", VeloraTypes.BYTE_ARRAY, "Byte array").required("from", VeloraTypes.INT, "Inclusive start").required("to", VeloraTypes.INT, "Exclusive end"), ctx -> ctx.argument(0, ByteArray.class).slice(ctx.argument(1, Integer.class), ctx.argument(2, Integer.class))).description("Copies a byte range").categoryId("bytes");
+            ns.function("concat", VeloraTypes.BYTE_ARRAY, p -> p.required("first", VeloraTypes.BYTE_ARRAY, "First byte array").required("second", VeloraTypes.BYTE_ARRAY, "Second byte array"), ctx -> checkedConcat(ctx.argument(0, ByteArray.class), ctx.argument(1, ByteArray.class))).description("Concatenates two byte arrays").categoryId("bytes");
+        });
+        apiRegistry.namespace("base64", ns -> {
+            ns.function("decode", VeloraTypes.BYTE_ARRAY, p -> p.required("text", VeloraTypes.STRING, "Base64 text or data URL"), ctx -> decodeBase64(ctx.argument(0, String.class))).description("Decodes Base64 text or a Base64 data URL").categoryId("bytes");
+            ns.function("encode", VeloraTypes.STRING, p -> p.required("data", VeloraTypes.BYTE_ARRAY, "Bytes to encode"), ctx -> encodeBase64(ctx.argument(0, ByteArray.class))).description("Encodes bytes as Base64 text").categoryId("bytes");
+        });
+    }
+
+    private void registerAssetsApi() {
+        var assets = builder.host().assets();
+        apiRegistry.namespace("assets", ns -> {
+            ns.function("exists", VeloraTypes.BOOLEAN, p -> p.required("path", VeloraTypes.STRING, "Relative asset path"), ctx -> assets.exists(ctx.argument(0, String.class))).description("Returns true when an asset file exists").categoryId("assets");
+            ns.function("bytes", VeloraTypes.BYTE_ARRAY, p -> p.required("path", VeloraTypes.STRING, "Relative asset path"), ctx -> assets.bytes(ctx.argument(0, String.class))).description("Reads an asset as bytes").categoryId("assets").cost(10);
+            ns.function("text", VeloraTypes.STRING, p -> p.required("path", VeloraTypes.STRING, "Relative UTF-8 asset path"), ctx -> checkedText(assets.bytes(ctx.argument(0, String.class)))).description("Reads an asset as UTF-8 text").categoryId("assets").cost(10);
+            ns.function("list", VeloraTypes.list(VeloraTypes.STRING), p -> p.optional("directory", VeloraTypes.STRING, "", "Relative directory"), ctx -> assets.list(ctx.argument(0, String.class))).description("Lists direct children of an asset directory").categoryId("assets").cost(10);
+        });
+    }
+
+    private ByteArray bytesOf(List<?> values) {
+        if (values.size() > builder.limits().maxCollectionElements()) throw new IllegalArgumentException("Too many byte values");
+        byte[] result = new byte[values.size()];
+        for (int i = 0; i < result.length; i++) {
+            Object value = values.get(i);
+            if (!(value instanceof Number number) || number.intValue() < 0 || number.intValue() > 255) throw new IllegalArgumentException("Byte value must be between 0 and 255 at index " + i);
+            result[i] = (byte) number.intValue();
+        }
+        return ByteArray.copyOf(result);
+    }
+
+    private ByteArray decodeBase64(String value) {
+        String text = value.trim();
+        if (text.regionMatches(true, 0, "data:", 0, 5)) {
+            int comma = text.indexOf(',');
+            if (comma < 0 || !text.substring(5, comma).toLowerCase(Locale.ROOT).contains(";base64")) throw new IllegalArgumentException("Data URL must contain Base64 data");
+            text = text.substring(comma + 1);
+        }
+        if (text.length() > builder.limits().maxStringLength()) throw new IllegalArgumentException("Base64 input is too large");
+        byte[] decoded;
+        try {
+            decoded = java.util.Base64.getMimeDecoder().decode(text);
+        } catch (IllegalArgumentException error) {
+            throw new IllegalArgumentException("Invalid Base64 data", error);
+        }
+        if (decoded.length > builder.limits().memoryPerScript()) throw new IllegalArgumentException("Decoded data exceeds the script memory limit");
+        return ByteArray.copyOf(decoded);
+    }
+
+    private String encodeBase64(ByteArray data) {
+        long encodedLength = (data.size() + 2L) / 3L * 4L;
+        if (encodedLength > builder.limits().maxStringLength()) throw new IllegalArgumentException("Encoded Base64 exceeds the string limit");
+        return java.util.Base64.getEncoder().encodeToString(data.toArray());
+    }
+
+    private String checkedText(ByteArray data) {
+        if (data.size() > builder.limits().maxStringLength()) throw new IllegalArgumentException("Decoded text exceeds the string limit");
+        return data.utf8();
+    }
+
+    private ByteArray checkedConcat(ByteArray first, ByteArray second) {
+        if ((long) first.size() + second.size() > builder.limits().memoryPerScript()) throw new IllegalArgumentException("Concatenated data exceeds the script memory limit");
+        return first.concat(second);
     }
 
     private String formatArguments(io.velora.api.function.FunctionContext context) {

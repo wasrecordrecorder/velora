@@ -21,7 +21,7 @@ public final class DefaultTypeRegistry implements TypeRegistry {
                 VeloraTypes.ANY, VeloraTypes.UNIT, VeloraTypes.NOTHING, VeloraTypes.BOOLEAN, VeloraTypes.BYTE,
                 VeloraTypes.INT, VeloraTypes.LONG, VeloraTypes.FLOAT, VeloraTypes.DOUBLE,
                 VeloraTypes.CHAR, VeloraTypes.STRING, VeloraTypes.DURATION, VeloraTypes.VEC2,
-                VeloraTypes.VEC3, VeloraTypes.COLOR, VeloraTypes.UUID
+                VeloraTypes.VEC3, VeloraTypes.COLOR, VeloraTypes.UUID, VeloraTypes.BYTE_ARRAY
         }) {
             byName.put(t.name(), t);
             all.add(t);
