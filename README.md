@@ -198,6 +198,14 @@ tick() {
 
 Event names and payloads are provided by the host rather than hardcoded into the Velora core.
 
+Hosts can also deliver a live payload synchronously when the emitter must observe script changes before returning:
+
+```java
+engine.events().emitImmediate(packetEvent, mutablePacketContext);
+```
+
+Immediate handlers share the same script fields and settings as queued handlers. They run on the emitter thread and must finish in the current call, so they cannot sleep, await tasks or yield. Queued `emitSafe` events remain the default for immutable notifications and normal asynchronous work.
+
 ## Settings
 
 Configuration is part of the language.

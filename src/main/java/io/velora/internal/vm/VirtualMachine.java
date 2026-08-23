@@ -88,6 +88,21 @@ public final class VirtualMachine {
         return executeInternal(module, 0, null, stack, callStack, 0);
     }
 
+    public VmExecutionResult execute(CompiledModule module, int functionIndex, ScriptValue[] args, long fiberId, VmHost host) {
+        initializeFields(module);
+        CompiledFunction fn = module.function(functionIndex);
+        if (fn == null) {
+            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                    "Function not found: " + functionIndex, 0, fiberId), 0, 0);
+        }
+        ValueStack stack = new ValueStack(Math.max(fn.maxStack(), 16));
+        Deque<CallFrame> callStack = new ArrayDeque<>();
+        CallFrame rootFrame = new CallFrame(fn, 0, 0);
+        for (int i = 0; i < Math.min(args.length, fn.parameterCount()); i++) rootFrame.locals[i] = args[i];
+        callStack.push(rootFrame);
+        return executeInternal(module, fiberId, host, stack, callStack, 0);
+    }
+
     public VmExecutionResult execute(CompiledModule module, long fiberId, VmHost host,
                                       ValueStack stack, Deque<CallFrame> callStack, int startInstructions) {
         initializeFields(module);

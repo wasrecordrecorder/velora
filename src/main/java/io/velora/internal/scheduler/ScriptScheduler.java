@@ -343,6 +343,36 @@ public final class ScriptScheduler implements VmHost {
         if (store != null) settingStores.put(scriptId, store);
     }
 
+    public io.velora.internal.setting.SettingStore settingStore(String scriptId) {
+        return settingStores.get(scriptId);
+    }
+
+    public void initializeScriptState(String scriptId, CompiledModule module) {
+        if (initializedScripts.contains(scriptId)) return;
+        Map<Integer, ScriptValue> instance = scriptInstanceFields.computeIfAbsent(scriptId, key -> new HashMap<>());
+        Map<Integer, ScriptValue> statics = scriptStaticFields.computeIfAbsent(scriptId, key -> new HashMap<>());
+        for (CompiledModule.FieldInitializer initializer : module.fieldInitializers()) {
+            Map<Integer, ScriptValue> fields = initializer.isStatic() ? statics : instance;
+            fields.putIfAbsent(initializer.fieldIndex(), VirtualMachine.copyValue(initializer.initialValue()));
+        }
+        initializedScripts.add(scriptId);
+    }
+
+    public boolean consumeImmediateApiCost(String scriptId, int cost) {
+        if (!consumeApiCost(scriptId, cost)) return false;
+        apiCallsByScript.merge(scriptId, 1L, Long::sum);
+        return true;
+    }
+
+    public void commitStateMutationForScript(String scriptId) {
+        long current = persistentMemory(scriptId);
+        long previous = persistentMemoryByScript.getOrDefault(scriptId, 0L);
+        long delta = current - previous;
+        ResourceCounter counter = resourcesByScript.computeIfAbsent(scriptId, key -> new ResourceCounter());
+        if (delta > 0 && exceedsMemory(counter.memoryUsed(), delta)) throw new ResourceLimitViolation("Script memory limit exceeded");
+        adjustPersistentMemory(scriptId, counter, delta);
+    }
+
     @Override
     public void yieldFiber(long fiberId) {
         ScriptFiber fiber = fibersById.get(fiberId);

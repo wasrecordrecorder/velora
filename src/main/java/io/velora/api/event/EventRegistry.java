@@ -40,6 +40,10 @@ public interface EventRegistry {
      */
     <T> void emitSafe(EventKey<T> key, T payload);
 
+    default <T> void emitImmediate(EventKey<T> key, T payload) {
+        throw new UnsupportedOperationException("Immediate event delivery is not supported by this registry");
+    }
+
     /**
      * Emit an event whose payload must be constructed on the main thread. The
      * factory runs via the host main-thread executor, then the resulting payload is

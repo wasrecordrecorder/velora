@@ -33,6 +33,8 @@ import io.velora.internal.security.*;
 import io.velora.internal.persistence.EnabledScriptsStore;
 import io.velora.internal.vm.ScriptValue;
 import io.velora.internal.vm.VirtualMachine;
+import io.velora.internal.vm.VmExecutionResult;
+import io.velora.internal.vm.VmHost;
 
 import java.util.*;
 
@@ -503,6 +505,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
             scriptManager = new DefaultScriptManager(scheduler, compiler, builder.host(), enabledScriptsStore, debugService, templateRegistry);
             if (!enabledScriptsStore.load() && builder.host().logger() != null) builder.host().logger().warn("Failed to load auto-enable state");
             eventRegistry.setDispatcher(this::dispatchEvent);
+            eventRegistry.setImmediateDispatcher(this::dispatchImmediateEvent);
             eventRegistry.setOverflowHandler(this::failScriptsForEvent);
         }
         return scriptManager;
@@ -584,7 +587,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
 
 
     @Override
-    public void tick() {
+    public synchronized void tick() {
         if (state == VeloraState.CLOSED) {
             throw new IllegalStateException("Engine is closed");
         }
@@ -646,6 +649,71 @@ public final class DefaultVeloraEngine implements VeloraEngine {
                 scheduleEventHandler(descriptor, instance.scriptId(), handler.functionIndex(), args);
             }
         }
+    }
+
+    private synchronized void dispatchImmediateEvent(String eventId, Object payload) {
+        EventDescriptor descriptor = eventRegistry.find(eventId);
+        if (descriptor == null || scriptManager == null) return;
+        ensureScheduler();
+        ScriptValue eventPayload;
+        try {
+            eventPayload = VirtualMachine.javaToValue(descriptor.payloadType(), payload);
+        } catch (RuntimeException error) {
+            builder.host().logger().error("Invalid immediate payload for event " + descriptor.id(), error);
+            return;
+        }
+        for (ScriptInstance instance : scriptManager.repository().all()) {
+            if (!instance.enabled() || instance.compiledModule() == null) continue;
+            var module = instance.compiledModule();
+            for (var handler : module.eventHandlers()) {
+                if (!matchesEvent(handler.eventReference(), descriptor.scriptName(), eventId)) continue;
+                var function = module.function(handler.functionIndex());
+                if (function == null) continue;
+                ScriptValue[] args = function.parameterCount() == 0 ? new ScriptValue[0] : new ScriptValue[]{eventPayload};
+                scheduler.initializeScriptState(instance.scriptId(), module);
+                VmHost host = immediateHost(instance.scriptId());
+                VirtualMachine vm = new VirtualMachine(apiRegistry, module.settings(), scheduler.settingStore(instance.scriptId()),
+                        builder.limits().instructionsPerFiberTick(), builder.limits().maxCallDepth(), builder.limits().maxStringLength(),
+                        builder.limits().maxCollectionElements(), builder.limits().maxCollectionDepth());
+                VmExecutionResult result = vm.execute(module, handler.functionIndex(), args, -1, host);
+                if (result.isSuspended()) {
+                    recordImmediateError(instance.scriptId(), function.name(), "Immediate event handler cannot suspend");
+                } else if (!result.success()) {
+                    recordImmediateError(instance.scriptId(), function.name(), result.error().message());
+                }
+            }
+        }
+    }
+
+    private void recordImmediateError(String scriptId, String function, String message) {
+        String value = message == null || message.isBlank() ? "Immediate event handler failed" : message;
+        errorStore.record(scriptId, new io.velora.api.debug.RuntimeError(scriptId, -1, function, "RUNTIME_IMMEDIATE_EVENT", value, "", builder.host().clock().nanoTime()));
+        builder.host().logger().error("Immediate event handler failed: " + scriptId + ":" + function + ": " + value, null);
+    }
+
+    private void ensureScheduler() {
+        if (scheduler == null) scheduler = new ScriptScheduler(builder.limits(), apiRegistry, errorStore, builder.host().workers(), constantRegistry, typeRegistry, builder.host().clock()::nanoTime, builder.host().mainThread()::isMainThread);
+    }
+
+    private VmHost immediateHost(String scriptId) {
+        return new VmHost() {
+            public long nanoTime() { return builder.host().clock().nanoTime(); }
+            public boolean isMainThread() { return builder.host().mainThread().isMainThread(); }
+            public boolean isCancelled(long fiberId) { return false; }
+            public long spawnFiber(String id, int functionIndex, ScriptValue[] args, long parentId) { return -1; }
+            public void sleepFiber(long fiberId, long wakeupNanos) {}
+            public void awaitFiber(long fiberId, long taskId) {}
+            public long watchTask(long fiberId, io.velora.api.task.VeloraTask<?> task, io.velora.api.type.VeloraType resultType) { return 0; }
+            public long watchWorkerCall(long fiberId, FunctionDescriptor descriptor, io.velora.api.function.FunctionContext context) { return 0; }
+            public boolean consumeApiCost(long fiberId, int cost) { return scheduler.consumeImmediateApiCost(scriptId, cost); }
+            public void yieldFiber(long fiberId) {}
+            public ScriptValue loadQualified(String namespace, String member) { return scheduler.loadQualified(namespace, member); }
+            public ScriptValue loadField(int fieldIndex) { return scheduler.loadFieldForScript(scriptId, fieldIndex); }
+            public void storeField(int fieldIndex, ScriptValue value) { scheduler.storeFieldForScript(scriptId, fieldIndex, value); }
+            public ScriptValue loadStatic(int fieldIndex) { return scheduler.loadStaticForScript(scriptId, fieldIndex); }
+            public void storeStatic(int fieldIndex, ScriptValue value) { scheduler.storeStaticForScript(scriptId, fieldIndex, value); }
+            public void commitStateMutation(long fiberId) { scheduler.commitStateMutationForScript(scriptId); }
+        };
     }
 
     private void scheduleEventHandler(EventDescriptor descriptor, String scriptId, int functionIndex, ScriptValue[] args) {

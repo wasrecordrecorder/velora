@@ -23,6 +23,7 @@ public final class DefaultEventRegistry implements EventRegistry {
     private boolean frozen;
     private volatile boolean closed;
     private EventDispatcherCallback dispatcher;
+    private EventDispatcherCallback immediateDispatcher;
     private Consumer<String> overflowHandler;
 
     public record PendingEvent(String eventId, Object payload, long timestamp) {}
@@ -33,6 +34,7 @@ public final class DefaultEventRegistry implements EventRegistry {
     public DefaultEventRegistry() { this(null); }
     public DefaultEventRegistry(VeloraHost host) { this.host = host; }
     public void setDispatcher(EventDispatcherCallback dispatcher) { this.dispatcher = dispatcher; }
+    public void setImmediateDispatcher(EventDispatcherCallback dispatcher) { this.immediateDispatcher = dispatcher; }
     public void setOverflowHandler(Consumer<String> overflowHandler) { this.overflowHandler = overflowHandler; }
 
     @Override
@@ -67,6 +69,25 @@ public final class DefaultEventRegistry implements EventRegistry {
         EventQueue queue = queues.computeIfAbsent(key.id(), ignored -> new EventQueue());
         int depth = queue.offer(descriptor, event);
         maxQueueDepth.accumulateAndGet(depth, Math::max);
+    }
+
+    @Override
+    public <T> void emitImmediate(EventKey<T> key, T payload) {
+        if (closed) throw new IllegalStateException("EventRegistry is closed");
+        Objects.requireNonNull(key);
+        EventDescriptor descriptor = find(key.id());
+        if (descriptor == null) {
+            diagnostic(key.id(), EventDiagnostic.Type.DROPPED);
+            return;
+        }
+        validatePayload(descriptor, key, payload);
+        EventDispatcherCallback callback = immediateDispatcher;
+        if (callback == null) {
+            diagnostic(key.id(), EventDiagnostic.Type.DROPPED);
+            return;
+        }
+        callback.dispatch(key.id(), payload);
+        diagnostic(key.id(), EventDiagnostic.Type.DELIVERED);
     }
 
     private <T> void validatePayload(EventDescriptor descriptor, EventKey<T> key, T payload) {
@@ -190,6 +211,7 @@ public final class DefaultEventRegistry implements EventRegistry {
     public void close() {
         closed = true;
         dispatcher = null;
+        immediateDispatcher = null;
         overflowHandler = null;
         queues.clear();
         totalQueueDepth.set(0);
