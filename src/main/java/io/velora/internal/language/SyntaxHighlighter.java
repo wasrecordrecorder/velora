@@ -27,6 +27,7 @@ public final class SyntaxHighlighter {
         if (tt == TokenType.BOOLEAN || tt == TokenType.KW_TRUE || tt == TokenType.KW_FALSE) return SyntaxToken.TokenType.BOOLEAN;
         if (tt == TokenType.NULL || tt == TokenType.KW_NULL) return SyntaxToken.TokenType.BOOLEAN;
         if (tt == TokenType.ANNOTATION || tt == TokenType.AT) return SyntaxToken.TokenType.ANNOTATION;
+        if (tt == TokenType.HASH) return SyntaxToken.TokenType.KEYWORD;
         if (tt == TokenType.LBRACE || tt == TokenType.RBRACE || tt == TokenType.LPAREN || tt == TokenType.RPAREN
                 || tt == TokenType.LBRACKET || tt == TokenType.RBRACKET || tt == TokenType.COMMA
                 || tt == TokenType.DOT || tt == TokenType.COLON || tt == TokenType.SEMICOLON
@@ -35,7 +36,9 @@ public final class SyntaxHighlighter {
                 || tt == TokenType.PERCENT || tt == TokenType.EQ || tt == TokenType.EQ_EQ
                 || tt == TokenType.BANG || tt == TokenType.BANG_EQ || tt == TokenType.LT || tt == TokenType.LE
                 || tt == TokenType.GT || tt == TokenType.GE || tt == TokenType.AND_AND || tt == TokenType.OR_OR
-                || tt == TokenType.QUESTION || tt == TokenType.INCREMENT || tt == TokenType.DECREMENT) return SyntaxToken.TokenType.OPERATOR;
+                || tt == TokenType.QUESTION || tt == TokenType.INCREMENT || tt == TokenType.DECREMENT
+                || tt == TokenType.RANGE || tt == TokenType.PLUS_EQ || tt == TokenType.MINUS_EQ
+                || tt == TokenType.STAR_EQ || tt == TokenType.SLASH_EQ || tt == TokenType.PERCENT_EQ) return SyntaxToken.TokenType.OPERATOR;
         if (tt.isKeyword()) return SyntaxToken.TokenType.KEYWORD;
         if (tt == TokenType.COMMENT) return SyntaxToken.TokenType.COMMENT;
         if (tt == TokenType.NEWLINE) return SyntaxToken.TokenType.NEWLINE;

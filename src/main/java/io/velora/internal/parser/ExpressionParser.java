@@ -184,6 +184,14 @@ public final class ExpressionParser {
     private ExpressionNode parsePostfix() {
         ExpressionNode expr = parsePrimary();
         while (true) {
+            int nl = 0;
+            while (context.tokens().peek(nl).is(TokenType.NEWLINE)) nl++;
+            if (nl > 0) {
+                Token after = context.tokens().peek(nl);
+                if (after.is(TokenType.DOT) || (after.is(TokenType.QUESTION) && context.tokens().peek(nl + 1).is(TokenType.DOT))) {
+                    for (int k = 0; k < nl; k++) context.advance();
+                }
+            }
             if (context.check(TokenType.DOT)) {
                 Token dot = context.advance();
                 Token member = context.expect(TokenType.IDENTIFIER, "Expected member name after '.'");
@@ -255,26 +263,46 @@ public final class ExpressionParser {
 
         if (token.is(TokenType.INTEGER)) {
             context.advance();
-            return new LiteralExpressionNode(context.filePath(), token.line(), token.column(),
-                    Integer.parseInt(token.text()), LiteralExpressionNode.LiteralKind.INTEGER);
+            try {
+                return new LiteralExpressionNode(context.filePath(), token.line(), token.column(),
+                        Integer.parseInt(token.text()), LiteralExpressionNode.LiteralKind.INTEGER);
+            } catch (NumberFormatException ignored) {
+                context.error(io.velora.api.compiler.DiagnosticCode.LEXER_INVALID_NUMBER, "Invalid integer literal: " + token.text(), token);
+                return new LiteralExpressionNode(context.filePath(), token.line(), token.column(), 0, LiteralExpressionNode.LiteralKind.INTEGER);
+            }
         }
         if (token.is(TokenType.LONG_LITERAL)) {
             context.advance();
             String text = token.text().replaceAll("[lL]$", "");
-            return new LiteralExpressionNode(context.filePath(), token.line(), token.column(),
-                    Long.parseLong(text), LiteralExpressionNode.LiteralKind.LONG);
+            try {
+                return new LiteralExpressionNode(context.filePath(), token.line(), token.column(),
+                        Long.parseLong(text), LiteralExpressionNode.LiteralKind.LONG);
+            } catch (NumberFormatException ignored) {
+                context.error(io.velora.api.compiler.DiagnosticCode.LEXER_INVALID_NUMBER, "Invalid long literal: " + token.text(), token);
+                return new LiteralExpressionNode(context.filePath(), token.line(), token.column(), 0L, LiteralExpressionNode.LiteralKind.LONG);
+            }
         }
         if (token.is(TokenType.FLOAT_LITERAL)) {
             context.advance();
             String text = token.text().replaceAll("[fF]$", "");
-            return new LiteralExpressionNode(context.filePath(), token.line(), token.column(),
-                    Float.parseFloat(text), LiteralExpressionNode.LiteralKind.FLOAT);
+            try {
+                return new LiteralExpressionNode(context.filePath(), token.line(), token.column(),
+                        Float.parseFloat(text), LiteralExpressionNode.LiteralKind.FLOAT);
+            } catch (NumberFormatException ignored) {
+                context.error(io.velora.api.compiler.DiagnosticCode.LEXER_INVALID_NUMBER, "Invalid float literal: " + token.text(), token);
+                return new LiteralExpressionNode(context.filePath(), token.line(), token.column(), 0f, LiteralExpressionNode.LiteralKind.FLOAT);
+            }
         }
         if (token.is(TokenType.DOUBLE_LITERAL)) {
             context.advance();
             String text = token.text().replaceAll("[dD]$", "");
-            return new LiteralExpressionNode(context.filePath(), token.line(), token.column(),
-                    Double.parseDouble(text), LiteralExpressionNode.LiteralKind.DOUBLE);
+            try {
+                return new LiteralExpressionNode(context.filePath(), token.line(), token.column(),
+                        Double.parseDouble(text), LiteralExpressionNode.LiteralKind.DOUBLE);
+            } catch (NumberFormatException ignored) {
+                context.error(io.velora.api.compiler.DiagnosticCode.LEXER_INVALID_NUMBER, "Invalid double literal: " + token.text(), token);
+                return new LiteralExpressionNode(context.filePath(), token.line(), token.column(), 0d, LiteralExpressionNode.LiteralKind.DOUBLE);
+            }
         }
         if (token.is(TokenType.STRING)) {
             context.advance();
@@ -348,10 +376,11 @@ public final class ExpressionParser {
 
     private ExpressionNode parseInterpolation(Token token) {
         String raw = token.text();
-        // raw includes surrounding quotes
         String body = raw.substring(1, raw.length() - 1);
         List<InterpolationExpressionNode.Segment> segments = new ArrayList<>();
         StringBuilder text = new StringBuilder();
+        int curLine = token.line();
+        int curCol = token.column() + 1;
         int i = 0;
         while (i < body.length()) {
             char c = body.charAt(i);
@@ -360,7 +389,10 @@ public final class ExpressionParser {
                     segments.add(new InterpolationExpressionNode.Text(text.toString()));
                     text = new StringBuilder();
                 }
-                i += 2; // skip ${
+                i += 2;
+                curCol += 2;
+                int exprLine = curLine;
+                int exprCol = curCol;
                 int depth = 1;
                 int start = i;
                 char nestedQuote = 0;
@@ -378,14 +410,19 @@ public final class ExpressionParser {
                     } else if (cc == '}') {
                         depth--;
                     }
-                    if (depth > 0) i++;
+                    if (depth > 0) {
+                        i++;
+                        if (cc == '\n') { curLine++; curCol = 0; } else curCol++;
+                    }
                 }
                 String exprSource = body.substring(start, i);
-                if (i < body.length()) i++; // skip }
-                ExpressionNode expr = parseSubExpression(exprSource, token.line(), token.column());
+                if (i < body.length()) {
+                    i++;
+                    curCol++;
+                }
+                ExpressionNode expr = parseSubExpression(exprSource, exprLine, exprCol);
                 segments.add(new InterpolationExpressionNode.Expr(expr));
             } else if (c == '\\') {
-                // unescape
                 if (i + 1 < body.length()) {
                     char esc = body.charAt(i + 1);
                     switch (esc) {
@@ -399,13 +436,16 @@ public final class ExpressionParser {
                         default -> text.append(esc);
                     }
                     i += 2;
+                    curCol += 2;
                 } else {
                     text.append(c);
                     i++;
+                    curCol++;
                 }
             } else {
                 text.append(c);
                 i++;
+                if (c == '\n') { curLine++; curCol = 0; } else curCol++;
             }
         }
         if (text.length() > 0) {
@@ -415,19 +455,28 @@ public final class ExpressionParser {
     }
 
     private ExpressionNode parseSubExpression(String source, int line, int column) {
+        if (source == null || source.isBlank()) {
+            context.error(io.velora.api.compiler.DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Empty interpolation expression", line, column);
+            return new LiteralExpressionNode(context.filePath(), line, column, "", LiteralExpressionNode.LiteralKind.STRING);
+        }
         try {
-            Lexer subLexer = new Lexer(source, context.filePath() + ":interp");
+            Lexer subLexer = new Lexer(source, context.filePath(), line, column);
             var subResult = subLexer.lex();
             if (subResult.diagnostics().stream().anyMatch(io.velora.api.compiler.Diagnostic::isError)) {
-                context.error(io.velora.api.compiler.DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Invalid interpolation expression", line, column);
+                var first = subResult.diagnostics().stream().filter(io.velora.api.compiler.Diagnostic::isError).findFirst().orElseThrow();
+                context.diagnostics().add(first);
                 return new LiteralExpressionNode(context.filePath(), line, column, "", LiteralExpressionNode.LiteralKind.STRING);
             }
             TokenStream subStream = new TokenStream(subResult.tokens());
             ParserContext subContext = new ParserContext(subStream, context.filePath());
             ExpressionNode expression = new ExpressionParser(subContext).parseExpression();
             subContext.skipTrivia();
-            if (subContext.hasErrors() || !subStream.isEof()) {
-                context.error(io.velora.api.compiler.DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Invalid interpolation expression", line, column);
+            if (subContext.hasErrors()) {
+                context.diagnostics().addAll(subContext.diagnostics());
+                return new LiteralExpressionNode(context.filePath(), line, column, "", LiteralExpressionNode.LiteralKind.STRING);
+            }
+            if (!subStream.isEof()) {
+                context.error(io.velora.api.compiler.DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Unexpected token in interpolation expression", subStream.peek());
                 return new LiteralExpressionNode(context.filePath(), line, column, "", LiteralExpressionNode.LiteralKind.STRING);
             }
             return expression;

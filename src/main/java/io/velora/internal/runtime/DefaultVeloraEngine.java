@@ -515,7 +515,7 @@ public final class DefaultVeloraEngine implements VeloraEngine {
     public LanguageService language() {
         ensureOpen();
         if (languageService == null) {
-            languageService = new DefaultLanguageService(apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry, javaImportRegistry);
+            languageService = new DefaultLanguageService(apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry, javaImportRegistry, builder.host());
         }
         return languageService;
     }

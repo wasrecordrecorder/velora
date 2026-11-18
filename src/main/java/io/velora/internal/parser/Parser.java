@@ -33,6 +33,7 @@ public final class Parser {
             ScriptNode script = parseScript(imports, annotations);
             if (script == null) return ParseResult.failure(context.diagnostics());
             context.tokens().skipNewlines();
+            while (context.tokens().match(TokenType.SEMICOLON)) context.tokens().skipNewlines();
             if (context.tokens().hasMore()) {
                 context.error(DiagnosticCode.PARSER_UNEXPECTED_TOKEN, "Multiple script declarations are not allowed", context.currentLine(), context.currentColumn());
             }
@@ -242,10 +243,15 @@ public final class Parser {
     }
 
     private Number parseNumberValue(Token token) {
-        if (token.is(TokenType.INTEGER)) return Integer.parseInt(token.text());
-        if (token.is(TokenType.LONG_LITERAL)) return Long.parseLong(token.text().replaceAll("[lL]$", ""));
-        if (token.is(TokenType.DOUBLE_LITERAL)) return Double.parseDouble(token.text().replaceAll("[dD]$", ""));
-        if (token.is(TokenType.FLOAT_LITERAL)) return Float.parseFloat(token.text().replaceAll("[fF]$", ""));
+        try {
+            if (token.is(TokenType.INTEGER)) return Integer.parseInt(token.text());
+            if (token.is(TokenType.LONG_LITERAL)) return Long.parseLong(token.text().replaceAll("[lL]$", ""));
+            if (token.is(TokenType.DOUBLE_LITERAL)) return Double.parseDouble(token.text().replaceAll("[dD]$", ""));
+            if (token.is(TokenType.FLOAT_LITERAL)) return Float.parseFloat(token.text().replaceAll("[fF]$", ""));
+        } catch (NumberFormatException ignored) {
+            context.error(DiagnosticCode.LEXER_INVALID_NUMBER, "Invalid numeric literal: " + token.text(), token);
+            return 0;
+        }
         return null;
     }
 
@@ -308,6 +314,10 @@ public final class Parser {
         List<StatementNode> statements = new ArrayList<>();
         context.skipTrivia();
         while (!context.check(TokenType.RBRACE) && context.tokens().hasMore()) {
+            if (context.match(TokenType.SEMICOLON)) {
+                context.skipTrivia();
+                continue;
+            }
             StatementNode member = parseScriptMember();
             if (member != null) {
                 statements.add(member);
@@ -489,6 +499,10 @@ public final class Parser {
         List<StatementNode> statements = new ArrayList<>();
         context.skipTrivia();
         while (!context.check(TokenType.RBRACE) && context.tokens().hasMore()) {
+            if (context.match(TokenType.SEMICOLON)) {
+                context.skipTrivia();
+                continue;
+            }
             StatementNode stmt = parseStatement();
             if (stmt != null) {
                 statements.add(stmt);
@@ -672,8 +686,8 @@ public final class Parser {
     private StatementNode parseReturnStatement() {
         Token returnToken = context.expect(TokenType.KW_RETURN);
         ExpressionNode value = null;
-        context.skipTrivia();
-        if (!context.check(TokenType.RBRACE) && !context.check(TokenType.EOF) && !context.check(TokenType.SEMICOLON) && !context.check(TokenType.NEWLINE)) {
+        Token next = context.tokens().peek();
+        if (!next.is(TokenType.NEWLINE) && !next.is(TokenType.SEMICOLON) && !next.is(TokenType.RBRACE) && !next.is(TokenType.EOF)) {
             value = exprParser.parseExpression();
         }
         return new ReturnStatementNode(context.filePath(), returnToken.line(), returnToken.column(), value);

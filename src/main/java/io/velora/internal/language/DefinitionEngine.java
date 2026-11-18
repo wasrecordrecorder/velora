@@ -16,6 +16,12 @@ public final class DefinitionEngine {
         Token target = tokenAt(tokens, line, column);
         if (target == null || target.type() != TokenType.IDENTIFIER) return Optional.empty();
         int targetIndex = tokens.indexOf(target);
+        if (targetIndex > 0 && (tokens.get(targetIndex - 1).is(TokenType.DOT) || tokens.get(targetIndex - 1).is(TokenType.COLON_COLON))) {
+            return Optional.empty();
+        }
+        if (targetIndex + 1 < tokens.size() && tokens.get(targetIndex + 1).is(TokenType.EQ) && enclosingOpenParen(tokens, targetIndex) >= 0) {
+            return Optional.empty();
+        }
         ScopeLayout scopes = scopes(tokens);
         int targetScope = scopes.scopeAt[targetIndex];
         int scriptScope = scriptScope(tokens, scopes);
@@ -132,7 +138,20 @@ public final class DefinitionEngine {
 
     private static boolean isInferredAssignment(List<Token> tokens, int index) {
         if (index + 1 >= tokens.size() || !tokens.get(index + 1).is(TokenType.EQ)) return false;
-        return index == 0 || !tokens.get(index - 1).is(TokenType.DOT);
+        if (index > 0 && (tokens.get(index - 1).is(TokenType.DOT) || tokens.get(index - 1).is(TokenType.COMMA) || tokens.get(index - 1).is(TokenType.COLON))) return false;
+        return enclosingOpenParen(tokens, index) < 0 && enclosingOpenBracket(tokens, index) < 0;
+    }
+
+    private static int enclosingOpenBracket(List<Token> tokens, int index) {
+        int depth = 0;
+        for (int i = index - 1; i >= 0; i--) {
+            if (tokens.get(i).is(TokenType.RBRACKET)) depth++;
+            else if (tokens.get(i).is(TokenType.LBRACKET)) {
+                if (depth == 0) return i;
+                depth--;
+            }
+        }
+        return -1;
     }
 
     private static int enclosingOpenParen(List<Token> tokens, int index) {

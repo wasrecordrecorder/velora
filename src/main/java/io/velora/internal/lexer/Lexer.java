@@ -47,12 +47,16 @@ public final class Lexer {
     private final List<Diagnostic> diagnostics = new ArrayList<>();
 
     public Lexer(String source, String filePath) {
+        this(source, filePath, 1, 0);
+    }
+
+    public Lexer(String source, String filePath, int startLine, int startColumn) {
         this.source = source;
         this.filePath = filePath;
         this.length = source.length();
         this.pos = 0;
-        this.line = 1;
-        this.column = 0;
+        this.line = Math.max(1, startLine);
+        this.column = Math.max(0, startColumn);
     }
 
     public LexerResult lex() {
@@ -94,27 +98,6 @@ public final class Lexer {
             if (c == '#') {
                 emit(TokenType.HASH, "#");
                 continue;
-            }
-            if (c == '\\' && pos + 1 < length) {
-                char next = source.charAt(pos + 1);
-                if (next == 'n') {
-                    emit(TokenType.NEWLINE, "\\n");
-                    line++;
-                    column = 1;
-                    continue;
-                }
-                if (next == 't') {
-                    int start = pos;
-                    pos += 2;
-                    column += 2;
-                    tokens.add(new Token(TokenType.WHITESPACE, source.substring(start, pos), line, column - 2, start));
-                    continue;
-                }
-                if (next == '\\') {
-                    pos += 2;
-                    column += 2;
-                    continue;
-                }
             }
             if (c == '"' || c == '\'') {
                 lexString(c);
@@ -164,7 +147,7 @@ public final class Lexer {
             }
             if (c == '\n') {
                 line++;
-                column = 1;
+                column = 0;
             } else {
                 column++;
             }
@@ -203,7 +186,7 @@ public final class Lexer {
                 closed = true;
                 break;
             }
-            if (c == '\n') {
+            if (c == '\n' || c == '\r') {
                 error(DiagnosticCode.LEXER_UNTERMINATED_STRING, "Unterminated string literal", startLine, startCol);
                 break;
             }
@@ -256,7 +239,7 @@ public final class Lexer {
                     } else if (cc == '}') {
                         depth--;
                     }
-                    if (cc == '\n') { line++; column = 1; } else { column++; }
+                    if (cc == '\n') { line++; column = 0; } else { column++; }
                     pos++;
                 }
                 continue;
@@ -280,23 +263,11 @@ public final class Lexer {
         boolean isDouble = false;
         boolean isFloat = false;
         boolean isLong = false;
-        // leading dot already handled by caller for fractional; here handle integer part
         while (pos < length && Character.isDigit(source.charAt(pos))) {
             pos++;
             column++;
         }
-        // Check if integer part exceeds Integer.MAX_VALUE (2147483647) - auto-promote to long
         String intPart = source.substring(start, pos);
-        if (!isDouble && !isFloat && !isLong) {
-            try {
-                Long.parseLong(intPart);
-                if (Long.parseLong(intPart) > Integer.MAX_VALUE) {
-                    isLong = true;
-                }
-            } catch (NumberFormatException ignored) {
-                // Too large for long, keep as INTEGER (will error later)
-            }
-        }
         if (pos < length && source.charAt(pos) == '.' && peek(1) != '.' && pos + 1 < length && Character.isDigit(peek(1))) {
             isDouble = true;
             pos++;
@@ -306,7 +277,6 @@ public final class Lexer {
                 column++;
             }
         }
-        // exponent
         if (pos < length && (source.charAt(pos) == 'e' || source.charAt(pos) == 'E')) {
             isDouble = true;
             pos++;
@@ -315,12 +285,17 @@ public final class Lexer {
                 pos++;
                 column++;
             }
+            int expStart = pos;
             while (pos < length && Character.isDigit(source.charAt(pos))) {
                 pos++;
                 column++;
             }
+            if (pos == expStart) {
+                error(DiagnosticCode.LEXER_INVALID_NUMBER, "Invalid exponent in numeric literal: " + source.substring(start, pos), line, startCol);
+                tokens.add(new Token(TokenType.DOUBLE_LITERAL, "0.0", line, startCol, start));
+                return;
+            }
         }
-        // suffixes
         if (pos < length) {
             char s = source.charAt(pos);
             if (s == 'f' || s == 'F') {
@@ -333,9 +308,35 @@ public final class Lexer {
                 pos++;
                 column++;
             } else if (s == 'l' || s == 'L') {
+                if (isDouble) {
+                    pos++;
+                    column++;
+                    error(DiagnosticCode.LEXER_INVALID_NUMBER, "Invalid long literal: " + source.substring(start, pos), line, startCol);
+                    tokens.add(new Token(TokenType.LONG_LITERAL, "0L", line, startCol, start));
+                    return;
+                }
                 isLong = true;
                 pos++;
                 column++;
+            }
+        }
+        String raw = source.substring(start, pos);
+        if (!isDouble && !isFloat && !isLong && !intPart.isEmpty()) {
+            try {
+                long parsed = Long.parseLong(intPart);
+                if (parsed > Integer.MAX_VALUE) isLong = true;
+            } catch (NumberFormatException ignored) {
+                error(DiagnosticCode.LEXER_INVALID_NUMBER, "Integer literal out of range: " + raw, line, startCol);
+                tokens.add(new Token(TokenType.INTEGER, "0", line, startCol, start));
+                return;
+            }
+        } else if (isLong) {
+            try {
+                Long.parseLong(raw.substring(0, raw.length() - 1));
+            } catch (NumberFormatException ignored) {
+                error(DiagnosticCode.LEXER_INVALID_NUMBER, "Long literal out of range: " + raw, line, startCol);
+                tokens.add(new Token(TokenType.LONG_LITERAL, "0L", line, startCol, start));
+                return;
             }
         }
         TokenType type;
@@ -343,7 +344,7 @@ public final class Lexer {
         else if (isDouble) type = TokenType.DOUBLE_LITERAL;
         else if (isLong) type = TokenType.LONG_LITERAL;
         else type = TokenType.INTEGER;
-        tokens.add(new Token(type, source.substring(start, pos), line, startCol, start));
+        tokens.add(new Token(type, raw, line, startCol, start));
     }
 
     private void lexIdentifierOrKeyword() {
@@ -460,7 +461,7 @@ public final class Lexer {
     }
 
     private void error(DiagnosticCode code, String message, int l, int col) {
-        SourceRange range = SourceRange.of(filePath, l, col);
+        SourceRange range = SourceRange.of(filePath, l, col + 1);
         diagnostics.add(new Diagnostic(DiagnosticSeverity.ERROR, code, message, range));
     }
 }

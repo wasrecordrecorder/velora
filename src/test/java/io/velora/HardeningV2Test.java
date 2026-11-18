@@ -1572,4 +1572,138 @@ class HardeningV2Test {
         engine.close();
     }
 
+    @Test
+    void lexerParserAndSemanticsReportAccurateDiagnosticsAndHandleStatements() {
+        CompileResult standalone = compiler().compile(CompileRequest.builder("diag-file")
+                .source("combat.vls", "@Script(\"Combat\")\nscript Combat {\n    run() {\n        x = missingVar\n    }\n}")
+                .build());
+        assertFalse(standalone.success());
+        Diagnostic diag = standalone.diagnostics().stream().filter(Diagnostic::isError).findFirst().orElseThrow();
+        assertEquals("combat.vls", diag.range().filePath());
+        assertEquals(4, diag.range().startLine());
+        assertEquals(13, diag.range().startColumn());
+
+        CompileResult bareReturnAndSemicolons = compiler().compile(CompileRequest.builder("ret-semi")
+                .source("combat.vls", "@Script(\"Combat\")\nscript Combat {\n    value = 0;\n    run(boolean done) {\n        if (done) {\n            return\n            value = 1;\n        }\n        value += 2;\n    }\n}")
+                .build());
+        assertTrue(bareReturnAndSemicolons.success(), bareReturnAndSemicolons.diagnostics().toString());
+
+        CompileResult badNumbersAndCall = compiler().compile(CompileRequest.builder("bad-literals")
+                .source("main.vls", "@Script(\"Bad\")\nscript Bad {\n    test() {\n        a = 1.5L\n        b = 1e\n    }\n}")
+                .build());
+        assertFalse(badNumbersAndCall.success());
+        assertTrue(badNumbersAndCall.diagnostics().stream().anyMatch(d -> d.code() == DiagnosticCode.LEXER_INVALID_NUMBER));
+
+        CompileResult uncallable = compiler().compile(CompileRequest.builder("uncallable")
+                .source("main.vls", "@Script(\"Uncallable\")\nscript Uncallable {\n    test() {\n        items = [1, 2]\n        items[0]()\n    }\n}")
+                .build());
+        assertFalse(uncallable.success());
+        assertTrue(uncallable.diagnostics().stream().anyMatch(Diagnostic::isError));
+    }
+
+    @Test
+    void languageServiceCompletesLocalsChainsInterpolationsAndPreservesComments() throws Exception {
+        api.namespace("items", ns -> {
+            ns.function("all", VeloraTypes.list(VeloraTypes.STRING), ctx -> List.of("a", "b"));
+            ns.function("take", VeloraTypes.UNIT, p -> p.required("length", VeloraTypes.INT), ctx -> null);
+        });
+        var language = new io.velora.internal.language.DefaultLanguageService(api, types, null, settings, constants);
+        var editor = language.openEditor("Lang", "combat.vls");
+
+        String base = """
+                @Script("Lang")
+                script Lang {
+                    #int limit = 5
+                    helper(int count, String tag) { return count }
+                    run(List<String> extra) {
+                        for (item in extra) {
+                            first = items.all().first()
+                            msg = "val=${first.}"
+                        }
+                        limit += 1
+                    }
+                }
+                """;
+        editor.updateText(base);
+        var snapshot = editor.snapshot();
+        assertTrue(snapshot.tokens().stream().noneMatch(t -> t.type() == io.velora.api.language.SyntaxToken.TokenType.ERROR
+                && (t.text().equals("#") || t.text().equals("+="))));
+
+        String interpLine = base.lines().toList().get(7);
+        int interpDot = interpLine.indexOf("first.") + "first.".length() + 1;
+        assertTrue(editor.completions(8, interpDot).stream().anyMatch(item -> item.label().equals("trim")));
+        int firstStart = interpLine.indexOf("first") + 1;
+        assertTrue(editor.hover(8, firstStart).orElseThrow().content().contains("Local `String`"));
+
+        editor.updateText("""
+                @Script("Lang")
+                script Lang {
+                    helper(int count, String tag) { return count }
+                    run() {
+                        helper(tag = "x"
+                    }
+                }
+                """);
+        String partialLine = editor.snapshot().content().lines().toList().get(4);
+        var sig = editor.signatureHelp(5, partialLine.length() + 1).orElseThrow();
+        assertEquals("helper", sig.functionName());
+        assertEquals(1, sig.activeParameter());
+        assertTrue(editor.completions(5, partialLine.indexOf("tag") + 1).stream().anyMatch(item -> item.label().equals("helper")));
+
+        String memberScope = """
+                @Script("Scope")
+                script Scope {
+                    int length = 10
+                    run(String text) {
+                        items.take(length = 2)
+                        n = text.length
+                        return length
+                    }
+                }
+                """;
+        editor.updateText(memberScope);
+        List<String> scopeLines = memberScope.lines().toList();
+        assertTrue(editor.definition(6, scopeLines.get(5).indexOf("length") + 1).isEmpty());
+        assertTrue(editor.definition(5, scopeLines.get(4).indexOf("length") + 1).isEmpty());
+        assertEquals(2, editor.rename("length", "total").size());
+
+        String commented = "@Script(\"C\")\nscript C {\n/*\n  keep\n    indent\n*/\nrun() {}\n}";
+        editor.updateText(commented);
+        assertTrue(editor.format().stream().noneMatch(e -> e.newText().contains("\nkeep\nindent\n")));
+        language.close();
+
+        Path root = Files.createTempDirectory("velora-lang-multi-");
+        try {
+            LocalVeloraFileSystem fs = new LocalVeloraFileSystem(root);
+            fs.writeAtomic("multi", "main.vls", "@Script(\"Multi\")\nscript Multi {\n    int run() {\n        return helper(10)\n    }\n}", null);
+            fs.writeAtomic("multi", "helper.vls", "int helper(int value) {\n    return value + 1\n}", null);
+            VeloraHost fsHost = new VeloraHost() {
+                @Override public String id() { return "test"; }
+                @Override public String version() { return "1"; }
+                @Override public MainThreadExecutor mainThread() { return host(new ArrayList<>()).mainThread(); }
+                @Override public WorkerExecutor workers() { return host(new ArrayList<>()).workers(); }
+                @Override public VeloraClock clock() { return host(new ArrayList<>()).clock(); }
+                @Override public VeloraLogger logger() { return host(new ArrayList<>()).logger(); }
+                @Override public VeloraFileSystem fileSystem() { return fs; }
+            };
+            VeloraEngine engine = Velora.builder().host(fsHost).build();
+            engine.freeze();
+            try (var mainEditor = engine.language().openEditor("multi", "main.vls");
+                 var helperEditor = engine.language().openEditor("multi", "helper.vls")) {
+                mainEditor.updateText("@Script(\"Multi\")\nscript Multi {\n    int run() {\n        return helper(10)\n    }\n}");
+                assertFalse(mainEditor.snapshot().hasErrors(), mainEditor.snapshot().diagnostics().toString());
+                assertTrue(mainEditor.hover(4, 16).orElseThrow().content().contains("helper(value: Int) -> Int"));
+
+                helperEditor.updateText("int helper(int value) {\n    return value + missingVar\n}");
+                var helperDiags = helperEditor.snapshot().diagnostics();
+                assertTrue(helperDiags.stream().anyMatch(d -> d.isError() && "helper.vls".equals(d.range().filePath()) && d.range().startLine() == 2));
+            }
+            engine.close();
+        } finally {
+            try (var walk = Files.walk(root)) {
+                walk.sorted(java.util.Comparator.reverseOrder()).forEach(path -> { try { Files.deleteIfExists(path); } catch (Exception ignored) {} });
+            }
+        }
+    }
+
 }

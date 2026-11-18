@@ -38,6 +38,7 @@ public final class SemanticAnalyzer {
     private final EventRegistry eventRegistry;
     private final JavaImportRegistry javaImportRegistry;
     private final List<Diagnostic> diagnostics = new ArrayList<>();
+    private String filePath = "main.vls";
     private Map<String, ResolvedScript.ResolvedFunction> resolvedFunctions;
     private Map<String, String> importNamespaces = Map.of();
 
@@ -69,6 +70,7 @@ public final class SemanticAnalyzer {
 
     public ResolvedScript analyze(ScriptNode script) {
         diagnostics.clear();
+        this.filePath = script.filePath() != null && !script.filePath().isBlank() ? script.filePath() : "main.vls";
         importNamespaces = resolveImports(script);
         validateScriptAnnotations(script);
         ResolvedScript.ScriptMetadata metadata = extractMetadata(script);
@@ -421,7 +423,9 @@ public final class SemanticAnalyzer {
                 VeloraType iterable = inferExpressionType(loop.iterable(), scope, function);
                 VeloraType element = iterable == null ? null : VeloraTypes.listElement(iterable.nonNull());
                 if (element == null && iterable != null) element = VeloraTypes.setElement(iterable.nonNull());
-                if (element != null) loopScope.define(new Symbol(loop.variable(), element, Symbol.Kind.LOCAL));
+                VeloraType declared = loop.variableType() != null ? resolveType(loop.variableType(), loop) : null;
+                VeloraType loopVarType = declared != null ? declared : element;
+                if (loopVarType != null) loopScope.define(new Symbol(loop.variable(), loopVarType, Symbol.Kind.LOCAL));
                 if (!inferBlockReturns(loop.body(), loopScope, function, returns)) return false;
             } else if (statement instanceof WhenStatementNode when) {
                 for (WhenStatementNode.Case item : when.cases()) if (!inferBlockReturns(item.body(), scope, function, returns)) return false;
@@ -512,6 +516,8 @@ public final class SemanticAnalyzer {
             if (element != null) return element;
             VeloraType mapValue = VeloraTypes.mapValue(base);
             if (mapValue != null) return mapValue;
+            if (base == VeloraTypes.VEC2 || base == VeloraTypes.VEC3) return VeloraTypes.DOUBLE;
+            if (base == VeloraTypes.COLOR) return VeloraTypes.INT;
             if (base == VeloraTypes.STRING) return VeloraTypes.CHAR;
             return null;
         }
@@ -801,7 +807,7 @@ public final class SemanticAnalyzer {
                 if (isApiNamespace(id.name())) {
                     return VeloraTypes.UNIT; // namespace itself
                 }
-                error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "Unresolved symbol: " + id.name(), id.line(), id.column());
+                error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "Unresolved symbol: " + id.name(), id.line(), id.column(), id.name().length());
                 return VeloraTypes.UNIT;
             }
             return s.type();
@@ -1126,12 +1132,13 @@ public final class SemanticAnalyzer {
                 for (ExpressionNode a : args) checkExpression(a, scope, currentFn);
                 return VeloraTypes.UNIT;
             }
-            error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "Unresolved function: " + id.name(), id.line(), id.column());
+            error(DiagnosticCode.SEMANTIC_UNRESOLVED_SYMBOL, "Unresolved function: " + id.name(), id.line(), id.column(), id.name().length());
             for (ExpressionNode a : args) checkExpression(a, scope, currentFn);
             return VeloraTypes.UNIT;
         }
         checkExpression(callee, scope, currentFn);
         for (ExpressionNode a : args) checkExpression(a, scope, currentFn);
+        error(DiagnosticCode.SEMANTIC_TYPE_MISMATCH, "Expression is not callable", callee.line(), callee.column());
         return VeloraTypes.UNIT;
     }
 
@@ -2098,6 +2105,12 @@ public final class SemanticAnalyzer {
     }
 
     private void error(DiagnosticCode code, String message, int line, int column) {
-        diagnostics.add(new Diagnostic(DiagnosticSeverity.ERROR, code, message, SourceRange.of("main.vls", line, column)));
+        diagnostics.add(new Diagnostic(DiagnosticSeverity.ERROR, code, message, SourceRange.of(filePath, line, column + 1)));
+    }
+
+    private void error(DiagnosticCode code, String message, int line, int column, int length) {
+        int startCol = Math.max(1, column + 1);
+        int endCol = startCol + Math.max(1, length);
+        diagnostics.add(new Diagnostic(DiagnosticSeverity.ERROR, code, message, SourceRange.of(filePath, line, startCol, line, endCol)));
     }
 }

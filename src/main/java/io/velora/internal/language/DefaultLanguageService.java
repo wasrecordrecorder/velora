@@ -8,6 +8,7 @@ import io.velora.api.interop.JavaImportRegistry;
 import io.velora.api.registry.ConstantRegistry;
 import io.velora.api.registry.SettingRegistry;
 import io.velora.api.registry.TypeRegistry;
+import io.velora.host.VeloraHost;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -20,32 +21,40 @@ public final class DefaultLanguageService implements LanguageService {
     private final SettingRegistry settingRegistry;
     private final ConstantRegistry constantRegistry;
     private final JavaImportRegistry javaImportRegistry;
+    private final VeloraHost host;
     private boolean available = true;
 
     public DefaultLanguageService() {
-        this(null, null, null, null, null, null);
+        this(null, null, null, null, null, null, null);
     }
 
     public DefaultLanguageService(ApiRegistry apiRegistry, TypeRegistry typeRegistry, EventRegistry eventRegistry,
                                   SettingRegistry settingRegistry, ConstantRegistry constantRegistry) {
-        this(apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry, null);
+        this(apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry, null, null);
     }
 
     public DefaultLanguageService(ApiRegistry apiRegistry, TypeRegistry typeRegistry, EventRegistry eventRegistry,
                                   SettingRegistry settingRegistry, ConstantRegistry constantRegistry,
                                   JavaImportRegistry javaImportRegistry) {
+        this(apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry, javaImportRegistry, null);
+    }
+
+    public DefaultLanguageService(ApiRegistry apiRegistry, TypeRegistry typeRegistry, EventRegistry eventRegistry,
+                                  SettingRegistry settingRegistry, ConstantRegistry constantRegistry,
+                                  JavaImportRegistry javaImportRegistry, VeloraHost host) {
         this.apiRegistry = apiRegistry;
         this.typeRegistry = typeRegistry;
         this.eventRegistry = eventRegistry;
         this.settingRegistry = settingRegistry;
         this.constantRegistry = constantRegistry;
         this.javaImportRegistry = javaImportRegistry;
+        this.host = host;
     }
 
     @Override
     public EditorSession openEditor(String scriptId, String filePath) {
         if (!available) throw new IllegalStateException("Language service is closed");
-        DefaultEditorSession session = new DefaultEditorSession(scriptId, filePath, apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry, javaImportRegistry);
+        DefaultEditorSession session = new DefaultEditorSession(scriptId, filePath, apiRegistry, typeRegistry, eventRegistry, settingRegistry, constantRegistry, javaImportRegistry, host);
         DefaultEditorSession previous = sessions.put(scriptId + ":" + filePath, session);
         if (previous != null) previous.close();
         return session;

@@ -21,6 +21,7 @@ import io.velora.internal.parser.Parser;
 import io.velora.internal.persistence.BytecodeCache;
 import io.velora.internal.semantic.ResolvedScript;
 import io.velora.internal.semantic.SemanticAnalyzer;
+import io.velora.internal.source.SourceBundler;
 import io.velora.internal.source.SourceHash;
 import io.velora.internal.vm.*;
 
@@ -86,7 +87,7 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
 
         Set<String> sourcePaths = new HashSet<>();
         for (SourceFile source : request.sources()) {
-            String path = normalizedSourcePath(source.relativePath());
+            String path = SourceBundler.normalizedSourcePath(source.relativePath());
             if (path == null) {
                 diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_PATH_TRAVERSAL,
                         "Invalid source path: " + source.relativePath(), SourceRange.of(source.relativePath(), 0, 0)));
@@ -99,12 +100,12 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             }
         }
 
-        SourceBundle bundle = sourceBundle(request.sources(), diagnostics);
+        SourceBundler.SourceBundle bundle = SourceBundler.bundle(request.sources(), diagnostics);
         if (bundle == null) return Compilation.failure(diagnostics);
         String registryHash = computeRegistryHash();
-        CompiledModule cached = cache.get(request.scriptId(), bundle.sourceHash, registryHash);
+        CompiledModule cached = cache.get(request.scriptId(), bundle.sourceHash(), registryHash);
         if (cached != null && request.mode() != CompileMode.FULL) {
-            return new Compilation(cached, bundle.remap(diagnostics), bundle.sourceHash, registryHash);
+            return new Compilation(cached, bundle.remap(diagnostics), bundle.sourceHash(), registryHash);
         }
         if (request.mode() == CompileMode.CACHE_ONLY) {
             diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_CACHE_MISS,
@@ -112,11 +113,11 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             return Compilation.failure(bundle.remap(diagnostics));
         }
 
-        LexerResult lexerResult = new Lexer(bundle.source, bundle.filePath).lex();
+        LexerResult lexerResult = new Lexer(bundle.source(), bundle.filePath()).lex();
         diagnostics.addAll(lexerResult.diagnostics());
         if (hasErrors(diagnostics)) return Compilation.failure(bundle.remap(diagnostics));
 
-        ParseResult parseResult = Parser.parse(bundle.source, bundle.filePath);
+        ParseResult parseResult = Parser.parse(bundle.source(), bundle.filePath());
         diagnostics.addAll(parseResult.diagnostics());
         if (hasErrors(diagnostics) || parseResult.scriptNode() == null) return Compilation.failure(bundle.remap(diagnostics));
 
@@ -130,11 +131,11 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
         diagnostics.addAll(new IrVerifier().verify(irModule));
         if (hasErrors(diagnostics)) return Compilation.failure(bundle.remap(diagnostics));
 
-        CompiledModule module = new BytecodeWriter().write(irModule, bundle.sourceHash, registryHash);
+        CompiledModule module = new BytecodeWriter().write(irModule, bundle.sourceHash(), registryHash);
         diagnostics.addAll(new BytecodeVerifier(apiRegistry).verify(module));
         if (hasErrors(diagnostics)) return Compilation.failure(bundle.remap(diagnostics));
-        cache.put(request.scriptId(), bundle.sourceHash, registryHash, module);
-        return new Compilation(module, bundle.remap(diagnostics), bundle.sourceHash, registryHash);
+        cache.put(request.scriptId(), bundle.sourceHash(), registryHash, module);
+        return new Compilation(module, bundle.remap(diagnostics), bundle.sourceHash(), registryHash);
     }
 
 
@@ -143,103 +144,6 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_UNSUPPORTED_VERSION,
                     "Script language version does not match compile request", SourceRange.of(parseResult.scriptNode().filePath(), 0, 0)));
         }
-    }
-
-    private SourceBundle sourceBundle(List<SourceFile> sources, List<Diagnostic> diagnostics) {
-        StringBuilder hashInput = new StringBuilder();
-        String mainSource = null;
-        String mainPath = null;
-        List<SourceFile> helpers = new ArrayList<>();
-        List<SourceFile> ordered = sources.stream()
-                .filter(source -> source.relativePath().toLowerCase(Locale.ROOT).endsWith(".vls"))
-                .sorted(Comparator.comparing(source -> normalizedSourcePath(source.relativePath())))
-                .toList();
-        for (SourceFile source : ordered) {
-            String path = normalizedSourcePath(source.relativePath());
-            hashInput.append(path).append('\0').append(SourceHash.compute(source.content())).append('\0');
-            boolean declaresScript = new Lexer(source.content(), path).lex().tokens().stream().anyMatch(token -> token.type() == TokenType.KW_SCRIPT);
-            if (declaresScript) {
-                if (mainSource != null) {
-                    diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_MULTIPLE_SCRIPTS,
-                            "Multiple script declarations across files", SourceRange.of(path, 0, 0)));
-                    return null;
-                }
-                mainSource = source.content();
-                mainPath = path;
-            } else {
-                helpers.add(source);
-            }
-        }
-        if (mainSource == null) {
-            diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_NO_SCRIPT,
-                    sources.isEmpty() ? "No .vls source files provided" : "No script declaration found", SourceRange.of("main.vls", 0, 0)));
-            return null;
-        }
-        List<SourceSpan> spans = new ArrayList<>();
-        if (!helpers.isEmpty()) {
-            int closingBrace = scriptClosingBrace(mainSource, mainPath);
-            int capacity = mainSource.length() + helpers.stream().mapToInt(helper -> helper.content().length()).sum() + helpers.size() * 2;
-            StringBuilder merged = new StringBuilder(capacity);
-            if (closingBrace >= 0) {
-                int insertion = lineInsertionOffset(mainSource, closingBrace);
-                merged.append(mainSource, 0, insertion);
-                if (!merged.isEmpty() && merged.charAt(merged.length() - 1) != '\n') merged.append('\n');
-                for (SourceFile helper : helpers) appendHelper(merged, helper, spans);
-                int suffixStartLine = lineAt(merged, merged.length());
-                int sourceStartLine = lineAt(mainSource, insertion);
-                merged.append(mainSource, insertion, mainSource.length());
-                spans.add(new SourceSpan(suffixStartLine, lineAt(merged, merged.length()) + 1, mainPath, sourceStartLine));
-            } else {
-                merged.append(mainSource);
-                if (!merged.isEmpty() && merged.charAt(merged.length() - 1) != '\n') merged.append('\n');
-                for (SourceFile helper : helpers) appendHelper(merged, helper, spans);
-            }
-            mainSource = merged.toString();
-        }
-        return new SourceBundle(mainSource, mainPath, SourceHash.compute(hashInput.toString()), List.copyOf(spans));
-    }
-
-    private int scriptClosingBrace(String source, String filePath) {
-        List<io.velora.internal.lexer.Token> tokens = new Lexer(source, filePath).lex().tokens();
-        int script = -1;
-        for (int i = 0; i < tokens.size(); i++) {
-            if (tokens.get(i).type() == TokenType.KW_SCRIPT) {
-                script = i;
-                break;
-            }
-        }
-        if (script < 0) return -1;
-        int depth = 0;
-        boolean opened = false;
-        for (int i = script + 1; i < tokens.size(); i++) {
-            var token = tokens.get(i);
-            if (token.type() == TokenType.LBRACE) {
-                depth++;
-                opened = true;
-            } else if (token.type() == TokenType.RBRACE && opened && --depth == 0) {
-                return token.offset();
-            }
-        }
-        return -1;
-    }
-
-    private int lineInsertionOffset(String source, int offset) {
-        int lineStart = source.lastIndexOf('\n', Math.max(0, offset - 1)) + 1;
-        for (int i = lineStart; i < offset; i++) if (!Character.isWhitespace(source.charAt(i))) return offset;
-        return lineStart;
-    }
-
-    private void appendHelper(StringBuilder merged, SourceFile helper, List<SourceSpan> spans) {
-        int startLine = lineAt(merged, merged.length());
-        merged.append(helper.content());
-        if (merged.isEmpty() || merged.charAt(merged.length() - 1) != '\n') merged.append('\n');
-        spans.add(new SourceSpan(startLine, lineAt(merged, merged.length()), normalizedSourcePath(helper.relativePath()), 1));
-    }
-
-    private int lineAt(CharSequence source, int offset) {
-        int line = 1;
-        for (int i = 0; i < offset; i++) if (source.charAt(i) == '\n') line++;
-        return line;
     }
 
     @Override
@@ -294,41 +198,6 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
         return value.getClass().getName() + ':' + String.valueOf(value);
     }
 
-    private String normalizedSourcePath(String path) {
-        if (path == null || path.isBlank() || path.indexOf('\0') >= 0 || path.startsWith("/") || path.startsWith("\\") || path.matches("^[A-Za-z]:.*")) return null;
-        String normalized = path.replace('\\', '/');
-        Deque<String> parts = new ArrayDeque<>();
-        for (String part : normalized.split("/")) {
-            if (part.isEmpty() || part.equals(".")) continue;
-            if (part.equals("..")) return null;
-            parts.addLast(part);
-        }
-        return parts.isEmpty() ? null : String.join("/", parts);
-    }
-
-    private record SourceSpan(int startLine, int endLineExclusive, String filePath, int sourceStartLine) {
-        private boolean contains(int line) { return line >= startLine && line < endLineExclusive; }
-        private int sourceLine(int line) { return sourceStartLine + line - startLine; }
-    }
-
-    private record SourceBundle(String source, String filePath, String sourceHash, List<SourceSpan> spans) {
-        private List<Diagnostic> remap(List<Diagnostic> diagnostics) {
-            if (spans.isEmpty()) return List.copyOf(diagnostics);
-            return diagnostics.stream().map(this::remap).toList();
-        }
-
-        private Diagnostic remap(Diagnostic diagnostic) {
-            SourceRange range = diagnostic.range();
-            if (range == null || !filePath.equals(range.filePath())) return diagnostic;
-            for (SourceSpan span : spans) {
-                if (!span.contains(range.startLine())) continue;
-                int start = span.sourceLine(range.startLine());
-                int end = span.contains(range.endLine()) ? span.sourceLine(range.endLine()) : start;
-                return new Diagnostic(diagnostic.severity(), diagnostic.code(), diagnostic.message(), SourceRange.of(span.filePath(), start, range.startColumn(), end, range.endColumn()));
-            }
-            return diagnostic;
-        }
-    }
     private record Compilation(CompiledModule module, List<Diagnostic> diagnostics, String sourceHash, String registryHash) {
         private static Compilation failure(List<Diagnostic> diagnostics) { return new Compilation(null, List.copyOf(diagnostics), null, null); }
     }

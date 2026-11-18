@@ -64,18 +64,85 @@ public final class HoverEngine {
         if (line < 1 || column < 1) return Optional.empty();
         int zeroColumn = column - 1;
         for (Token token : new Lexer(content, filePath).lex().tokens()) {
+            if (token.is(TokenType.STRING_INTERP)) {
+                Token sub = interpolationTokenAt(token, line, zeroColumn, filePath);
+                if (sub != null) {
+                    if (sub.isTrivia() || sub.is(TokenType.EOF)) return Optional.empty();
+                    int offset = token.offset() + sub.offset();
+                    return buildHover(content, sub, offset, filePath, apiRegistry, typeRegistry, constantRegistry, eventRegistry, javaImportRegistry, resolved);
+                }
+            }
             if (token.line() != line || token.length() == 0) continue;
             if (zeroColumn < token.column() || zeroColumn >= token.column() + token.length()) continue;
             if (token.isTrivia() || token.is(TokenType.EOF)) return Optional.empty();
-            String text = token.text().startsWith("@") ? token.text().substring(1) : token.text();
-            String qualified = qualifiedAt(content, line, token.column(), token.text());
-            String detail = dynamicInfo(content, text, qualified, token.offset(), apiRegistry, typeRegistry, constantRegistry, eventRegistry, javaImportRegistry, resolved);
-            if (detail == null) detail = INFO.get(text);
-            String shown = qualified != null ? qualified : token.text();
-            String body = "```velora\n" + shown + "\n```" + (detail == null ? "" : "\n" + detail);
-            return Optional.of(HoverInfo.of(body, filePath, token.line(), token.column() + 1));
+            return buildHover(content, token, token.offset(), filePath, apiRegistry, typeRegistry, constantRegistry, eventRegistry, javaImportRegistry, resolved);
         }
         return Optional.empty();
+    }
+
+    private static Optional<HoverInfo> buildHover(String content, Token token, int tokenOffset, String filePath,
+                                                  ApiRegistry apiRegistry, TypeRegistry typeRegistry, ConstantRegistry constantRegistry,
+                                                  EventRegistry eventRegistry, JavaImportRegistry javaImportRegistry, ResolvedScript resolved) {
+        String text = token.text().startsWith("@") ? token.text().substring(1) : token.text();
+        String qualified = qualifiedAt(content, token.line(), token.column(), token.text());
+        String detail = dynamicInfo(content, text, qualified, tokenOffset, apiRegistry, typeRegistry, constantRegistry, eventRegistry, javaImportRegistry, resolved);
+        if (detail == null) detail = INFO.get(text);
+        String shown = qualified != null ? qualified : token.text();
+        String body = "```velora\n" + shown + "\n```" + (detail == null ? "" : "\n" + detail);
+        return Optional.of(HoverInfo.of(body, filePath, token.line(), token.column() + 1));
+    }
+
+    private static Token interpolationTokenAt(Token interpToken, int targetLine, int targetZeroCol, String filePath) {
+        String raw = interpToken.text();
+        int curLine = interpToken.line();
+        int curCol = interpToken.column() + 1;
+        int i = 1;
+        int limit = raw.length() - 1;
+        while (i < limit) {
+            char c = raw.charAt(i);
+            if (c == '$' && i + 1 < limit && raw.charAt(i + 1) == '{') {
+                i += 2;
+                curCol += 2;
+                int exprLine = curLine;
+                int exprCol = curCol;
+                int start = i;
+                int depth = 1;
+                char nestedQuote = 0;
+                boolean escaped = false;
+                while (i < limit && depth > 0) {
+                    char cc = raw.charAt(i);
+                    if (nestedQuote != 0) {
+                        if (escaped) escaped = false;
+                        else if (cc == '\\') escaped = true;
+                        else if (cc == nestedQuote) nestedQuote = 0;
+                    } else if (cc == '"' || cc == '\'') {
+                        nestedQuote = cc;
+                    } else if (cc == '{') {
+                        depth++;
+                    } else if (cc == '}') {
+                        depth--;
+                    }
+                    if (depth > 0) {
+                        i++;
+                        if (cc == '\n') { curLine++; curCol = 0; } else curCol++;
+                    }
+                }
+                String expr = raw.substring(start, i);
+                for (Token sub : new Lexer(expr, filePath, exprLine, exprCol).lex().tokens()) {
+                    if (sub.line() == targetLine && sub.length() > 0 && targetZeroCol >= sub.column() && targetZeroCol < sub.column() + sub.length()) {
+                        return new Token(sub.type(), sub.text(), sub.line(), sub.column(), start + sub.offset());
+                    }
+                }
+                if (i < limit) { i++; curCol++; }
+            } else if (c == '\\' && i + 1 < limit) {
+                i += 2;
+                curCol += 2;
+            } else {
+                i++;
+                if (c == '\n') { curLine++; curCol = 0; } else curCol++;
+            }
+        }
+        return null;
     }
 
     private static String dynamicInfo(String content, String token, String qualified, int tokenOffset, ApiRegistry apiRegistry, TypeRegistry typeRegistry,
@@ -93,7 +160,7 @@ public final class HoverEngine {
                 var constant = constantRegistry.find(namespace, member);
                 if (constant != null) return "Constant `" + constant.type().name() + "`.";
             }
-            var receiverType = LanguageMetadata.qualifierType(content, namespace, tokenOffset, typeRegistry, resolved);
+            var receiverType = LanguageMetadata.qualifierType(content, namespace, tokenOffset, apiRegistry, typeRegistry, constantRegistry, javaImportRegistry, resolved);
             var builtin = LanguageMetadata.member(receiverType, member);
             if (builtin != null) return "`" + builtin.detail() + "`\n" + builtin.description();
         }
@@ -103,6 +170,10 @@ public final class HoverEngine {
             for (var setting : resolved.settings()) if (setting.id().equals(token)) return "Setting `" + setting.type().name() + "`." + setting.description().filter(value -> !value.isBlank()).map(value -> "\n" + value).orElse("");
             var function = resolved.functions().get(token);
             if (function != null) return "Function `" + function.name() + "(" + String.join(", ", function.parameters().stream().map(parameter -> parameter.name() + ": " + parameter.type().name()).toList()) + ") -> " + function.returnType().name() + "`.";
+        }
+        var local = LanguageMetadata.visibleLocals(content, tokenOffset + token.length(), apiRegistry, typeRegistry, constantRegistry, javaImportRegistry, resolved).get(token);
+        if (local != null) {
+            return (local.parameter() ? "Parameter" : "Local") + " `" + local.type().name() + "`.";
         }
         if (javaImportRegistry != null) {
             var imported = JavaImportAliases.resolve(content, javaImportRegistry).get(token);
@@ -130,16 +201,7 @@ public final class HoverEngine {
         int dot = tokenColumn - 1;
         while (dot >= 0 && Character.isWhitespace(source.charAt(dot))) dot--;
         if (dot < 0 || source.charAt(dot) != '.') return null;
-        int end = dot;
-        int start = end;
-        while (start > 0) {
-            char c = source.charAt(start - 1);
-            if (Character.isJavaIdentifierPart(c) || c == '.' || c == '?') start--;
-            else break;
-        }
-        if (start == end) return null;
-        String qualifier = source.substring(start, end);
-        if (qualifier.startsWith(".") || qualifier.endsWith(".")) return null;
-        return qualifier + "." + token;
+        String qualifier = LanguageMetadata.extractQualifierBackward(source, dot);
+        return qualifier == null ? null : qualifier + "." + token;
     }
 }

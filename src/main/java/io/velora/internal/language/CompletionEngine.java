@@ -23,7 +23,7 @@ public final class CompletionEngine {
             "spawn", "true", "false", "null"
     );
     private static final List<String> TYPES = List.of(
-            "Any", "boolean", "byte", "int", "long", "float", "double", "char", "String", "Duration",
+            "Any", "Unit", "boolean", "byte", "int", "long", "float", "double", "char", "String", "Duration",
             "Vec2", "Vec3", "Color", "UUID", "List", "Map", "Set", "Task"
     );
     private static final List<String> BUILTINS = List.of("list", "set", "map", "await", "delay", "yield");
@@ -39,7 +39,10 @@ public final class CompletionEngine {
             java.util.Map.entry("math", "Numeric, trigonometric and interpolation utilities."),
             java.util.Map.entry("random", "Random numbers, booleans and probability helpers."),
             java.util.Map.entry("time", "Host wall-clock and monotonic time utilities."),
-            java.util.Map.entry("uuid", "UUID creation, parsing and validation utilities.")
+            java.util.Map.entry("uuid", "UUID creation, parsing and validation utilities."),
+            java.util.Map.entry("bytes", "Immutable binary byte array helpers."),
+            java.util.Map.entry("base64", "Base64 encoding and decoding helpers."),
+            java.util.Map.entry("assets", "Read-only script asset access helpers.")
     );
 
     private CompletionEngine() {}
@@ -89,7 +92,7 @@ public final class CompletionEngine {
                     if (matches(constant.name(), prefix) && seen.add(constant.name())) result.add(new CompletionItem(constant.name(), enumType.name(), null, constant.name(), CompletionItem.CompletionKind.ENUM_CONSTANT));
                 }
             }
-            var qualifierType = LanguageMetadata.qualifierType(content, qualifier, cursorOffset(content, line, column), typeRegistry, resolved);
+            var qualifierType = LanguageMetadata.qualifierType(content, qualifier, cursorOffset(content, line, column), apiRegistry, typeRegistry, constantRegistry, javaImportRegistry, resolved);
             for (var member : LanguageMetadata.members(qualifierType)) {
                 if (!matches(member.name(), prefix) || !seen.add(member.name())) continue;
                 result.add(new CompletionItem(member.name(), member.detail(), member.description(), member.name(),
@@ -103,6 +106,13 @@ public final class CompletionEngine {
                 for (var event : eventRegistry.all()) addAnnotation(result, seen, event.scriptName(), prefix, event.payloadType().name(), event.description());
             }
             return List.copyOf(result);
+        }
+        int cursorOffset = cursorOffset(content, line, column);
+        for (var entry : LanguageMetadata.visibleLocals(content, cursorOffset, apiRegistry, typeRegistry, constantRegistry, javaImportRegistry, resolved).entrySet()) {
+            var local = entry.getValue();
+            if (matches(local.name(), prefix) && seen.add(local.name())) {
+                result.add(new CompletionItem(local.name(), local.type().name(), local.parameter() ? "Parameter" : "Local variable", local.name(), CompletionItem.CompletionKind.PROPERTY));
+            }
         }
         add(result, seen, KEYWORDS, CompletionItem.CompletionKind.KEYWORD, prefix);
         for (String type : TYPES) {
@@ -215,9 +225,39 @@ public final class CompletionEngine {
         if (offset < 0) return true;
         for (var token : new Lexer(content, "completion.vls").lex().tokens()) {
             if (offset < token.offset() || offset >= token.offset() + token.length()) continue;
-            if (token.is(TokenType.COMMENT) || token.is(TokenType.STRING) || token.is(TokenType.STRING_INTERP)) return true;
+            if (token.is(TokenType.COMMENT) || token.is(TokenType.STRING)) return true;
+            if (token.is(TokenType.STRING_INTERP)) return !insideInterpolation(token.text(), offset - token.offset());
         }
         return false;
+    }
+
+    private static boolean insideInterpolation(String raw, int relativeOffset) {
+        int limit = Math.min(relativeOffset, raw.length());
+        int braceDepth = 0;
+        char nestedQuote = 0;
+        boolean escaped = false;
+        for (int i = 1; i < limit; i++) {
+            char c = raw.charAt(i);
+            if (braceDepth > 0) {
+                if (nestedQuote != 0) {
+                    if (escaped) escaped = false;
+                    else if (c == '\\') escaped = true;
+                    else if (c == nestedQuote) nestedQuote = 0;
+                } else if (c == '"' || c == '\'') {
+                    nestedQuote = c;
+                } else if (c == '{') {
+                    braceDepth++;
+                } else if (c == '}') {
+                    braceDepth--;
+                }
+            } else if (c == '\\') {
+                i++;
+            } else if (c == '$' && i + 1 < limit && raw.charAt(i + 1) == '{') {
+                braceDepth = 1;
+                i++;
+            }
+        }
+        return braceDepth > 0 && nestedQuote == 0;
     }
 
     private static int cursorOffset(String content, int line, int column) {
@@ -251,16 +291,7 @@ public final class CompletionEngine {
         String source = lines[line - 1];
         int cursor = Math.min(column - 1, source.length()) - prefixLength;
         if (cursor <= 0 || source.charAt(cursor - 1) != '.') return null;
-        int end = cursor - 1;
-        int start = end;
-        while (start > 0) {
-            char c = source.charAt(start - 1);
-            if (Character.isJavaIdentifierPart(c) || c == '.' || c == '?') start--;
-            else break;
-        }
-        if (start == end) return null;
-        String qualifier = source.substring(start, end);
-        return qualifier.startsWith(".") || qualifier.endsWith(".") ? null : qualifier;
+        return LanguageMetadata.extractQualifierBackward(source, cursor - 1);
     }
 
 

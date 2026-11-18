@@ -60,12 +60,14 @@ public final class ParserContext {
     }
 
     public void error(DiagnosticCode code, String message, Token token) {
-        SourceRange range = SourceRange.of(filePath, token.line(), token.column());
+        int startCol = token.column() + 1;
+        int endCol = startCol + Math.max(1, token.length());
+        SourceRange range = SourceRange.of(filePath, token.line(), startCol, token.line(), endCol);
         diagnostics.add(new Diagnostic(DiagnosticSeverity.ERROR, code, message, range));
     }
 
     public void error(DiagnosticCode code, String message, int line, int column) {
-        SourceRange range = SourceRange.of(filePath, line, column);
+        SourceRange range = SourceRange.of(filePath, line, column + 1);
         diagnostics.add(new Diagnostic(DiagnosticSeverity.ERROR, code, message, range));
     }
 
