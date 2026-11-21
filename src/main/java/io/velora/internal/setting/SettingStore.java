@@ -13,6 +13,7 @@ public final class SettingStore {
     private final Map<String, SettingDescriptor> descriptorsById = new LinkedHashMap<>();
     private final Map<String, SettingDescriptor> aliases = new LinkedHashMap<>();
     private final List<SettingDescriptor> descriptors;
+    private java.util.function.BiConsumer<String, Object> updateListener;
 
     public SettingStore(List<SettingDescriptor> descriptors) {
         this.descriptors = List.copyOf(descriptors);
@@ -39,11 +40,17 @@ public final class SettingStore {
         return get(descriptors.get(index).id());
     }
 
+    public void setUpdateListener(java.util.function.BiConsumer<String, Object> listener) {
+        this.updateListener = listener;
+    }
+
     public void set(String id, SettingValue value) {
         SettingDescriptor descriptor = descriptor(id);
         SettingCell cell = descriptor != null ? cells.get(descriptor.id()) : null;
         if (cell == null) throw new IllegalArgumentException("Unknown setting: " + id);
-        cell.value(SettingValidator.normalize(descriptor, value));
+        SettingValue normalized = SettingValidator.normalize(descriptor, value);
+        cell.value(normalized);
+        if (updateListener != null) updateListener.accept(descriptor.id(), normalized.value());
     }
 
     public List<SettingDescriptor> descriptors() { return descriptors; }

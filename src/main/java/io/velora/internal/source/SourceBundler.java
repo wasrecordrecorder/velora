@@ -42,7 +42,74 @@ public final class SourceBundler {
         }
     }
 
+    public enum ScriptLanguage {
+        VLS, JAVASCRIPT, LUA
+    }
+
+    public static ScriptLanguage detectLanguage(List<SourceFile> sources) {
+        boolean hasVls = false;
+        boolean hasJs = false;
+        boolean hasLua = false;
+        for (SourceFile source : sources) {
+            String path = source.relativePath().toLowerCase(Locale.ROOT);
+            if (path.endsWith(".vls")) hasVls = true;
+            else if (path.endsWith(".js") || path.endsWith(".mjs")) hasJs = true;
+            else if (path.endsWith(".lua")) hasLua = true;
+        }
+        int count = (hasVls ? 1 : 0) + (hasJs ? 1 : 0) + (hasLua ? 1 : 0);
+        if (count > 1) return null;
+        if (hasJs) return ScriptLanguage.JAVASCRIPT;
+        if (hasLua) return ScriptLanguage.LUA;
+        return ScriptLanguage.VLS;
+    }
+
     public static SourceBundle bundle(List<SourceFile> sources, List<Diagnostic> diagnostics) {
+        ScriptLanguage lang = detectLanguage(sources);
+        if (lang == null) {
+            if (diagnostics != null) {
+                diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_BAD_SOURCE,
+                        "Cannot mix multiple script languages (.vls, .js, .lua) in a single script", SourceRange.of("main", 1, 1)));
+            }
+            return null;
+        }
+
+        if (lang == ScriptLanguage.JAVASCRIPT || lang == ScriptLanguage.LUA) {
+            String ext = lang == ScriptLanguage.JAVASCRIPT ? ".js" : ".lua";
+            StringBuilder hashInput = new StringBuilder();
+            List<SourceFile> ordered = sources.stream()
+                    .filter(source -> normalizedSourcePath(source.relativePath()) != null)
+                    .sorted(Comparator.comparing(source -> normalizedSourcePath(source.relativePath())))
+                    .toList();
+            SourceFile mainFile = null;
+            for (SourceFile source : ordered) {
+                String path = normalizedSourcePath(source.relativePath());
+                hashInput.append(path).append('\0').append(SourceHash.compute(source.content())).append('\0');
+                String lower = path.toLowerCase(Locale.ROOT);
+                if (mainFile == null) {
+                    if (lang == ScriptLanguage.JAVASCRIPT && (lower.equals("main.js") || lower.equals("main.mjs"))) mainFile = source;
+                    else if (lang == ScriptLanguage.LUA && lower.equals("main.lua")) mainFile = source;
+                }
+            }
+            if (mainFile == null && !ordered.isEmpty()) {
+                mainFile = ordered.stream()
+                        .filter(s -> {
+                            String p = s.relativePath().toLowerCase(Locale.ROOT);
+                            return lang == ScriptLanguage.JAVASCRIPT ? (p.endsWith(".js") || p.endsWith(".mjs")) : p.endsWith(".lua");
+                        })
+                        .findFirst()
+                        .orElse(ordered.get(0));
+            }
+            if (mainFile == null) {
+                if (diagnostics != null) {
+                    diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_NO_SCRIPT,
+                            "No " + ext + " source files provided", SourceRange.of("main" + ext, 1, 1)));
+                }
+                return null;
+            }
+            String mainPath = normalizedSourcePath(mainFile.relativePath());
+            return new SourceBundle(mainFile.content(), mainPath, SourceHash.compute(hashInput.toString()), List.of());
+        }
+
         StringBuilder hashInput = new StringBuilder();
         String mainSource = null;
         String mainPath = null;

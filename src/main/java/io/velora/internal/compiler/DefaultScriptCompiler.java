@@ -8,10 +8,13 @@ import io.velora.api.function.FunctionDescriptor;
 import io.velora.api.interop.JavaImportRegistry;
 import io.velora.api.registry.*;
 import io.velora.api.setting.SettingKind;
+import io.velora.api.setting.SettingDescriptor;
 import io.velora.api.type.EnumType;
 import io.velora.api.type.StructType;
 import io.velora.api.type.VeloraType;
+import io.velora.api.type.VeloraTypes;
 import io.velora.internal.bytecode.*;
+import io.velora.internal.foreign.*;
 import io.velora.internal.ir.*;
 import io.velora.internal.lexer.Lexer;
 import io.velora.internal.lexer.LexerResult;
@@ -113,6 +116,11 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
             return Compilation.failure(bundle.remap(diagnostics));
         }
 
+        SourceBundler.ScriptLanguage lang = SourceBundler.detectLanguage(request.sources());
+        if (lang == SourceBundler.ScriptLanguage.JAVASCRIPT || lang == SourceBundler.ScriptLanguage.LUA) {
+            return compileForeign(request, bundle, lang, registryHash, diagnostics);
+        }
+
         LexerResult lexerResult = new Lexer(bundle.source(), bundle.filePath()).lex();
         diagnostics.addAll(lexerResult.diagnostics());
         if (hasErrors(diagnostics)) return Compilation.failure(bundle.remap(diagnostics));
@@ -134,6 +142,139 @@ public final class DefaultScriptCompiler implements ScriptCompiler {
         CompiledModule module = new BytecodeWriter().write(irModule, bundle.sourceHash(), registryHash);
         diagnostics.addAll(new BytecodeVerifier(apiRegistry).verify(module));
         if (hasErrors(diagnostics)) return Compilation.failure(bundle.remap(diagnostics));
+        cache.put(request.scriptId(), bundle.sourceHash(), registryHash, module);
+        return new Compilation(module, bundle.remap(diagnostics), bundle.sourceHash(), registryHash);
+    }
+
+    private Compilation compileForeign(CompileRequest request, SourceBundler.SourceBundle bundle,
+                                       SourceBundler.ScriptLanguage lang, String registryHash,
+                                       List<Diagnostic> diagnostics) {
+        for (SourceFile sf : request.sources()) {
+            String path = SourceBundler.normalizedSourcePath(sf.relativePath());
+            if (path == null) continue;
+            List<Diagnostic> syntaxErrors = lang == SourceBundler.ScriptLanguage.JAVASCRIPT
+                    ? NativeBridge.checkSyntaxJs(sf.content(), path)
+                    : NativeBridge.checkSyntaxLua(sf.content(), path);
+            diagnostics.addAll(syntaxErrors);
+        }
+        if (hasErrors(diagnostics)) return Compilation.failure(bundle.remap(diagnostics));
+
+        Map<String, String> sourceMap = new HashMap<>();
+        for (SourceFile sf : request.sources()) {
+            String path = SourceBundler.normalizedSourcePath(sf.relativePath());
+            if (path != null) sourceMap.put(path, sf.content());
+        }
+
+        ForeignHost ephemeralHost = new ForeignHost() {
+            @Override
+            public String readFile(String scriptId, String relativePath) {
+                String norm = SourceBundler.normalizedSourcePath(relativePath);
+                return norm != null ? sourceMap.get(norm) : null;
+            }
+            @Override public void log(String scriptId, int level, String message) {}
+            @Override public Object callApi(String scriptId, String namespace, String function, Object[] args) { return null; }
+            @Override public Object invokeNative(Object target, String method, Object[] args) { return null; }
+            @Override public Object getNativeField(Object target, String field) { return null; }
+            @Override public boolean setNativeField(Object target, String field, Object value) { return false; }
+            @Override public long scheduleDelay(String scriptId, long durationNanos) { return 0; }
+            @Override public void scheduleYield(String scriptId) {}
+        };
+
+        long ctx = lang == SourceBundler.ScriptLanguage.JAVASCRIPT
+                ? NativeBridge.createJsContext(request.scriptId(), bundle.filePath(), bundle.source(), ephemeralHost)
+                : NativeBridge.createLuaContext(request.scriptId(), bundle.filePath(), bundle.source(), ephemeralHost);
+
+        if (ctx == 0) {
+            diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_BAD_SOURCE,
+                    "Failed to initialize foreign engine context", SourceRange.of(bundle.filePath(), 1, 1)));
+            return Compilation.failure(bundle.remap(diagnostics));
+        }
+
+        ForeignScriptDescriptor desc;
+        try {
+            desc = NativeBridge.extractDescriptor(ctx);
+        } finally {
+            NativeBridge.closeContext(ctx);
+        }
+
+        if (desc == null) {
+            String hint = lang == SourceBundler.ScriptLanguage.JAVASCRIPT
+                    ? "export default defineScript({ ... })"
+                    : "return velora.define({ ... })";
+            diagnostics.add(Diagnostic.error(DiagnosticCode.COMPILER_NO_SCRIPT,
+                    "Script definition not found. Use " + hint, SourceRange.of(bundle.filePath(), 1, 1)));
+            return Compilation.failure(bundle.remap(diagnostics));
+        }
+
+        List<SettingDescriptor> settings = new ArrayList<>();
+        for (int i = 0; i < desc.settings().size(); i++) {
+            ForeignSettingDef def = desc.settings().get(i);
+            VeloraType vt = typeRegistry.find(def.type());
+            if (vt == null) vt = VeloraTypes.STRING;
+            Object defVal = def.defaultValue();
+            if (defVal instanceof Number num) {
+                if ("Float".equals(def.type())) defVal = num.floatValue();
+                else if ("Int".equals(def.type())) defVal = num.intValue();
+                else if ("Double".equals(def.type())) defVal = num.doubleValue();
+                else if ("Long".equals(def.type())) defVal = num.longValue();
+                else if ("Byte".equals(def.type())) defVal = num.byteValue();
+                else if ("Short".equals(def.type())) defVal = num.shortValue();
+            }
+            List<SettingDescriptor.Constraint> constraints = new ArrayList<>();
+            if (def.min() != null || def.max() != null) {
+                constraints.add(SettingDescriptor.Constraint.range(def.min(), def.max()));
+            }
+            if (def.step() != null) {
+                constraints.add(SettingDescriptor.Constraint.step(def.step()));
+            }
+            settings.add(new SettingDescriptor(def.id(), def.name(), vt, defVal, null, null, null, i, false, false, false, null, constraints, i));
+        }
+
+        ConstantPool pool = new ConstantPool();
+        List<CompiledFunction> functions = new ArrayList<>();
+        List<String> lifecycleHooks = new ArrayList<>(desc.lifecycleHooks());
+        List<CompiledModule.EventHandlerInfo> eventHandlers = new ArrayList<>();
+        int fnIdx = 0;
+
+        for (String hook : lifecycleHooks) {
+            int constIdx = pool.addString(hook);
+            int[] code = new int[]{Opcode.CALL_FOREIGN.ordinal(), constIdx, 0, Opcode.RETURN.ordinal()};
+            int[] lines = new int[]{1, 1, 1, 1};
+            functions.add(new CompiledFunction(hook, fnIdx++, 0, 0, 1, true, true, code, lines));
+        }
+
+        for (String evName : desc.eventNames()) {
+            int constIdx = pool.addString(evName);
+            int[] code = new int[]{Opcode.LOAD_LOCAL.ordinal(), 0, Opcode.CALL_FOREIGN.ordinal(), constIdx, 1, Opcode.RETURN.ordinal()};
+            int[] lines = new int[]{1, 1, 1, 1, 1, 1};
+            functions.add(new CompiledFunction(evName, fnIdx, 1, 1, 1, false, false, code, lines));
+            eventHandlers.add(new CompiledModule.EventHandlerInfo(evName, evName, fnIdx++, false));
+        }
+
+        CompiledModule module = new CompiledModule(
+                request.scriptId(),
+                desc.name() != null && !desc.name().isBlank() ? desc.name() : request.scriptId(),
+                desc.version() != null && !desc.version().isBlank() ? desc.version() : "1.0.0",
+                2,
+                bundle.sourceHash(),
+                registryHash,
+                pool,
+                functions,
+                settings,
+                List.of(),
+                List.of(),
+                List.of(),
+                List.of(),
+                lifecycleHooks,
+                eventHandlers,
+                List.of(),
+                desc.author(),
+                desc.description()
+        );
+
+        diagnostics.addAll(new BytecodeVerifier(apiRegistry).verify(module));
+        if (hasErrors(diagnostics)) return Compilation.failure(bundle.remap(diagnostics));
+
         cache.put(request.scriptId(), bundle.sourceHash(), registryHash, module);
         return new Compilation(module, bundle.remap(diagnostics), bundle.sourceHash(), registryHash);
     }

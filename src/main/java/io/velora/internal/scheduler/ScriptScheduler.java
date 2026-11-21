@@ -15,6 +15,7 @@ import io.velora.api.task.VeloraTask;
 import io.velora.api.type.VeloraType;
 import io.velora.internal.bytecode.CompiledFunction;
 import io.velora.internal.bytecode.CompiledModule;
+import io.velora.internal.foreign.*;
 import io.velora.internal.debug.RuntimeErrorStore;
 import io.velora.internal.security.ResourceCounter;
 import io.velora.internal.security.ResourceLimitViolation;
@@ -310,6 +311,7 @@ public final class ScriptScheduler implements VmHost {
     }
 
     public void stopScript(String scriptId) {
+        unregisterForeignContext(scriptId);
         cancelScriptTasks(scriptId);
         Set<Long> ids = new HashSet<>(fibersByScript.getOrDefault(scriptId, Set.of()));
         for (Long id : ids) {
@@ -881,4 +883,41 @@ public final class ScriptScheduler implements VmHost {
     public RuntimeErrorStore errorStore() { return errorStore; }
     private record BufferedCompletion(String scriptId, long parentFiberId, CompletionQueue.CompletionRecord record) {}
 
+    private final Map<String, Long> foreignContexts = new HashMap<>();
+
+    public void registerForeignContext(String scriptId, long ctx) {
+        foreignContexts.put(scriptId, ctx);
+    }
+
+    public void unregisterForeignContext(String scriptId) {
+        Long ctx = foreignContexts.remove(scriptId);
+        if (ctx != null && ctx != 0) {
+            NativeBridge.closeContext(ctx);
+        }
+    }
+
+    public long foreignContext(String scriptId) {
+        return foreignContexts.getOrDefault(scriptId, 0L);
+    }
+
+    @Override
+    public ForeignExecutionResult executeForeign(String scriptId, String functionName, ScriptValue[] args, long fiberId, boolean resuming) {
+        long ctx = foreignContext(scriptId);
+        if (ctx == 0) return ForeignExecutionResult.success(null);
+
+        if (resuming) {
+            return NativeBridge.resume(ctx, fiberId, null, null);
+        }
+
+        Object payload = null;
+        if (args != null && args.length > 0 && args[0] != null) {
+            payload = args[0].boxed();
+        }
+
+        Set<String> lifecycle = Set.of("ON_LOAD", "ON_ENABLE", "ON_DISABLE", "ON_UNLOAD", "ON_RUN");
+        if (lifecycle.contains(functionName)) {
+            return NativeBridge.invokeHook(ctx, functionName);
+        }
+        return NativeBridge.dispatchEvent(ctx, functionName, payload);
+    }
 }

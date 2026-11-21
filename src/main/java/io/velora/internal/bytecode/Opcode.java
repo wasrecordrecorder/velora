@@ -76,7 +76,8 @@ public enum Opcode {
     LINE(1),           // LINE lineNumber
     BREAKPOINT(0),
     IS_TYPE(1),
-    LOAD_QUALIFIED(2);
+    LOAD_QUALIFIED(2),
+    CALL_FOREIGN(2);
 
     private final int operandWords;
 

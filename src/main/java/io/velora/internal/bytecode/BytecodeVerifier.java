@@ -202,6 +202,10 @@ public final class BytecodeVerifier {
                 }
             }
             case CALL_API, CALL_SUSPEND -> validateApiCall(function, instruction, diagnostics);
+            case CALL_FOREIGN -> {
+                validateStringOperand(operands[0], module, function, instruction, diagnostics);
+                if (operands[1] < 0) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Negative foreign call argument count in " + function.name() + " at " + instruction.offset());
+            }
             case CALL_MEMBER -> {
                 validateStringOperand(operands[0], module, function, instruction, diagnostics);
                 if (operands[1] < 0) error(diagnostics, DiagnosticCode.BYTECODE_BAD_OPERAND, "Negative member argument count in " + function.name() + " at " + instruction.offset());
@@ -261,7 +265,7 @@ public final class BytecodeVerifier {
         return switch (opcode) {
             case STORE_LOCAL, STORE_FIELD, STORE_STATIC, POP, DUP, NEGATE, NOT, IS_NULL, IS_TYPE, JUMP_IF_FALSE, JUMP_IF_TRUE, GET_MEMBER, AWAIT, DELAY -> 1;
             case ADD, SUB, MUL, DIV, MOD, EQUAL, NOT_EQUAL, LESS, LESS_EQUAL, GREATER, GREATER_EQUAL, GET_INDEX, SET_MEMBER -> 2;
-            case CALL, CALL_API, CALL_SUSPEND, SPAWN -> instruction.operands()[1];
+            case CALL, CALL_API, CALL_SUSPEND, SPAWN, CALL_FOREIGN -> instruction.operands()[1];
             case CALL_MEMBER -> instruction.operands()[1] + 1;
             case CREATE_LIST, CREATE_SET -> instruction.operands()[0];
             case CREATE_MAP -> instruction.operands()[0] * 2;
@@ -276,7 +280,7 @@ public final class BytecodeVerifier {
             case STORE_LOCAL, STORE_FIELD, STORE_STATIC, POP, DELAY, JUMP_IF_FALSE, JUMP_IF_TRUE -> -1;
             case ADD, SUB, MUL, DIV, MOD, EQUAL, NOT_EQUAL, LESS, LESS_EQUAL, GREATER, GREATER_EQUAL, GET_INDEX -> -1;
             case SET_MEMBER -> -2;
-            case CALL, CALL_API, CALL_SUSPEND, SPAWN -> 1 - instruction.operands()[1];
+            case CALL, CALL_API, CALL_SUSPEND, SPAWN, CALL_FOREIGN -> 1 - instruction.operands()[1];
             case CALL_MEMBER -> -instruction.operands()[1];
             case CREATE_LIST, CREATE_SET -> 1 - instruction.operands()[0];
             case CREATE_MAP -> 1 - instruction.operands()[0] * 2;

@@ -18,6 +18,138 @@ public final class SyntaxHighlighter {
         return tokens;
     }
 
+    private static final Set<String> JS_KEYWORDS = Set.of(
+            "function", "let", "const", "var", "return", "if", "else", "for", "while", "do",
+            "switch", "case", "default", "break", "continue", "import", "export", "from", "as",
+            "class", "extends", "new", "this", "typeof", "instanceof", "try", "catch", "finally",
+            "throw", "async", "await", "yield"
+    );
+
+    private static final Set<String> LUA_KEYWORDS = Set.of(
+            "and", "break", "do", "else", "elseif", "end", "for", "function", "goto", "if",
+            "in", "local", "not", "or", "repeat", "return", "then", "until", "while"
+    );
+
+    public static List<SyntaxToken> highlightJs(String content) {
+        return tokenizeGeneric(content, JS_KEYWORDS, Set.of("true", "false", "null", "undefined"), true);
+    }
+
+    public static List<SyntaxToken> highlightLua(String content) {
+        return tokenizeGeneric(content, LUA_KEYWORDS, Set.of("true", "false", "nil"), false);
+    }
+
+    private static List<SyntaxToken> tokenizeGeneric(String content, Set<String> keywords, Set<String> booleans, boolean isJs) {
+        List<SyntaxToken> tokens = new ArrayList<>();
+        int len = content.length();
+        int line = 1;
+        int col = 1;
+        int i = 0;
+        while (i < len) {
+            char c = content.charAt(i);
+            if (c == '\n') {
+                line++;
+                col = 1;
+                i++;
+                continue;
+            }
+            if (Character.isWhitespace(c)) {
+                int startCol = col;
+                int start = i;
+                while (i < len && Character.isWhitespace(content.charAt(i)) && content.charAt(i) != '\n') {
+                    i++;
+                    col++;
+                }
+                tokens.add(new SyntaxToken(SyntaxToken.TokenType.WHITESPACE, content.substring(start, i), line, startCol, i - start));
+                continue;
+            }
+            if (isJs && c == '/' && i + 1 < len && content.charAt(i + 1) == '/') {
+                int startCol = col;
+                int start = i;
+                while (i < len && content.charAt(i) != '\n') {
+                    i++;
+                    col++;
+                }
+                tokens.add(new SyntaxToken(SyntaxToken.TokenType.COMMENT, content.substring(start, i), line, startCol, i - start));
+                continue;
+            }
+            if (isJs && c == '/' && i + 1 < len && content.charAt(i + 1) == '*') {
+                int startCol = col;
+                int startLine = line;
+                int start = i;
+                i += 2;
+                col += 2;
+                while (i + 1 < len && !(content.charAt(i) == '*' && content.charAt(i + 1) == '/')) {
+                    if (content.charAt(i) == '\n') { line++; col = 1; } else col++;
+                    i++;
+                }
+                if (i + 1 < len) { i += 2; col += 2; }
+                tokens.add(new SyntaxToken(SyntaxToken.TokenType.COMMENT, content.substring(start, i), startLine, startCol, i - start));
+                continue;
+            }
+            if (!isJs && c == '-' && i + 1 < len && content.charAt(i + 1) == '-') {
+                int startCol = col;
+                int start = i;
+                while (i < len && content.charAt(i) != '\n') {
+                    i++;
+                    col++;
+                }
+                tokens.add(new SyntaxToken(SyntaxToken.TokenType.COMMENT, content.substring(start, i), line, startCol, i - start));
+                continue;
+            }
+            if (c == '"' || c == '\'' || (isJs && c == '`')) {
+                char quote = c;
+                int startCol = col;
+                int startLine = line;
+                int start = i++;
+                col++;
+                boolean esc = false;
+                while (i < len) {
+                    char ch = content.charAt(i);
+                    if (ch == '\n') { line++; col = 1; } else col++;
+                    i++;
+                    if (!esc && ch == quote) break;
+                    esc = !esc && ch == '\\';
+                }
+                tokens.add(new SyntaxToken(SyntaxToken.TokenType.STRING, content.substring(start, i), startLine, startCol, i - start));
+                continue;
+            }
+            if (Character.isDigit(c) || (c == '.' && i + 1 < len && Character.isDigit(content.charAt(i + 1)))) {
+                int startCol = col;
+                int start = i;
+                if (c == '0' && i + 1 < len && (content.charAt(i + 1) == 'x' || content.charAt(i + 1) == 'X')) {
+                    i += 2;
+                    col += 2;
+                    while (i < len && "0123456789abcdefABCDEF".indexOf(content.charAt(i)) >= 0) { i++; col++; }
+                } else {
+                    while (i < len && (Character.isDigit(content.charAt(i)) || content.charAt(i) == '.')) { i++; col++; }
+                }
+                tokens.add(new SyntaxToken(SyntaxToken.TokenType.NUMBER, content.substring(start, i), line, startCol, i - start));
+                continue;
+            }
+            if (Character.isLetter(c) || c == '_' || (isJs && c == '$')) {
+                int startCol = col;
+                int start = i;
+                while (i < len && (Character.isLetterOrDigit(content.charAt(i)) || content.charAt(i) == '_' || (isJs && content.charAt(i) == '$'))) {
+                    i++;
+                    col++;
+                }
+                String word = content.substring(start, i);
+                SyntaxToken.TokenType tt = keywords.contains(word) ? SyntaxToken.TokenType.KEYWORD
+                        : booleans.contains(word) ? SyntaxToken.TokenType.BOOLEAN
+                        : SyntaxToken.TokenType.IDENTIFIER;
+                tokens.add(new SyntaxToken(tt, word, line, startCol, i - start));
+                continue;
+            }
+            int startCol = col;
+            i++;
+            col++;
+            String op = String.valueOf(c);
+            SyntaxToken.TokenType tt = "{}()[]:;,".indexOf(c) >= 0 ? SyntaxToken.TokenType.PUNCTUATION : SyntaxToken.TokenType.OPERATOR;
+            tokens.add(new SyntaxToken(tt, op, line, startCol, 1));
+        }
+        return tokens;
+    }
+
     private static SyntaxToken.TokenType mapType(TokenType tt) {
         if (tt == null) return SyntaxToken.TokenType.ERROR;
         if (tt == TokenType.IDENTIFIER) return SyntaxToken.TokenType.IDENTIFIER;

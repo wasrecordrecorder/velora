@@ -8,7 +8,10 @@ import io.velora.host.ScriptFileEntry;
 import io.velora.host.VeloraHost;
 import io.velora.host.SourceSnapshot;
 import io.velora.internal.bytecode.CompiledModule;
+import io.velora.internal.bytecode.Opcode;
 import io.velora.internal.compiler.DefaultScriptCompiler;
+import io.velora.internal.foreign.*;
+import io.velora.internal.source.SourceBundler;
 import io.velora.internal.scheduler.FiberState;
 import io.velora.internal.scheduler.ScriptFiber;
 import io.velora.internal.scheduler.ScriptScheduler;
@@ -174,6 +177,7 @@ public final class DefaultScriptManager implements ScriptManager {
         serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.STATUS_CHANGED, scriptId, ScriptStatus.ENABLING));
 
         CompiledModule module = instance.compiledModule();
+        ensureForeignContext(instance);
         if (instance.settingStore() != null) scheduler.setSettingStore(scriptId, instance.settingStore());
         if (!instance.loadHookCompleted()) {
             if (module.lifecycleHooks().contains("ON_LOAD")) {
@@ -345,6 +349,101 @@ public final class DefaultScriptManager implements ScriptManager {
 
     private SettingStore createSettingStore(CompiledModule module) {
         return new SettingStore(module.settings());
+    }
+
+    private void ensureForeignContext(ScriptInstance instance) {
+        if (scheduler.foreignContext(instance.scriptId()) != 0) return;
+        CompiledModule module = instance.compiledModule();
+        if (module == null) return;
+        boolean isForeign = module.functions().stream().anyMatch(f -> {
+            for (int op : f.code()) if (op == Opcode.CALL_FOREIGN.ordinal()) return true;
+            return false;
+        });
+        if (!isForeign) return;
+
+        List<SourceFile> sources = new ArrayList<>();
+        if (host != null && host.fileSystem() != null && instance.descriptor() != null) {
+            for (String path : instance.descriptor().sourceFiles()) {
+                SourceSnapshot snapshot = host.fileSystem().readSource(instance.scriptId(), path);
+                if (snapshot != null) sources.add(new SourceFile(path, snapshot.content(), snapshot.contentHash()));
+            }
+        }
+
+        SourceBundler.ScriptLanguage lang = SourceBundler.detectLanguage(sources);
+        if (lang == null || lang == SourceBundler.ScriptLanguage.VLS) return;
+
+        SourceBundler.SourceBundle bundle = SourceBundler.bundle(sources, null);
+        if (bundle == null) return;
+
+        ForeignHost foreignHost = new ForeignHost() {
+            @Override
+            public String readFile(String sId, String relativePath) {
+                if (host != null && host.fileSystem() != null) {
+                    SourceSnapshot snap = host.fileSystem().readSource(sId, relativePath);
+                    if (snap != null) return snap.content();
+                }
+                return null;
+            }
+
+            @Override
+            public void log(String sId, int level, String message) {
+                if (host != null && host.logger() != null) {
+                    switch (level) {
+                        case 0 -> host.logger().debug(message);
+                        case 1 -> host.logger().info(message);
+                        case 2 -> host.logger().warn(message);
+                        default -> host.logger().error(message, null);
+                    }
+                }
+                serviceEvents.fire(ScriptServiceEvents.ScriptServiceEvent.of(ScriptServiceEvents.Type.LOG_ADDED, sId, message));
+            }
+
+            @Override
+            public Object callApi(String sId, String namespace, String function, Object[] args) {
+                return null;
+            }
+
+            @Override
+            public Object invokeNative(Object target, String method, Object[] args) {
+                return null;
+            }
+
+            @Override
+            public Object getNativeField(Object target, String field) {
+                return null;
+            }
+
+            @Override
+            public boolean setNativeField(Object target, String field, Object value) {
+                return false;
+            }
+
+            @Override
+            public long scheduleDelay(String sId, long durationNanos) {
+                return 0;
+            }
+
+            @Override
+            public void scheduleYield(String sId) {
+            }
+        };
+
+        long ctx = lang == SourceBundler.ScriptLanguage.JAVASCRIPT
+                ? NativeBridge.createJsContext(instance.scriptId(), bundle.filePath(), bundle.source(), foreignHost)
+                : NativeBridge.createLuaContext(instance.scriptId(), bundle.filePath(), bundle.source(), foreignHost);
+
+        if (ctx != 0) {
+            scheduler.registerForeignContext(instance.scriptId(), ctx);
+            if (instance.settingStore() != null) {
+                instance.settingStore().setUpdateListener((k, v) -> NativeBridge.updateSetting(ctx, k, v));
+                for (var desc : module.settings()) {
+                    var sv = instance.settingStore().get(desc.id());
+                    if (sv != null) {
+                        NativeBridge.updateSetting(ctx, desc.id(), sv.value());
+                    }
+                }
+            }
+        }
     }
 
     private ScriptDescriptor descriptorForModule(ScriptDescriptor current, CompiledModule module, ScriptRevision revision, long reloadTime) {

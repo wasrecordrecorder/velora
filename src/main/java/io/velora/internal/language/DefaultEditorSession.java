@@ -11,6 +11,7 @@ import io.velora.api.registry.SettingRegistry;
 import io.velora.api.registry.TypeRegistry;
 import io.velora.host.SourceSnapshot;
 import io.velora.host.VeloraHost;
+import io.velora.internal.foreign.NativeBridge;
 import io.velora.internal.lexer.Lexer;
 import io.velora.internal.lexer.LexerResult;
 import io.velora.internal.parser.Parser;
@@ -67,6 +68,10 @@ public final class DefaultEditorSession implements EditorSession {
         this.constantRegistry = constantRegistry;
         this.javaImportRegistry = javaImportRegistry;
         this.host = host;
+        if (host != null && host.fileSystem() != null && scriptId != null && filePath != null) {
+            io.velora.host.SourceSnapshot snap = host.fileSystem().readSource(scriptId, filePath);
+            if (snap != null && snap.content() != null) this.content = snap.content();
+        }
     }
 
     @Override public String scriptId() { return scriptId; }
@@ -87,6 +92,21 @@ public final class DefaultEditorSession implements EditorSession {
     public EditorSnapshot snapshot() {
         ensureOpen();
         if (cachedSnapshot != null) return cachedSnapshot;
+        String lower = filePath.toLowerCase(Locale.ROOT);
+        if (lower.endsWith(".js") || lower.endsWith(".mjs")) {
+            List<SyntaxToken> tokens = SyntaxHighlighter.highlightJs(content);
+            List<Diagnostic> diagnostics = NativeBridge.checkSyntaxJs(content, filePath);
+            cachedSnapshot = new EditorSnapshot(scriptId, filePath, content,
+                    SourceHash.compute(content), diagnostics, tokens, revisionToken);
+            return cachedSnapshot;
+        }
+        if (lower.endsWith(".lua")) {
+            List<SyntaxToken> tokens = SyntaxHighlighter.highlightLua(content);
+            List<Diagnostic> diagnostics = NativeBridge.checkSyntaxLua(content, filePath);
+            cachedSnapshot = new EditorSnapshot(scriptId, filePath, content,
+                    SourceHash.compute(content), diagnostics, tokens, revisionToken);
+            return cachedSnapshot;
+        }
         LexerResult lr = new Lexer(content, filePath).lex();
         List<SyntaxToken> tokens = SyntaxHighlighter.highlight(lr);
         List<Diagnostic> diagnostics = analyzeProject(lr);

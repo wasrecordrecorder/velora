@@ -713,6 +713,9 @@ public final class DefaultVeloraEngine implements VeloraEngine {
             public ScriptValue loadStatic(int fieldIndex) { return scheduler.loadStaticForScript(scriptId, fieldIndex); }
             public void storeStatic(int fieldIndex, ScriptValue value) { scheduler.storeStaticForScript(scriptId, fieldIndex, value); }
             public void commitStateMutation(long fiberId) { scheduler.commitStateMutationForScript(scriptId); }
+            public io.velora.internal.foreign.ForeignExecutionResult executeForeign(String scriptId, String functionName, ScriptValue[] args, long fiberId, boolean resuming) {
+                return scheduler.executeForeign(scriptId, functionName, args, fiberId, resuming);
+            }
         };
     }
 

@@ -8,6 +8,7 @@ public final class CallFrame {
     final int stackBase;
     final int localBase;
     int line;
+    boolean foreignResuming;
     public final ScriptValue[] locals;
 
     public CallFrame(CompiledFunction function, int stackBase, int localBase) {

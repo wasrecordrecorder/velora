@@ -164,9 +164,14 @@ public final class LocalVeloraFileSystem implements VeloraFileSystem {
         return current != null && Objects.equals(current.revision().revisionHash(), expected.revisionHash());
     }
 
+    private static boolean isSourceExtension(String name) {
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
+        return lower.endsWith(".vls") || lower.endsWith(".js") || lower.endsWith(".mjs") || lower.endsWith(".lua");
+    }
+
     private static String normalizeSourcePath(String path) {
         String normalized = normalizeRelative(path, true);
-        if (!normalized.toLowerCase(java.util.Locale.ROOT).endsWith(".vls")) throw new IllegalArgumentException("Source file must end with .vls: " + path);
+        if (!isSourceExtension(normalized)) throw new IllegalArgumentException("Source file must end with .vls, .js, .mjs or .lua: " + path);
         return normalized;
     }
 
@@ -186,7 +191,7 @@ public final class LocalVeloraFileSystem implements VeloraFileSystem {
     }
 
     private static boolean isSource(Path scriptDir, Path path) {
-        if (!path.getFileName().toString().toLowerCase(java.util.Locale.ROOT).endsWith(".vls")) return false;
+        if (!isSourceExtension(path.getFileName().toString())) return false;
         Path relative = scriptDir.relativize(path);
         for (Path part : relative) if (part.toString().equals(DATA_DIR)) return false;
         return true;

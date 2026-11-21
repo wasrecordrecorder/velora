@@ -22,4 +22,5 @@ public interface VmHost {
     ScriptValue loadStatic(int fieldIndex);
     void storeStatic(int fieldIndex, ScriptValue value);
     void commitStateMutation(long fiberId);
+    io.velora.internal.foreign.ForeignExecutionResult executeForeign(String scriptId, String functionName, ScriptValue[] args, long fiberId, boolean resuming);
 }

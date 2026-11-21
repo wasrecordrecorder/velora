@@ -262,6 +262,38 @@ public final class VirtualMachine {
                         }
                         callStack.push(newFrame);
                     }
+                    case CALL_FOREIGN -> {
+                        int constIdx = operand0;
+                        int argCount = operand1;
+                        String hookName = module.constantPool().stringValue(constIdx);
+                        ScriptValue[] callArgs = new ScriptValue[argCount];
+                        if (!frame.foreignResuming) {
+                            for (int i = argCount - 1; i >= 0; i--) callArgs[i] = stack.pop();
+                        }
+                        if (host == null) {
+                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                                    "Foreign call requires a scheduler", currentLine(callStack), fiberId), instructions, System.nanoTime() - startTime);
+                        }
+                        io.velora.internal.foreign.ForeignExecutionResult res = host.executeForeign(module.scriptId(), hookName, callArgs, fiberId, frame.foreignResuming);
+                        frame.foreignResuming = false;
+                        if (res.isSuspendedDelay()) {
+                            frame.foreignResuming = true;
+                            long nanos = res.suspendedDurationNanos();
+                            host.sleepFiber(fiberId, host.nanoTime() + nanos);
+                            return VmExecutionResult.suspended(VmExecutionResult.SuspendReason.SLEEP, nanos, instructions, System.nanoTime() - startTime);
+                        }
+                        if (res.isSuspendedYield()) {
+                            frame.foreignResuming = true;
+                            host.yieldFiber(fiberId);
+                            return VmExecutionResult.suspended(VmExecutionResult.SuspendReason.YIELD, 0, instructions, System.nanoTime() - startTime);
+                        }
+                        if (res.isError()) {
+                            return VmExecutionResult.failure(VmError.of(DiagnosticCode.RUNTIME_API_ERROR,
+                                    res.errorMessage() != null ? res.errorMessage() : "Foreign execution error", currentLine(callStack), fiberId), instructions, System.nanoTime() - startTime);
+                        }
+                        ScriptValue retVal = VirtualMachine.javaToValue(res.result());
+                        stack.push(retVal != null ? retVal : PrimitiveValue.nullValue());
+                    }
                     case CALL_API -> {
                         int apiIdx = operand0;
                         int argCount = operand1;
